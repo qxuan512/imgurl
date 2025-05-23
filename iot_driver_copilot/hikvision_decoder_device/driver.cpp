@@ -1,330 +1,316 @@
 #include <iostream>
-#include <cstdlib>
 #include <string>
-#include <thread>
-#include <vector>
-#include <sstream>
+#include <cstdlib>
 #include <cstring>
-#include <map>
+#include <thread>
 #include <mutex>
+#include <map>
+#include <sstream>
+#include <vector>
+#include <functional>
 #include <condition_variable>
-#include <netinet/in.h>
+
+#ifdef _WIN32
+#include <winsock2.h>
+typedef int socklen_t;
+#pragma comment(lib, "ws2_32.lib")
+#else
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#endif
 
-#define BUFFER_SIZE 8192
-#define MAX_CONNECTIONS 10
+// ---- Simple HTTP Server Helpers ----
 
-// Simple HTTP Response Helpers
-std::string http_200(const std::string& content, const std::string& content_type = "application/json") {
-    std::ostringstream oss;
-    oss << "HTTP/1.1 200 OK\r\n"
-        << "Content-Type: " << content_type << "\r\n"
-        << "Content-Length: " << content.size() << "\r\n"
-        << "Connection: close\r\n"
-        << "\r\n"
-        << content;
-    return oss.str();
-}
+#define HTTP_OK "HTTP/1.1 200 OK\r\n"
+#define HTTP_UNAUTHORIZED "HTTP/1.1 401 Unauthorized\r\n"
+#define HTTP_BAD_REQUEST "HTTP/1.1 400 Bad Request\r\n"
+#define HTTP_NOT_FOUND "HTTP/1.1 404 Not Found\r\n"
+#define HTTP_SERVER_ERROR "HTTP/1.1 500 Internal Server Error\r\n"
 
-std::string http_401(const std::string& msg = "Unauthorized") {
-    std::ostringstream oss;
-    oss << "HTTP/1.1 401 Unauthorized\r\n"
-        << "Content-Type: text/plain\r\n"
-        << "Content-Length: " << msg.size() << "\r\n"
-        << "Connection: close\r\n"
-        << "\r\n"
-        << msg;
-    return oss.str();
-}
+#define MAX_REQUEST_SIZE 8192
 
-std::string http_404() {
-    std::string msg = "404 Not Found";
-    std::ostringstream oss;
-    oss << "HTTP/1.1 404 Not Found\r\n"
-        << "Content-Type: text/plain\r\n"
-        << "Content-Length: " << msg.size() << "\r\n"
-        << "Connection: close\r\n"
-        << "\r\n"
-        << msg;
-    return oss.str();
-}
+// ---- Device SDK Simulation & Session ----
 
-std::string http_405() {
-    std::string msg = "405 Method Not Allowed";
-    std::ostringstream oss;
-    oss << "HTTP/1.1 405 Method Not Allowed\r\n"
-        << "Content-Type: text/plain\r\n"
-        << "Content-Length: " << msg.size() << "\r\n"
-        << "Connection: close\r\n"
-        << "\r\n"
-        << msg;
-    return oss.str();
-}
-
-std::string http_500(const std::string &msg = "Internal Server Error") {
-    std::ostringstream oss;
-    oss << "HTTP/1.1 500 Internal Server Error\r\n"
-        << "Content-Type: text/plain\r\n"
-        << "Content-Length: " << msg.size() << "\r\n"
-        << "Connection: close\r\n"
-        << "\r\n"
-        << msg;
-    return oss.str();
-}
-
-// Session store for authentication
-struct SessionStore {
-    std::mutex mutex;
-    std::string session_token;
-    bool valid = false;
-
-    void set(const std::string& token) {
-        std::lock_guard<std::mutex> lock(mutex);
-        session_token = token;
-        valid = true;
-    }
-    bool check(const std::string& token) {
-        std::lock_guard<std::mutex> lock(mutex);
-        return valid && session_token == token;
-    }
-    void invalidate() {
-        std::lock_guard<std::mutex> lock(mutex);
-        valid = false;
-        session_token.clear();
-    }
-} session_store;
-
-// Util: parse HTTP headers
-std::map<std::string, std::string> parse_headers(const std::string& headers) {
-    std::map<std::string, std::string> result;
-    std::istringstream iss(headers);
-    std::string line;
-    while (std::getline(iss, line)) {
-        size_t pos = line.find(':');
-        if (pos != std::string::npos) {
-            std::string key = line.substr(0, pos);
-            std::string value = line.substr(pos + 1);
-            // Trim
-            key.erase(key.find_last_not_of(" \r\n")+1);
-            value.erase(0, value.find_first_not_of(" \t"));
-            value.erase(value.find_last_not_of(" \t\r\n")+1);
-            result[key] = value;
-        }
-    }
-    return result;
-}
-
-// Util: parse POST body key=val&key2=val2
-std::map<std::string, std::string> parse_urlencoded(const std::string& body) {
-    std::map<std::string, std::string> result;
-    std::istringstream iss(body);
-    std::string pair;
-    while (std::getline(iss, pair, '&')) {
-        size_t pos = pair.find('=');
-        if (pos != std::string::npos) {
-            std::string key = pair.substr(0, pos);
-            std::string value = pair.substr(pos + 1);
-            result[key] = value;
-        }
-    }
-    return result;
-}
-
-// -- Hikvision Device SDK Mockup/Simulation --
-// In practice, you'd use the vendor SDK headers and link to the library. Here, we simulate responses.
-
-std::string mock_device_ip;
-std::string mock_device_user;
-std::string mock_device_pass;
-
-bool hikvision_login(const std::string& user, const std::string& pass) {
-    // Simulate login
-    return user == mock_device_user && pass == mock_device_pass;
-}
-
-std::string hikvision_capture_jpeg() {
-    // Simulate capturing a JPEG image from the decoder device (should be replaced with real SDK call)
-    // For demo, return a fixed JPEG header + dummy data
-    static const unsigned char jpeg_header[] = {
-        0xFF, 0xD8, // SOI
-        0xFF, 0xE0, // APP0
-        0x00, 0x10, // length
-        'J', 'F', 'I', 'F', 0x00
-    };
-    std::string jpeg((const char*)jpeg_header, sizeof(jpeg_header));
-    jpeg += std::string(1024, '\xAA'); // Dummy image payload
-    jpeg += std::string("\xFF\xD9", 2); // EOI
-    return jpeg;
-}
-
-// -- HTTP Server Logic --
-
-struct Request {
-    std::string method;
-    std::string path;
-    std::string headers;
-    std::string body;
-    std::map<std::string, std::string> header_map;
-    std::string session_token;
+struct DeviceSession {
+    std::string username;
+    std::string token;
+    bool logged_in = false;
+    // In a real driver, this would hold SDK handles/resources
 };
 
-bool parse_request(const std::string& req, Request& out) {
-    size_t pos1 = req.find("\r\n");
-    if (pos1 == std::string::npos) return false;
-    std::string req_line = req.substr(0, pos1);
-    std::istringstream iss(req_line);
-    iss >> out.method >> out.path;
-    size_t pos2 = req.find("\r\n\r\n");
-    if (pos2 == std::string::npos) return false;
-    out.headers = req.substr(pos1+2, pos2-pos1-2);
-    out.body = req.substr(pos2+4);
-    out.header_map = parse_headers(out.headers);
+std::mutex session_mutex;
+DeviceSession g_session;
 
-    // Try get session token from headers
-    auto it = out.header_map.find("Authorization");
-    if (it != out.header_map.end()) {
-        if (it->second.find("Bearer ") == 0) {
-            out.session_token = it->second.substr(7);
+// Simulate token generation
+std::string generate_token(const std::string& user) {
+    return "session_" + user + "_token_" + std::to_string(rand() % 100000);
+}
+
+// Simulated Hikvision device login
+bool hikvision_login(const std::string& ip, int port, const std::string& user, const std::string& pass, std::string& token) {
+    // TODO: Replace with actual SDK logic
+    if (user == "admin" && pass == "12345") {
+        token = generate_token(user);
+        return true;
+    }
+    return false;
+}
+
+// Simulated capture (returns a fake JPEG binary)
+std::vector<uint8_t> hikvision_capture(const std::string& token) {
+    // TODO: Replace with actual SDK binary stream
+    // For demonstration, return a small static JPEG header
+    static const uint8_t dummy_jpeg[] = {
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46,
+        0x49, 0x46, 0x00, 0x01, 0x01, 0x01, 0x00, 0x60,
+        0x00, 0x60, 0x00, 0x00, 0xFF, 0xD9
+    };
+    return std::vector<uint8_t>(dummy_jpeg, dummy_jpeg + sizeof(dummy_jpeg));
+}
+
+// ---- Environment Variables ----
+
+std::string env(const char* name, const char* def = "") {
+    const char* val = std::getenv(name);
+    if (!val) return def;
+    return val;
+}
+
+int env_int(const char* name, int def) {
+    const char* val = std::getenv(name);
+    if (!val) return def;
+    return atoi(val);
+}
+
+// ---- HTTP Parsing ----
+
+struct HttpRequest {
+    std::string method;
+    std::string path;
+    std::string body;
+    std::map<std::string, std::string> headers;
+};
+
+bool parse_http_request(const char* buffer, size_t len, HttpRequest& req) {
+    std::istringstream ss(std::string(buffer, len));
+    std::string line;
+    if (!std::getline(ss, line)) return false;
+    std::istringstream lss(line);
+    lss >> req.method >> req.path;
+    // Headers
+    while (std::getline(ss, line) && line != "\r") {
+        if (line.empty() || line == "\n") break;
+        size_t sep = line.find(':');
+        if (sep != std::string::npos) {
+            std::string key = line.substr(0, sep);
+            std::string val = line.substr(sep+1);
+            while (!val.empty() && (val[0] == ' ' || val[0] == '\t')) val.erase(0,1);
+            while (!val.empty() && (val.back() == '\r' || val.back() == '\n')) val.pop_back();
+            req.headers[key] = val;
+        }
+    }
+    // Body
+    if (req.headers.count("Content-Length")) {
+        int clen = atoi(req.headers["Content-Length"].c_str());
+        if (clen > 0) {
+            req.body.resize(clen);
+            ss.read(&req.body[0], clen);
         }
     }
     return true;
 }
 
-std::string gen_session_token() {
-    static int counter = 1;
-    std::ostringstream oss;
-    oss << "sess-" << getpid() << "-" << time(nullptr) << "-" << (counter++);
-    return oss.str();
+// ---- HTTP Server Core ----
+
+void send_response(int client, const std::string& header, const std::string& content_type, const std::string& body) {
+    std::ostringstream resp;
+    resp << header;
+    resp << "Content-Type: " << content_type << "\r\n";
+    resp << "Content-Length: " << body.size() << "\r\n";
+    resp << "Connection: close\r\n\r\n";
+    resp << body;
+    std::string s = resp.str();
+#ifdef _WIN32
+    send(client, s.c_str(), (int)s.size(), 0);
+#else
+    ::send(client, s.c_str(), s.size(), 0);
+#endif
 }
 
-void handle_login(const Request& req, int client_sock) {
-    if (req.method != "POST") {
-        std::string resp = http_405();
-        send(client_sock, resp.data(), resp.size(), 0);
+void send_response_binary(int client, const std::string& header, const std::string& content_type, const std::vector<uint8_t>& data) {
+    std::ostringstream resp;
+    resp << header;
+    resp << "Content-Type: " << content_type << "\r\n";
+    resp << "Content-Length: " << data.size() << "\r\n";
+    resp << "Connection: close\r\n\r\n";
+    std::string head = resp.str();
+#ifdef _WIN32
+    send(client, head.c_str(), (int)head.size(), 0);
+    send(client, (const char*)data.data(), (int)data.size(), 0);
+#else
+    ::send(client, head.c_str(), head.size(), 0);
+    ::send(client, data.data(), data.size(), 0);
+#endif
+}
+
+// ---- API Handlers ----
+
+void handle_login(const HttpRequest& req, int client) {
+    // Expects JSON {"username": "...", "password": "..."}
+    std::string user, pass;
+    size_t up = req.body.find("\"username\"");
+    size_t pp = req.body.find("\"password\"");
+    if (up != std::string::npos) {
+        size_t q1 = req.body.find('"', up+10);
+        size_t q2 = req.body.find('"', q1+1);
+        user = req.body.substr(q1+1, q2-q1-1);
+    }
+    if (pp != std::string::npos) {
+        size_t q1 = req.body.find('"', pp+10);
+        size_t q2 = req.body.find('"', q1+1);
+        pass = req.body.substr(q1+1, q2-q1-1);
+    }
+    if (user.empty() || pass.empty()) {
+        send_response(client, HTTP_BAD_REQUEST, "application/json", "{\"error\":\"Missing username or password\"}");
         return;
     }
-    // Parse body as urlencoded
-    auto params = parse_urlencoded(req.body);
-    auto it_user = params.find("username");
-    auto it_pass = params.find("password");
-    if (it_user == params.end() || it_pass == params.end()) {
-        std::string resp = http_401("Missing credentials");
-        send(client_sock, resp.data(), resp.size(), 0);
-        return;
-    }
-    if (hikvision_login(it_user->second, it_pass->second)) {
-        std::string token = gen_session_token();
-        session_store.set(token);
-        std::string resp = http_200("{\"session_token\":\"" + token + "\"}");
-        send(client_sock, resp.data(), resp.size(), 0);
+    std::string device_ip = env("DEVICE_IP", "127.0.0.1");
+    int device_port = env_int("DEVICE_PORT", 8000);
+
+    std::string token;
+    if (hikvision_login(device_ip, device_port, user, pass, token)) {
+        std::lock_guard<std::mutex> lk(session_mutex);
+        g_session.username = user;
+        g_session.token = token;
+        g_session.logged_in = true;
+        send_response(client, HTTP_OK, "application/json", "{\"token\":\"" + token + "\"}");
     } else {
-        std::string resp = http_401("Invalid credentials");
-        send(client_sock, resp.data(), resp.size(), 0);
+        send_response(client, HTTP_UNAUTHORIZED, "application/json", "{\"error\":\"Invalid credentials\"}");
     }
 }
 
-void handle_capture(const Request& req, int client_sock) {
-    if (req.method != "POST") {
-        std::string resp = http_405();
-        send(client_sock, resp.data(), resp.size(), 0);
-        return;
-    }
-    if (req.session_token.empty() || !session_store.check(req.session_token)) {
-        std::string resp = http_401();
-        send(client_sock, resp.data(), resp.size(), 0);
-        return;
-    }
-    std::string jpeg = hikvision_capture_jpeg();
-    std::ostringstream oss;
-    oss << "HTTP/1.1 200 OK\r\n"
-        << "Content-Type: image/jpeg\r\n"
-        << "Content-Length: " << jpeg.size() << "\r\n"
-        << "Connection: close\r\n"
-        << "\r\n";
-    send(client_sock, oss.str().data(), oss.str().size(), 0);
-    send(client_sock, jpeg.data(), jpeg.size(), 0);
-}
-
-void handle_client(int client_sock) {
-    char buffer[BUFFER_SIZE];
-    ssize_t received = recv(client_sock, buffer, BUFFER_SIZE-1, 0);
-    if (received <= 0) {
-        close(client_sock);
-        return;
-    }
-    buffer[received] = 0;
-    std::string req_str(buffer);
-
-    Request req;
-    if (!parse_request(req_str, req)) {
-        std::string resp = http_500("Malformed HTTP request");
-        send(client_sock, resp.data(), resp.size(), 0);
-        close(client_sock);
-        return;
-    }
-
-    if (req.path == "/login") {
-        handle_login(req, client_sock);
-    } else if (req.path == "/capture") {
-        handle_capture(req, client_sock);
+void handle_capture(const HttpRequest& req, int client) {
+    std::string token;
+    auto it = req.headers.find("Authorization");
+    if (it != req.headers.end()) {
+        const std::string& val = it->second;
+        if (val.find("Bearer ") == 0)
+            token = val.substr(7);
+        else
+            token = val;
     } else {
-        std::string resp = http_404();
-        send(client_sock, resp.data(), resp.size(), 0);
+        // Try from JSON body
+        size_t tk = req.body.find("\"token\"");
+        if (tk != std::string::npos) {
+            size_t q1 = req.body.find('"', tk+7);
+            size_t q2 = req.body.find('"', q1+1);
+            token = req.body.substr(q1+1, q2-q1-1);
+        }
     }
-    close(client_sock);
+
+    {
+        std::lock_guard<std::mutex> lk(session_mutex);
+        if (!g_session.logged_in || token != g_session.token) {
+            send_response(client, HTTP_UNAUTHORIZED, "application/json", "{\"error\":\"Not authorized\"}");
+            return;
+        }
+    }
+    std::vector<uint8_t> jpeg = hikvision_capture(token);
+    send_response_binary(client, HTTP_OK, "image/jpeg", jpeg);
 }
 
-int main(int argc, char* argv[]) {
-    // Configuration from env
-    const char* env_host = getenv("SERVER_HOST");
-    const char* env_port = getenv("SERVER_PORT");
-    const char* env_device_ip = getenv("DEVICE_IP");
-    const char* env_device_user = getenv("DEVICE_USER");
-    const char* env_device_pass = getenv("DEVICE_PASS");
+// ---- Routing ----
 
-    std::string server_host = env_host ? env_host : "0.0.0.0";
-    int server_port = env_port ? atoi(env_port) : 8080;
-    mock_device_ip = env_device_ip ? env_device_ip : "192.168.1.100";
-    mock_device_user = env_device_user ? env_device_user : "admin";
-    mock_device_pass = env_device_pass ? env_device_pass : "12345";
+void handle_request(int client, const HttpRequest& req) {
+    if (req.method == "POST" && req.path == "/login") {
+        handle_login(req, client);
+    } else if (req.method == "POST" && req.path == "/capture") {
+        handle_capture(req, client);
+    } else {
+        send_response(client, HTTP_NOT_FOUND, "application/json", "{\"error\":\"Not found\"}");
+    }
+}
 
-    int server_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_sock < 0) {
-        std::cerr << "Socket creation failed\n";
+void client_thread(int client) {
+    char buffer[MAX_REQUEST_SIZE];
+#ifdef _WIN32
+    int r = recv(client, buffer, sizeof(buffer), 0);
+#else
+    int r = ::recv(client, buffer, sizeof(buffer), 0);
+#endif
+    if (r <= 0) {
+#ifdef _WIN32
+        closesocket(client);
+#else
+        close(client);
+#endif
+        return;
+    }
+    HttpRequest req;
+    if (!parse_http_request(buffer, r, req)) {
+        send_response(client, HTTP_BAD_REQUEST, "application/json", "{\"error\":\"Malformed request\"}");
+#ifdef _WIN32
+        closesocket(client);
+#else
+        close(client);
+#endif
+        return;
+    }
+    handle_request(client, req);
+#ifdef _WIN32
+    closesocket(client);
+#else
+    close(client);
+#endif
+}
+
+// ---- Main Server ----
+
+int main() {
+#ifdef _WIN32
+    WSADATA wsaData;
+    WSAStartup(MAKEWORD(2,2), &wsaData);
+#endif
+    std::string listen_host = env("SERVER_HOST", "0.0.0.0");
+    int listen_port = env_int("SERVER_PORT", 8080);
+
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) {
+        std::cerr << "Failed to create socket\n";
         return 1;
     }
+    sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(listen_port);
+    addr.sin_addr.s_addr = inet_addr(listen_host.c_str());
 
     int opt = 1;
-    setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(server_port);
-    inet_pton(AF_INET, server_host.c_str(), &addr.sin_addr);
-
-    if (bind(server_sock, (sockaddr*)&addr, sizeof(addr)) < 0) {
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
+    if (bind(s, (sockaddr*)&addr, sizeof(addr)) < 0) {
         std::cerr << "Bind failed\n";
-        close(server_sock);
         return 1;
     }
-
-    if (listen(server_sock, MAX_CONNECTIONS) < 0) {
+    if (listen(s, 8) < 0) {
         std::cerr << "Listen failed\n";
-        close(server_sock);
         return 1;
     }
-
-    std::cout << "HTTP server listening on " << server_host << ":" << server_port << std::endl;
-
+    std::cout << "HTTP server listening on " << listen_host << ":" << listen_port << std::endl;
     while (true) {
-        sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-        int client_sock = accept(server_sock, (sockaddr*)&client_addr, &client_len);
-        if (client_sock < 0) continue;
-        std::thread(handle_client, client_sock).detach();
+        sockaddr_in cli_addr;
+        socklen_t clilen = sizeof(cli_addr);
+        int cli = accept(s, (sockaddr*)&cli_addr, &clilen);
+        if (cli < 0) continue;
+        std::thread t(client_thread, cli);
+        t.detach();
     }
-
-    close(server_sock);
+#ifdef _WIN32
+    closesocket(s);
+    WSACleanup();
+#else
+    close(s);
+#endif
     return 0;
 }
