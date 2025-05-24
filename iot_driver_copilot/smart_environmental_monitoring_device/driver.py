@@ -1,184 +1,161 @@
 import os
-import json
 import time
+import json
 import threading
 import random
-import sys
-import signal
 import paho.mqtt.client as mqtt
 
-# Environment Variables
+# Environment Variables (all must be set externally)
 MQTT_BROKER = os.environ.get("MQTT_BROKER", "localhost")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
-MQTT_USERNAME = os.environ.get("MQTT_USERNAME")
-MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD")
-DEVICE_ID = os.environ.get("DEVICE_ID", "smart_env_device_001")
-PUBLISH_INTERVAL_30S = int(os.environ.get("PUBLISH_INTERVAL_30S", 30))
-PUBLISH_INTERVAL_60S = int(os.environ.get("PUBLISH_INTERVAL_60S", 60))
+MQTT_USERNAME = os.environ.get("MQTT_USERNAME", None)
+MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD", None)
+DEVICE_ID = os.environ.get("DEVICE_ID", "envmonitor001")
+PUBLISH_INTERVAL_FAST = int(os.environ.get("PUBLISH_INTERVAL_FAST", "30")) # seconds for fast data
+PUBLISH_INTERVAL_SLOW = int(os.environ.get("PUBLISH_INTERVAL_SLOW", "60")) # seconds for slow data
 
-client = mqtt.Client(client_id=DEVICE_ID, clean_session=True)
-
-if MQTT_USERNAME and MQTT_PASSWORD:
-    client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
-
-# Device State
-state = {
-    "temperature": 22.5,
-    "humidity": 45,
+# Device state
+device_state = {
+    "temperature": 22.0,
+    "humidity": 50.0,
     "airquality": {"PM2.5": 12, "CO2": 400},
     "battery": 87,
     "status": {"status": "normal", "led": "on"},
     "led_brightness": 75,
     "buzzer": "DISABLE",
-    "alarm_threshold": {"PM2.5": 35, "CO2": 800},
-    "alarm_active": False
+    "alarm_threshold": {"PM2.5": 35, "CO2": 800}
 }
 
-# Graceful exit
-def signal_handler(sig, frame):
-    client.disconnect()
-    sys.exit(0)
+# ---- MQTT Topic Definitions ----
+TOPICS = [
+    # Telemetry (publish)
+    ("device/sensors/temperature", 0),
+    ("device/sensors/humidity", 0),
+    ("device/sensors/airquality", 0),
+    ("device/sensors/battery", 0),
+    ("device/sensors/status", 1),
+    # Alarms (publish)
+    ("device/alerts/alarm", 2),
+    # Config/Commands (subscribe)
+    ("device/config/alarm_threshold", 2),
+    ("device/config/led", 2),
+    ("device/config/buzzer", 2),
+    ("device/commands/calibrate", 2),
+    ("device/commands/restart", 2),
+    ("device/commands/reset", 2)
+]
 
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
+# ---- MQTT Client Setup ----
+client = mqtt.Client(client_id=f"{DEVICE_ID}-driver", clean_session=True, protocol=mqtt.MQTTv311)
 
-# MQTT Callbacks
+if MQTT_USERNAME:
+    client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+
+def publish_json(topic, payload, qos):
+    client.publish(topic, json.dumps(payload), qos=qos, retain=False)
+
+def publish_text(topic, payload, qos):
+    client.publish(topic, payload, qos=qos, retain=False)
+
+# ---- Device Logic Simulations ----
+
+def simulate_telemetry():
+    while True:
+        # Temperature, Humidity every 30s (QoS 0)
+        temp = round(device_state['temperature'] + random.uniform(-0.5, 0.5), 1)
+        hum = round(device_state['humidity'] + random.uniform(-2, 2), 1)
+        device_state['temperature'] = temp
+        device_state['humidity'] = hum
+        publish_json("device/sensors/temperature", {"temperature": temp, "unit": "C"}, qos=0)
+        publish_json("device/sensors/humidity", {"humidity": hum, "unit": "%"}, qos=0)
+        # Battery every 30s (QoS 0)
+        device_state['battery'] = max(0, device_state['battery'] - random.uniform(0, 0.05))
+        publish_json("device/sensors/battery", {"battery": int(device_state['battery'])}, qos=0)
+        # Status every 30s (QoS 1)
+        publish_json("device/sensors/status", device_state['status'], qos=1)
+        # Wait for next fast cycle
+        time.sleep(PUBLISH_INTERVAL_FAST)
+
+def simulate_airquality():
+    while True:
+        # Air Quality every 60s (QoS 0)
+        pm25 = max(0, round(device_state['airquality']['PM2.5'] + random.uniform(-2, 2), 1))
+        co2 = max(300, int(device_state['airquality']['CO2'] + random.uniform(-10, 10)))
+        device_state['airquality']['PM2.5'] = pm25
+        device_state['airquality']['CO2'] = co2
+        publish_json("device/sensors/airquality", {"PM2.5": pm25, "CO2": co2}, qos=0)
+        # Check for alarm
+        if pm25 > device_state["alarm_threshold"]["PM2.5"]:
+            publish_json("device/alerts/alarm", {"alarm": "threshold exceeded", "sensor": "PM2.5", "value": pm25}, qos=2)
+            device_state["status"]["status"] = "alarm"
+        elif co2 > device_state["alarm_threshold"]["CO2"]:
+            publish_json("device/alerts/alarm", {"alarm": "threshold exceeded", "sensor": "CO2", "value": co2}, qos=2)
+            device_state["status"]["status"] = "alarm"
+        else:
+            device_state["status"]["status"] = "normal"
+        time.sleep(PUBLISH_INTERVAL_SLOW)
+
+# ---- MQTT Callback Handlers ----
+
 def on_connect(client, userdata, flags, rc):
-    # Subscribe to command/config/topics (QoS as per API)
-    client.subscribe("device/config/alarm_threshold", qos=2)
-    client.subscribe("device/config/led", qos=2)
-    client.subscribe("device/config/buzzer", qos=2)
-    client.subscribe("device/commands/calibrate", qos=2)
-    client.subscribe("device/commands/restart", qos=2)
-    client.subscribe("device/commands/reset", qos=2)
+    for topic, qos in TOPICS:
+        if topic.startswith("device/config/") or topic.startswith("device/commands/"):
+            client.subscribe(topic, qos=qos)
 
 def on_message(client, userdata, msg):
     topic = msg.topic
-    payload = msg.payload.decode()
-    # Handle configuration and commands
+    payload_text = msg.payload.decode("utf-8")
+    try:
+        payload = json.loads(payload_text)
+    except:
+        payload = payload_text
+
+    # Configurations
     if topic == "device/config/alarm_threshold":
-        try:
-            data = json.loads(payload)
-            state["alarm_threshold"].update(data)
-            # Optionally publish confirmation
-            client.publish("device/config/alarm_threshold/ack",
-                payload=json.dumps({"result": "ok", "threshold": state["alarm_threshold"]}),
-                qos=2,
-                retain=False)
-        except Exception:
-            client.publish("device/config/alarm_threshold/ack",
-                payload=json.dumps({"result": "error"}),
-                qos=2)
+        if isinstance(payload, dict):
+            device_state["alarm_threshold"].update(payload)
+            publish_json("device/config/alarm_threshold", {"result": "ok", "set": device_state["alarm_threshold"]}, qos=2)
     elif topic == "device/config/led":
-        if payload.startswith("BRIGHTNESS:"):
-            try:
-                value = int(payload.split(":")[1])
-                state["led_brightness"] = value
-                state["status"]["led"] = "on" if value > 0 else "off"
-                client.publish("device/config/led/ack",
-                    payload=json.dumps({"result": "ok", "led_brightness": value}),
-                    qos=2)
-            except Exception:
-                client.publish("device/config/led/ack",
-                    payload=json.dumps({"result": "error"}),
-                    qos=2)
+        if isinstance(payload, str) and payload.startswith("BRIGHTNESS:"):
+            level = int(payload.split(":", 1)[1])
+            device_state["led_brightness"] = level
+            device_state["status"]["led"] = "on" if level > 0 else "off"
+            publish_json("device/config/led", {"result": "ok", "brightness": level}, qos=2)
     elif topic == "device/config/buzzer":
-        if payload in ("ENABLE", "DISABLE"):
-            state["buzzer"] = payload
-            client.publish("device/config/buzzer/ack",
-                payload=json.dumps({"result": "ok", "buzzer": payload}),
-                qos=2)
-        else:
-            client.publish("device/config/buzzer/ack",
-                payload=json.dumps({"result": "error"}),
-                qos=2)
+        if payload in ["ENABLE", "DISABLE"]:
+            device_state["buzzer"] = payload
+            publish_json("device/config/buzzer", {"result": "ok", "buzzer": payload}, qos=2)
+    # Commands
     elif topic == "device/commands/calibrate":
-        if payload.strip().upper() == "CALIBRATE":
-            # Simulate calibration
-            client.publish("device/commands/calibrate/ack",
-                payload=json.dumps({"result": "calibrated"}),
-                qos=2)
+        # Simulate calibration
+        publish_json("device/commands/calibrate", {"result": "calibration started"}, qos=2)
+        time.sleep(1) # Simulate delay
+        publish_json("device/commands/calibrate", {"result": "calibration complete"}, qos=2)
     elif topic == "device/commands/restart":
-        if payload.strip().upper() == "RESTART":
-            client.publish("device/commands/restart/ack",
-                payload=json.dumps({"result": "restarting"}),
-                qos=2)
-            time.sleep(1)
-            os.execv(sys.executable, ['python'] + sys.argv)
+        publish_json("device/commands/restart", {"result": "device restarting"}, qos=2)
+        time.sleep(1)
+        publish_json("device/commands/restart", {"result": "device online"}, qos=2)
     elif topic == "device/commands/reset":
-        if payload.strip().upper() == "RESET":
-            # Simulate reset
-            state["temperature"] = 22.5
-            state["humidity"] = 45
-            state["airquality"] = {"PM2.5": 12, "CO2": 400}
-            state["battery"] = 100
-            state["status"] = {"status": "normal", "led": "on"}
-            state["led_brightness"] = 75
-            state["buzzer"] = "DISABLE"
-            state["alarm_threshold"] = {"PM2.5": 35, "CO2": 800}
-            state["alarm_active"] = False
-            client.publish("device/commands/reset/ack",
-                payload=json.dumps({"result": "reset"}),
-                qos=2)
+        publish_json("device/commands/reset", {"result": "device resetting"}, qos=2)
+        time.sleep(2)
+        # Reset state
+        device_state["temperature"] = 22.0
+        device_state["humidity"] = 50.0
+        device_state["airquality"] = {"PM2.5": 12, "CO2": 400}
+        device_state["battery"] = 100
+        device_state["status"] = {"status": "normal", "led": "on"}
+        publish_json("device/commands/reset", {"result": "reset complete"}, qos=2)
 
-client.on_connect = on_connect
-client.on_message = on_message
-
-def simulate_sensor():
-    # Simulate changing sensor values
-    state["temperature"] = round(20 + random.uniform(-2, 3), 1)
-    state["humidity"] = int(40 + random.uniform(-5, 10))
-    state["airquality"]["PM2.5"] = int(10 + random.uniform(-2, 7))
-    state["airquality"]["CO2"] = int(400 + random.uniform(-20, 50))
-    state["battery"] = max(0, state["battery"] - random.uniform(0.01, 0.1))
-    # Alarm check
-    alarm = None
-    for k in ("PM2.5", "CO2"):
-        if state["airquality"][k] > state["alarm_threshold"].get(k, 99999):
-            alarm = {"alarm": "threshold exceeded", "sensor": k, "value": state["airquality"][k]}
-            state["alarm_active"] = True
-            break
-    if alarm:
-        client.publish(
-            "device/alerts/alarm",
-            payload=json.dumps(alarm),
-            qos=2
-        )
-    else:
-        state["alarm_active"] = False
-
-def publish_telemetry():
-    while True:
-        simulate_sensor()
-        # Publish temperature
-        temp_payload = json.dumps({"temperature": state["temperature"], "unit": "C"})
-        client.publish("device/sensors/temperature", payload=temp_payload, qos=0)
-        # Publish humidity
-        hum_payload = json.dumps({"humidity": state["humidity"], "unit": "%"})
-        client.publish("device/sensors/humidity", payload=hum_payload, qos=0)
-        # Publish battery
-        bat_payload = json.dumps({"battery": int(state["battery"])})
-        client.publish("device/sensors/battery", payload=bat_payload, qos=0)
-        # Publish status
-        status_payload = json.dumps(state["status"])
-        client.publish("device/sensors/status", payload=status_payload, qos=1)
-        # Wait 30s for next batch
-        time.sleep(PUBLISH_INTERVAL_30S)
-
-def publish_airquality():
-    while True:
-        air_payload = json.dumps(state["airquality"])
-        client.publish("device/sensors/airquality", payload=air_payload, qos=0)
-        time.sleep(PUBLISH_INTERVAL_60S)
+# ---- Main ----
 
 def main():
-    client.will_set("device/sensors/status", payload=json.dumps({"status": "offline"}), qos=1, retain=True)
-    client.connect(MQTT_BROKER, MQTT_PORT, 60)
-    # Start background publishing threads
-    t1 = threading.Thread(target=publish_telemetry, daemon=True)
-    t2 = threading.Thread(target=publish_airquality, daemon=True)
-    t1.start()
-    t2.start()
+    client.on_connect = on_connect
+    client.on_message = on_message
+    client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+    # Start telemetry threads
+    threading.Thread(target=simulate_telemetry, daemon=True).start()
+    threading.Thread(target=simulate_airquality, daemon=True).start()
+    # Loop forever
     client.loop_forever()
 
 if __name__ == "__main__":
