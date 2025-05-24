@@ -2,253 +2,261 @@
 #include <cstring>
 #include <iostream>
 #include <thread>
-#include <chrono>
 #include <mutex>
-#include <condition_variable>
-#include <queue>
 #include <atomic>
+#include <chrono>
+#include <vector>
+#include <map>
+#include <condition_variable>
 #include <json/json.h>
 #include "HCNetSDK.h"
-#include "mqtt/async_client.h"
+#include "MQTTClient.h"
 
-// ========================== Configuration via ENV ==========================
-struct Config {
-    std::string device_ip;
-    int device_port;
-    std::string device_user;
-    std::string device_password;
-    std::string mqtt_broker;
-    int mqtt_port;
-    std::string mqtt_client_id;
-    std::string mqtt_username;
-    std::string mqtt_password;
-    int mqtt_keepalive;
+#define QOS_1 1
+#define TIMEOUT 10000L
 
-    static Config from_env() {
-        Config cfg;
-        cfg.device_ip        = std::getenv("DEVICE_IP")        ? std::getenv("DEVICE_IP")        : "192.168.1.100";
-        cfg.device_port      = std::getenv("DEVICE_PORT")      ? std::stoi(std::getenv("DEVICE_PORT")) : 8000;
-        cfg.device_user      = std::getenv("DEVICE_USER")      ? std::getenv("DEVICE_USER")      : "admin";
-        cfg.device_password  = std::getenv("DEVICE_PASSWORD")  ? std::getenv("DEVICE_PASSWORD")  : "12345";
-        cfg.mqtt_broker      = std::getenv("MQTT_BROKER")      ? std::getenv("MQTT_BROKER")      : "tcp://localhost:1883";
-        cfg.mqtt_port        = std::getenv("MQTT_PORT")        ? std::stoi(std::getenv("MQTT_PORT")) : 1883;
-        cfg.mqtt_client_id   = std::getenv("MQTT_CLIENT_ID")   ? std::getenv("MQTT_CLIENT_ID")   : "hikvision_decoder_driver";
-        cfg.mqtt_username    = std::getenv("MQTT_USERNAME")    ? std::getenv("MQTT_USERNAME")    : "";
-        cfg.mqtt_password    = std::getenv("MQTT_PASSWORD")    ? std::getenv("MQTT_PASSWORD")    : "";
-        cfg.mqtt_keepalive   = std::getenv("MQTT_KEEPALIVE")   ? std::stoi(std::getenv("MQTT_KEEPALIVE")) : 60;
-        return cfg;
-    }
-};
-
-// ========================== Utility ==========================
-void log(const std::string& msg) {
-    std::cout << "[driver] " << msg << std::endl;
+// Helper: Get env var with optional default
+std::string getenv_def(const char* name, const char* def = nullptr) {
+    const char* val = std::getenv(name);
+    return val ? val : (def ? def : "");
 }
 
-// ========================== HCNetSDK Session ==========================
-class HikSession {
+// HCNetSDK management
+class HikvisionDecoder {
 public:
-    HikSession(const Config& cfg)
-        : cfg_(cfg), user_id_(-1) {
+    HikvisionDecoder(const std::string& ip, int port, const std::string& user, const std::string& pass)
+        : m_lUserID(-1), m_ip(ip), m_port(port), m_user(user), m_pass(pass) {
         NET_DVR_Init();
     }
-    ~HikSession() {
-        if (user_id_ >= 0) {
-            NET_DVR_Logout(user_id_);
+    ~HikvisionDecoder() {
+        if (m_lUserID >= 0) {
+            NET_DVR_Logout(m_lUserID);
         }
         NET_DVR_Cleanup();
     }
     bool login() {
         NET_DVR_USER_LOGIN_INFO loginInfo = {0};
         NET_DVR_DEVICEINFO_V40 devInfo = {0};
-        strncpy(loginInfo.sDeviceAddress, cfg_.device_ip.c_str(), sizeof(loginInfo.sDeviceAddress) - 1);
-        strncpy(loginInfo.sUserName, cfg_.device_user.c_str(), sizeof(loginInfo.sUserName) - 1);
-        strncpy(loginInfo.sPassword, cfg_.device_password.c_str(), sizeof(loginInfo.sPassword) - 1);
-        loginInfo.wPort = cfg_.device_port;
+        strncpy(loginInfo.sDeviceAddress, m_ip.c_str(), sizeof(loginInfo.sDeviceAddress) - 1);
+        loginInfo.wPort = m_port;
+        strncpy(loginInfo.sUserName, m_user.c_str(), sizeof(loginInfo.sUserName) - 1);
+        strncpy(loginInfo.sPassword, m_pass.c_str(), sizeof(loginInfo.sPassword) - 1);
         loginInfo.bUseAsynLogin = 0;
-        user_id_ = NET_DVR_Login_V40(&loginInfo, &devInfo);
-        if (user_id_ < 0) {
-            log("Login failed: " + std::to_string(NET_DVR_GetLastError()));
-            return false;
-        }
-        log("Login success.");
-        return true;
+        m_lUserID = NET_DVR_Login_V40(&loginInfo, &devInfo);
+        return m_lUserID >= 0;
     }
-    LONG user_id() const { return user_id_; }
-
-    // --- Device Operations ---
-    bool enable_decoder_channel(int channel, bool enable) {
-        NET_DVR_MATRIX_CHAN_STATUS status = {0};
-        status.dwSize = sizeof(status);
-        status.byEnable = enable ? 1 : 0;
-        if (!NET_DVR_SetDVRConfig(user_id_, NET_DVR_SET_MATRIX_CHAN_STATUS, channel, &status, sizeof(status))) {
-            log("Enable/Disable decoder channel failed: " + std::to_string(NET_DVR_GetLastError()));
-            return false;
+    void logout() {
+        if (m_lUserID >= 0) {
+            NET_DVR_Logout(m_lUserID);
+            m_lUserID = -1;
         }
-        return true;
     }
+    // Example: Enable/Disable decoder channel
+    bool setDecoderChannel(int channel, bool enable) {
+        NET_DVR_MATRIX_DEC_CHAN_ENABLE decEnable = {0};
+        decEnable.dwSize = sizeof(decEnable);
+        decEnable.dwEnable = enable ? 1 : 0;
+        LONG ret = NET_DVR_SetDVRConfig(m_lUserID, NET_DVR_MATRIX_DEC_CHAN_ENABLE, channel, &decEnable, sizeof(decEnable));
+        return ret == TRUE;
+    }
+    // Example: Reboot device
     bool reboot() {
-        if (!NET_DVR_RebootDVR(user_id_)) {
-            log("Reboot failed: " + std::to_string(NET_DVR_GetLastError()));
-            return false;
-        }
-        return true;
+        return NET_DVR_RebootDVR(m_lUserID) == TRUE;
     }
-    bool set_config(const Json::Value& config) {
-        // Example: set network param
-        if (config.isMember("network")) {
-            // ... parse and set network config using NET_DVR_SetDVRConfig
-            // For brevity, not fully implemented
+    // Example: Set config - expects config in JSON
+    bool setConfig(const Json::Value& cfg) {
+        // Only implements time, network, user as examples
+        bool ok = true;
+        if (cfg.isMember("time")) {
+            NET_DVR_TIME time = {0};
+            auto t = cfg["time"];
+            time.dwYear = t.get("year", 2023).asUInt();
+            time.dwMonth = t.get("month", 1).asUInt();
+            time.dwDay = t.get("day", 1).asUInt();
+            time.dwHour = t.get("hour", 0).asUInt();
+            time.dwMinute = t.get("minute", 0).asUInt();
+            time.dwSecond = t.get("second", 0).asUInt();
+            ok &= NET_DVR_SetDVRConfig(m_lUserID, NET_DVR_SET_TIMECFG, 0, &time, sizeof(time));
         }
-        // ... handle other config parameters
-        return true;
+        // ... Implement other config as needed
+        return ok;
     }
-    Json::Value get_status() {
+    // Gather status for telemetry
+    Json::Value getStatus() {
         Json::Value status;
-        // Example: get decoder channel status
-        NET_DVR_MATRIX_CHAN_STATUS chanStatus[16] = {0};
-        DWORD returned = 0;
-        if (!NET_DVR_GetDVRConfig(user_id_, NET_DVR_GET_MATRIX_CHAN_STATUS, 0, chanStatus, sizeof(chanStatus), &returned)) {
-            log("Get decoder channel status failed: " + std::to_string(NET_DVR_GetLastError()));
+        NET_DVR_WORKSTATE_V40 workState = {0};
+        DWORD dwReturned = 0;
+        if (NET_DVR_GetDVRWorkState_V40(m_lUserID, &workState)) {
+            status["device_health"] = (bool)workState.struDeviceStatic.struDeviceStaticInfo.byDeviceStatus;
+            status["decoder_channel_status"] = Json::arrayValue;
+            for (int i = 0; i < workState.dwDecChanNum; ++i) {
+                Json::Value ch;
+                ch["channel"] = i + 1;
+                ch["status"] = (unsigned)workState.pDecChanStatus[i].byDecodeStatus;
+                status["decoder_channel_status"].append(ch);
+            }
+            status["alarm_in_status"] = (unsigned)workState.struDeviceStatic.struDeviceStaticInfo.byAlarmInStatus;
+            status["alarm_out_status"] = (unsigned)workState.struDeviceStatic.struDeviceStaticInfo.byAlarmOutStatus;
+        } else {
+            status["error"] = (int)NET_DVR_GetLastError();
         }
-        for (int i = 0; i < returned / sizeof(NET_DVR_MATRIX_CHAN_STATUS); ++i) {
-            Json::Value c;
-            c["channel"]     = i + 1;
-            c["enabled"]     = chanStatus[i].byEnable == 1;
-            c["decodeState"] = chanStatus[i].byDecState;
-            status["decoder_channels"].append(c);
-        }
-        // ... gather more status if needed
-        status["run_status"] = "OK";
         return status;
     }
-
 private:
-    Config cfg_;
-    LONG user_id_;
+    LONG m_lUserID;
+    std::string m_ip;
+    int m_port;
+    std::string m_user, m_pass;
 };
 
-// ========================== MQTT Handling ==========================
-class MqttDriver {
+// MQTT Client wrapper
+class MQTTWrapper {
 public:
-    MqttDriver(const Config& cfg, HikSession& hik)
-        : cfg_(cfg), hik_(hik), client_(cfg.mqtt_broker, cfg.mqtt_client_id),
-          status_thread_(), running_(false)
-    {
-        mqtt::connect_options connopts;
-        connopts.set_keep_alive_interval(cfg_.mqtt_keepalive);
-        if (!cfg_.mqtt_username.empty()) {
-            connopts.set_user_name(cfg_.mqtt_username);
-            connopts.set_password(cfg_.mqtt_password);
+    MQTTWrapper(const std::string& broker, int port, const std::string& client_id)
+        : m_broker(broker), m_port(port), m_client_id(client_id), m_connected(false) {
+        MQTTClient_create(&m_client, (m_broker + ":" + std::to_string(m_port)).c_str(),
+                          m_client_id.c_str(), MQTTCLIENT_PERSISTENCE_NONE, NULL);
+        MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+        conn_opts.keepAliveInterval = 20;
+        conn_opts.cleansession = 1;
+        if (MQTTClient_connect(m_client, &conn_opts) == MQTTCLIENT_SUCCESS) {
+            m_connected = true;
         }
-        client_.set_connected_handler([this](const std::string&) {
-            log("Connected to MQTT broker");
-            client_.subscribe("device/commands/decoder", cfg_.mqtt_qos, nullptr, nullptr);
-            client_.subscribe("device/commands/reboot", cfg_.mqtt_qos, nullptr, nullptr);
-            client_.subscribe("device/commands/config", cfg_.mqtt_qos, nullptr, nullptr);
-        });
-        client_.set_message_callback([this](mqtt::const_message_ptr msg) {
-            handle_mqtt_message(msg);
-        });
-        client_.set_connection_lost_handler([this](const std::string&) {
-            log("MQTT connection lost");
-        });
-        cfg_.mqtt_qos = 1; // All API endpoints specify QoS 1
-
-        log("Connecting to MQTT...");
-        client_.connect(connopts)->wait();
     }
-    ~MqttDriver() {
-        stop();
-        client_.disconnect()->wait();
+    ~MQTTWrapper() {
+        if (m_connected)
+            MQTTClient_disconnect(m_client, 1000);
+        MQTTClient_destroy(&m_client);
     }
-    void start() {
-        running_ = true;
-        status_thread_ = std::thread([this]() { this->status_publisher_loop(); });
+    bool publish(const std::string& topic, const std::string& payload, int qos) {
+        MQTTClient_message pubmsg = MQTTClient_message_initializer;
+        pubmsg.payload = (void*)payload.c_str();
+        pubmsg.payloadlen = (int)payload.size();
+        pubmsg.qos = qos;
+        pubmsg.retained = 0;
+        MQTTClient_deliveryToken token;
+        return MQTTClient_publishMessage(m_client, topic.c_str(), &pubmsg, &token) == MQTTCLIENT_SUCCESS &&
+            MQTTClient_waitForCompletion(m_client, token, TIMEOUT) == MQTTCLIENT_SUCCESS;
     }
-    void stop() {
-        running_ = false;
-        if (status_thread_.joinable())
-            status_thread_.join();
+    bool subscribe(const std::string& topic, int qos) {
+        return MQTTClient_subscribe(m_client, topic.c_str(), qos) == MQTTCLIENT_SUCCESS;
     }
-
+    void setCallback(MQTTClient_messageArrived* msgArrived, void* context) {
+        MQTTClient_setCallbacks(m_client, context, NULL, msgArrived, NULL);
+    }
+    MQTTClient m_client;
+    bool m_connected;
 private:
-    Config cfg_;
-    HikSession& hik_;
-    mqtt::async_client client_;
-    std::thread status_thread_;
-    std::atomic<bool> running_;
-
-    void handle_mqtt_message(mqtt::const_message_ptr msg) {
-        std::string topic = msg->get_topic();
-        std::string payload = msg->to_string();
-        Json::Value root;
-        Json::CharReaderBuilder reader;
-        std::string errs;
-        if (!Json::parseFromStream(reader, payload, &root, &errs)) {
-            log("JSON parse error: " + errs);
-            return;
-        }
-        if (topic == "device/commands/decoder") {
-            // Format: { "action": "enable"/"disable", "channel": <num> }
-            bool res = false;
-            if (root.isMember("action") && root.isMember("channel")) {
-                int channel = root["channel"].asInt();
-                bool enable = root["action"].asString() == "enable";
-                res = hik_.enable_decoder_channel(channel, enable);
-            }
-            publish_ack("device/commands/decoder/ack", res);
-        }
-        else if (topic == "device/commands/reboot") {
-            // Format: { "command": "reboot" }
-            bool res = root.isMember("command") && root["command"].asString() == "reboot"
-                       && hik_.reboot();
-            publish_ack("device/commands/reboot/ack", res);
-        }
-        else if (topic == "device/commands/config") {
-            bool res = hik_.set_config(root);
-            publish_ack("device/commands/config/ack", res);
-        }
-    }
-    void publish_ack(const std::string& topic, bool success) {
-        Json::Value ack;
-        ack["result"] = success ? "ok" : "fail";
-        mqtt::message_ptr pubmsg = mqtt::make_message(topic, Json::FastWriter().write(ack));
-        pubmsg->set_qos(1);
-        client_.publish(pubmsg);
-    }
-    void status_publisher_loop() {
-        while (running_) {
-            Json::Value status = hik_.get_status();
-            mqtt::message_ptr pubmsg = mqtt::make_message("device/status", Json::FastWriter().write(status));
-            pubmsg->set_qos(1);
-            client_.publish(pubmsg);
-            std::this_thread::sleep_for(std::chrono::seconds(5));
-        }
-    }
+    std::string m_broker;
+    int m_port;
+    std::string m_client_id;
 };
 
-// ========================== MAIN ==========================
-int main() {
-    Config cfg = Config::from_env();
+// Global references
+std::atomic<bool> g_running{true};
+std::mutex g_status_mutex;
+Json::Value g_last_status;
 
-    log("Initializing Hikvision session...");
-    HikSession hik(cfg);
-    if (!hik.login()) {
-        log("Failed to login to device. Exiting.");
+// MQTT message arrived callback
+int messageArrived(void* context, char* topicName, int topicLen, MQTTClient_message* message) {
+    HikvisionDecoder* decoder = static_cast<HikvisionDecoder*>(context);
+    std::string topic(topicName, topicLen > 0 ? topicLen : strlen(topicName));
+    std::string payload((char*)message->payload, message->payloadlen);
+    Json::Value resp;
+    Json::CharReaderBuilder rbuilder;
+    std::string errs;
+    Json::Value root;
+    std::istringstream iss(payload);
+    bool parseOk = Json::parseFromStream(rbuilder, iss, &root, &errs);
+    if (topic == "device/commands/decoder" && parseOk) {
+        std::string action = root.get("action", "").asString();
+        int channel = root.get("channel", -1).asInt();
+        bool ok = false;
+        if (action == "enable" && channel > 0)
+            ok = decoder->setDecoderChannel(channel, true);
+        else if (action == "disable" && channel > 0)
+            ok = decoder->setDecoderChannel(channel, false);
+        resp["result"] = ok ? "success" : "fail";
+        resp["action"] = action;
+        resp["channel"] = channel;
+    } else if (topic == "device/commands/reboot" && parseOk) {
+        if (root.get("command", "") == "reboot") {
+            bool ok = decoder->reboot();
+            resp["result"] = ok ? "success" : "fail";
+        }
+    } else if (topic == "device/commands/config" && parseOk) {
+        bool ok = decoder->setConfig(root);
+        resp["result"] = ok ? "success" : "fail";
+    }
+    if (!resp.isNull()) {
+        Json::StreamWriterBuilder wbuilder;
+        std::string ans = Json::writeString(wbuilder, resp);
+        MQTTWrapper* mqtt = (MQTTWrapper*)(((void**)context)[1]);
+        mqtt->publish("device/commands/response", ans, QOS_1);
+    }
+    MQTTClient_freeMessage(&message);
+    MQTTClient_free(topicName);
+    return 1;
+}
+
+void telemetryLoop(HikvisionDecoder* decoder, MQTTWrapper* mqtt, int interval_sec) {
+    while (g_running) {
+        Json::Value status = decoder->getStatus();
+        {
+            std::lock_guard<std::mutex> lock(g_status_mutex);
+            g_last_status = status;
+        }
+        Json::StreamWriterBuilder wbuilder;
+        std::string payload = Json::writeString(wbuilder, status);
+        mqtt->publish("device/status", payload, QOS_1);
+        std::this_thread::sleep_for(std::chrono::seconds(interval_sec));
+    }
+}
+
+int main() {
+    // Environment: device config
+    std::string dev_ip   = getenv_def("DEVICE_IP", "192.168.1.64");
+    int dev_port         = std::stoi(getenv_def("DEVICE_PORT", "8000"));
+    std::string dev_user = getenv_def("DEVICE_USER", "admin");
+    std::string dev_pass = getenv_def("DEVICE_PASSWORD", "12345");
+    // MQTT config
+    std::string mqtt_host = getenv_def("MQTT_BROKER", "tcp://127.0.0.1");
+    int mqtt_port         = std::stoi(getenv_def("MQTT_PORT", "1883"));
+    std::string mqtt_clientid = getenv_def("MQTT_CLIENT_ID", "hikvision_decoder_driver");
+    int telemetry_interval = std::stoi(getenv_def("TELEMETRY_INTERVAL", "5"));
+
+    HikvisionDecoder decoder(dev_ip, dev_port, dev_user, dev_pass);
+    if (!decoder.login()) {
+        std::cerr << "Failed to login to device at " << dev_ip << ":" << dev_port << std::endl;
         return 1;
     }
+    MQTTWrapper mqtt(mqtt_host, mqtt_port, mqtt_clientid);
+    if (!mqtt.m_connected) {
+        std::cerr << "Failed to connect to MQTT broker " << mqtt_host << ":" << mqtt_port << std::endl;
+        return 2;
+    }
 
-    log("Initializing MQTT driver...");
-    MqttDriver driver(cfg, hik);
-    driver.start();
+    // Subscribe to command topics
+    mqtt.subscribe("device/commands/decoder", QOS_1);
+    mqtt.subscribe("device/commands/reboot", QOS_1);
+    mqtt.subscribe("device/commands/config", QOS_1);
 
-    log("Driver running. Press Ctrl+C to exit.");
-    std::mutex m;
-    std::unique_lock<std::mutex> lk(m);
-    std::condition_variable cv;
-    cv.wait(lk); // Wait forever
+    // Set callback
+    void* context[2] = {&decoder, &mqtt};
+    mqtt.setCallback(messageArrived, context);
 
-    driver.stop();
+    // Start telemetry thread
+    std::thread telemetry_thread(telemetryLoop, &decoder, &mqtt, telemetry_interval);
+
+    // Also support subscribe to device/status (for other clients)
+    mqtt.subscribe("device/status", QOS_1);
+
+    std::cout << "MQTT driver for Hikvision Decoder running. Press Ctrl+C to exit." << std::endl;
+    // Run main loop (wait for exit)
+    while (g_running) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+    telemetry_thread.join();
+    decoder.logout();
     return 0;
 }
