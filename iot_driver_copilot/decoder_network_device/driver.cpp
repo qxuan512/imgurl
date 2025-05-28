@@ -1,302 +1,396 @@
 #include <iostream>
-#include <fstream>
-#include <sstream>
-#include <string>
 #include <cstdlib>
-#include <map>
-#include <mutex>
-#include <thread>
-#include <vector>
-#include <ctime>
 #include <cstring>
-#include <json/json.h>
-#include <microhttpd.h>
+#include <string>
+#include <sstream>
+#include <vector>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <map>
+#include <fstream>
+#include <streambuf>
+#include <ctime>
+#include <unistd.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/types.h>
 
-extern "C" {
-// Placeholders for HCNetSDK functions and types
-typedef int LONG;
-typedef struct { int dummy; } NET_DVR_DEVICEINFO_V30;
-LONG NET_DVR_Init() { return 1; }
-void NET_DVR_Cleanup() {}
-LONG NET_DVR_Login_V30(const char* ip, int port, const char* user, const char* pwd, NET_DVR_DEVICEINFO_V30* devinfo) { return 1; }
-LONG NET_DVR_Logout(LONG userID) { return 1; }
-int NET_DVR_ActivateDevice(const char* ip, int port, const char* pass) { return 1; }
-int NET_DVR_RebootDVR(LONG userID) { return 1; }
-int NET_DVR_GetDeviceStatus(LONG userID, std::string& outStatus) { outStatus = "{\"device\":\"ok\",\"channels\":[{\"id\":1,\"state\":\"playing\"}]}"; return 1; }
-int NET_DVR_RemotePlaybackControl(LONG userID, const std::string& cmd, Json::Value& params, std::string& outResult) { outResult = "{\"playback\":\"success\"}"; return 1; }
-int NET_DVR_SetDisplayConfig(LONG userID, Json::Value& config, std::string& outResult) { outResult = "{\"config\":\"updated\"}"; return 1; }
+// HCNetSDK C++ header simulation (to be replaced with actual SDK headers)
+// #include "HCNetSDK.h"
+
+#define BUFFER_SIZE 8192
+
+// --- Utility Functions ---
+
+std::string get_env(const char *key, const char *default_val = "") {
+    const char *val = std::getenv(key);
+    return val ? std::string(val) : std::string(default_val);
 }
 
-#define PORT_ENV "HTTP_PORT"
-#define DEVICE_IP_ENV "DEVICE_IP"
-#define DEVICE_PORT_ENV "DEVICE_PORT"
-#define DEVICE_USER_ENV "DEVICE_USER"
-#define DEVICE_PASS_ENV "DEVICE_PASS"
-#define SDK_ACTIVATE_PASS_ENV "SDK_ACTIVATE_PASS"
+std::string now_iso8601() {
+    time_t t = std::time(nullptr);
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%FT%TZ", std::gmtime(&t));
+    return buf;
+}
 
-// Global session manager
-struct Session {
-    LONG userID;
-    std::string token;
-    std::time_t expiry;
+std::string http_status_message(int code) {
+    switch (code) {
+        case 200: return "OK";
+        case 201: return "Created";
+        case 204: return "No Content";
+        case 400: return "Bad Request";
+        case 401: return "Unauthorized";
+        case 403: return "Forbidden";
+        case 404: return "Not Found";
+        case 405: return "Method Not Allowed";
+        case 500: return "Internal Server Error";
+        case 503: return "Service Unavailable";
+        default:  return "Unknown";
+    }
+}
+
+void send_http_response(int client_fd, int status_code, const std::string &content_type, const std::string &body) {
+    std::ostringstream oss;
+    oss << "HTTP/1.1 " << status_code << " " << http_status_message(status_code) << "\r\n";
+    oss << "Content-Type: " << content_type << "\r\n";
+    oss << "Content-Length: " << body.size() << "\r\n";
+    oss << "Access-Control-Allow-Origin: *\r\n";
+    oss << "Connection: close\r\n";
+    oss << "\r\n";
+    oss << body;
+    std::string response = oss.str();
+    send(client_fd, response.c_str(), response.size(), 0);
+}
+
+// --- Global State and Device Session Management ---
+
+std::mutex state_mutex;
+struct DeviceSession {
+    std::string session_token;
+    bool logged_in;
+    std::string username;
+    std::string password;
+    // HCNetSDK session info; replace with actual handles
+    int user_id;
+    DeviceSession() : session_token(""), logged_in(false), user_id(-1) {}
+} g_session;
+
+// --- Device SDK Interaction Simulations ---
+// In actual implementation, replace these with direct SDK calls.
+
+bool sdk_initialize() {
+    // return NET_DVR_Init();
+    return true;
+}
+
+bool sdk_cleanup() {
+    // NET_DVR_Cleanup();
+    return true;
+}
+
+bool sdk_login(const std::string &ip, int port, const std::string &user, const std::string &pass, int &user_id) {
+    // NET_DVR_DEVICEINFO_V30 devinfo;
+    // user_id = NET_DVR_Login_V30(ip.c_str(), port, user.c_str(), pass.c_str(), &devinfo);
+    // return user_id >= 0;
+    user_id = 1; // Simulated user id
+    return true;
+}
+
+bool sdk_logout(int user_id) {
+    // return NET_DVR_Logout(user_id);
+    return true;
+}
+
+bool sdk_activate(const std::string &ip, int port, const std::string &password) {
+    // NET_DVR_ActivateDevice(ip.c_str(), port, password.c_str());
+    return true;
+}
+
+bool sdk_reboot(int user_id) {
+    // NET_DVR_RebootDVR(user_id);
+    return true;
+}
+
+std::string sdk_get_status(int user_id) {
+    // Simulate status as JSON
+    std::ostringstream oss;
+    oss << "{";
+    oss << "\"timestamp\":\"" << now_iso8601() << "\",";
+    oss << "\"device\":{\"model\":\"DS-6300D-JX\",\"manufacturer\":\"Hikvision\"},";
+    oss << "\"channels\":[{\"id\":1,\"status\":\"online\"},{\"id\":2,\"status\":\"offline\"}],";
+    oss << "\"alarms\":[],";
+    oss << "\"sdk\":{\"state\":\"active\",\"version\":\"5.7.0\"},";
+    oss << "\"error_codes\":[]";
+    oss << "}";
+    return oss.str();
+}
+
+bool sdk_update_display_config(int user_id, const std::string &config_json) {
+    // Parse config_json and apply to SDK
+    return true;
+}
+
+bool sdk_playback_control(int user_id, const std::string &playback_json) {
+    // Parse playback_json and send playback commands to SDK
+    return true;
+}
+
+// --- HTTP Request Parsing ---
+
+struct HttpRequest {
+    std::string method;
+    std::string path;
+    std::string http_version;
+    std::map<std::string, std::string> headers;
+    std::string body;
 };
-std::mutex g_sessions_mutex;
-std::map<std::string, Session> g_sessions;
 
-static std::string generate_token() {
-    static const char alphanum[] =
-        "0123456789"
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        "abcdefghijklmnopqrstuvwxyz";
-    int len = 32;
-    std::string token;
-    for (int i = 0; i < len; ++i)
-        token += alphanum[rand() % (sizeof(alphanum) - 1)];
-    return token;
-}
-
-static bool validate_token(const std::string& token, LONG& userID) {
-    std::lock_guard<std::mutex> lock(g_sessions_mutex);
-    auto it = g_sessions.find(token);
-    if (it == g_sessions.end()) return false;
-    if (std::time(nullptr) > it->second.expiry) {
-        g_sessions.erase(it);
-        return false;
+bool parse_http_request(const std::string &raw, HttpRequest &req) {
+    std::istringstream iss(raw);
+    std::string line;
+    if (!std::getline(iss, line)) return false;
+    std::istringstream ls(line);
+    ls >> req.method >> req.path >> req.http_version;
+    while (std::getline(iss, line) && line != "\r") {
+        auto pos = line.find(':');
+        if (pos != std::string::npos) {
+            std::string key = line.substr(0, pos);
+            std::string val = line.substr(pos + 1);
+            while (!val.empty() && (val[0] == ' ' || val[0] == '\t')) val.erase(0, 1);
+            if (!val.empty() && val.back() == '\r') val.pop_back();
+            req.headers[key] = val;
+        }
     }
-    userID = it->second.userID;
+    if (req.headers.count("Content-Length")) {
+        int content_length = std::stoi(req.headers["Content-Length"]);
+        std::string body(content_length, 0);
+        iss.read(&body[0], content_length);
+        req.body = body;
+    }
     return true;
 }
 
-static void invalidate_token(const std::string& token) {
-    std::lock_guard<std::mutex> lock(g_sessions_mutex);
-    g_sessions.erase(token);
+// --- Session Token Generation ---
+
+std::string generate_token() {
+    static const char alpha[] = "0123456789abcdef";
+    std::ostringstream oss;
+    for (int i = 0; i < 32; ++i)
+        oss << alpha[rand() % (sizeof(alpha) - 1)];
+    return oss.str();
 }
 
-static int send_response(struct MHD_Connection* connection, int status_code, const std::string& body, const char* content_type = "application/json") {
-    struct MHD_Response* response = MHD_create_response_from_buffer(body.size(), (void*)body.c_str(), MHD_RESPMEM_MUST_COPY);
-    MHD_add_response_header(response, "Content-Type", content_type);
-    int ret = MHD_queue_response(connection, status_code, response);
-    MHD_destroy_response(response);
-    return ret;
+// --- REST API Endpoints Implementation ---
+
+void handle_sessions_post(int client_fd, const HttpRequest &req, const std::string &device_ip, int device_port) {
+    // JSON parse: {"username": "...", "password": "..."}
+    std::string user, pass;
+    auto u = req.body.find("\"username\"");
+    auto p = req.body.find("\"password\"");
+    if (u == std::string::npos || p == std::string::npos) {
+        send_http_response(client_fd, 400, "application/json", "{\"error\":\"Missing credentials\"}");
+        return;
+    }
+    auto uq = req.body.find(':', u);
+    auto pq = req.body.find(':', p);
+    if (uq == std::string::npos || pq == std::string::npos) {
+        send_http_response(client_fd, 400, "application/json", "{\"error\":\"Malformed JSON\"}");
+        return;
+    }
+    user = req.body.substr(uq + 1, req.body.find(',', uq) - uq - 1);
+    pass = req.body.substr(pq + 1, req.body.find('}', pq) - pq - 1);
+    user.erase(remove_if(user.begin(), user.end(), [](char c){return c==' '||c=='\"'||c==','||c=='}';}), user.end());
+    pass.erase(remove_if(pass.begin(), pass.end(), [](char c){return c==' '||c=='\"'||c==','||c=='}';}), pass.end());
+
+    std::lock_guard<std::mutex> lock(state_mutex);
+    if (!sdk_initialize()) {
+        send_http_response(client_fd, 500, "application/json", "{\"error\":\"SDK init failed\"}");
+        return;
+    }
+    int user_id = -1;
+    if (!sdk_login(device_ip, device_port, user, pass, user_id)) {
+        send_http_response(client_fd, 401, "application/json", "{\"error\":\"Login failed\"}");
+        return;
+    }
+    g_session.session_token = generate_token();
+    g_session.logged_in = true;
+    g_session.username = user;
+    g_session.password = pass;
+    g_session.user_id = user_id;
+    std::ostringstream oss;
+    oss << "{\"session_token\":\"" << g_session.session_token << "\"}";
+    send_http_response(client_fd, 201, "application/json", oss.str());
 }
 
-static bool parse_json_post(struct MHD_Connection* connection, std::string& out) {
-    const char* length_str = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "Content-Length");
-    if (!length_str) return false;
-    long len = std::strtol(length_str, nullptr, 10);
-    if (len <= 0 || len > 1024*1024) return false;
-    char* buf = new char[len+1];
-    int ret = MHD_get_connection_values(connection, MHD_POSTDATA_KIND, nullptr, nullptr); // force libmicrohttpd to make POST available
-    int pos = 0;
-    const char* data;
-    size_t size;
-    MHD_get_connection_values(connection, MHD_POSTDATA_KIND, [](void* cls, enum MHD_ValueKind kind, const char* key, const char* value) {
-        std::string* out = (std::string*)cls;
-        out->assign(value);
-        return MHD_YES;
-    }, &out);
-    delete[] buf;
-    return true;
+void handle_sessions_delete(int client_fd, const HttpRequest &req) {
+    std::lock_guard<std::mutex> lock(state_mutex);
+    if (!g_session.logged_in) {
+        send_http_response(client_fd, 401, "application/json", "{\"error\":\"Not logged in\"}");
+        return;
+    }
+    if (!sdk_logout(g_session.user_id)) {
+        send_http_response(client_fd, 500, "application/json", "{\"error\":\"Logout failed\"}");
+        return;
+    }
+    sdk_cleanup();
+    g_session = DeviceSession();
+    send_http_response(client_fd, 204, "application/json", "");
 }
 
-// Utility: Get POST body
-static std::string get_post_data(struct MHD_Connection* connection) {
-    char* data = nullptr;
-    size_t size = 0;
-    MHD_get_connection_values(connection, MHD_POSTDATA_KIND, [](void* cls, enum MHD_ValueKind kind, const char* key, const char* value) {
-        std::string* str = (std::string*)cls;
-        if (value) str->assign(value);
-        return MHD_YES;
-    }, &data);
-    std::string ret;
-    if (data)
-        ret = std::string(data);
-    return ret;
+bool check_session(const HttpRequest &req) {
+    auto it = req.headers.find("Authorization");
+    if (it == req.headers.end()) return false;
+    std::string token = it->second;
+    if (token.find("Bearer ") == 0) token = token.substr(7);
+    std::lock_guard<std::mutex> lock(state_mutex);
+    return g_session.logged_in && (g_session.session_token == token);
 }
 
-// HTTP handler
-static int request_handler(void* cls, struct MHD_Connection* connection, const char* url,
-                          const char* method, const char* version,
-                          const char* upload_data, size_t* upload_data_size, void** ptr) {
-    static int dummy;
-    if (&dummy != *ptr) {
-        *ptr = &dummy;
-        return MHD_YES;
+void handle_commands_activate(int client_fd, const HttpRequest &req, const std::string &device_ip, int device_port) {
+    if (!check_session(req)) {
+        send_http_response(client_fd, 401, "application/json", "{\"error\":\"Unauthorized\"}");
+        return;
     }
-    Json::Value resp;
-    std::string token, post_data;
-    LONG userID = 0;
-    int status_code = 200;
-
-    if (strcmp(url, "/sessions") == 0 && strcmp(method, "POST") == 0) {
-        post_data = get_post_data(connection);
-        Json::Value root;
-        Json::Reader reader;
-        if (!reader.parse(post_data, root)) {
-            resp["error"] = "Invalid JSON";
-            return send_response(connection, 400, resp.toStyledString());
+    // JSON parse: {"password": "newpassword"} or reuse login password
+    std::string password = g_session.password;
+    auto p = req.body.find("\"password\"");
+    if (p != std::string::npos) {
+        auto pq = req.body.find(':', p);
+        if (pq != std::string::npos) {
+            password = req.body.substr(pq+1, req.body.find('}', pq)-pq-1);
+            password.erase(remove_if(password.begin(), password.end(), [](char c){return c==' '||c=='\"'||c==','||c=='}';}), password.end());
         }
-        std::string ip = getenv(DEVICE_IP_ENV) ? getenv(DEVICE_IP_ENV) : "";
-        int port = getenv(DEVICE_PORT_ENV) ? atoi(getenv(DEVICE_PORT_ENV)) : 8000;
-        std::string user = root.get("username", "").asString();
-        std::string pass = root.get("password", "").asString();
-        if (ip.empty() || user.empty() || pass.empty()) {
-            resp["error"] = "Missing credentials";
-            return send_response(connection, 400, resp.toStyledString());
-        }
-        NET_DVR_DEVICEINFO_V30 devinfo;
-        LONG uid = NET_DVR_Login_V30(ip.c_str(), port, user.c_str(), pass.c_str(), &devinfo);
-        if (uid <= 0) {
-            resp["error"] = "Login failed";
-            return send_response(connection, 401, resp.toStyledString());
-        }
-        std::string new_token = generate_token();
-        {
-            std::lock_guard<std::mutex> lock(g_sessions_mutex);
-            g_sessions[new_token] = {uid, new_token, std::time(nullptr) + 3600};
-        }
-        resp["token"] = new_token;
-        return send_response(connection, 200, resp.toStyledString());
     }
-    if (strcmp(url, "/sessions") == 0 && strcmp(method, "DELETE") == 0) {
-        const char* auth = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "Authorization");
-        if (!auth) {
-            resp["error"] = "Missing token";
-            return send_response(connection, 401, resp.toStyledString());
-        }
-        token = std::string(auth);
-        invalidate_token(token);
-        resp["result"] = "Logged out";
-        return send_response(connection, 200, resp.toStyledString());
+    if (!sdk_activate(device_ip, device_port, password)) {
+        send_http_response(client_fd, 500, "application/json", "{\"error\":\"Activation failed\"}");
+        return;
     }
-    if (strcmp(url, "/commands/activate") == 0 && strcmp(method, "POST") == 0) {
-        std::string ip = getenv(DEVICE_IP_ENV) ? getenv(DEVICE_IP_ENV) : "";
-        int port = getenv(DEVICE_PORT_ENV) ? atoi(getenv(DEVICE_PORT_ENV)) : 8000;
-        std::string pass = getenv(SDK_ACTIVATE_PASS_ENV) ? getenv(SDK_ACTIVATE_PASS_ENV) : "";
-        if (ip.empty() || pass.empty()) {
-            resp["error"] = "Missing device IP or activation password";
-            return send_response(connection, 400, resp.toStyledString());
-        }
-        int ret = NET_DVR_ActivateDevice(ip.c_str(), port, pass.c_str());
-        if (!ret) {
-            resp["error"] = "Activation failed";
-            return send_response(connection, 500, resp.toStyledString());
-        }
-        resp["result"] = "Device activated";
-        return send_response(connection, 200, resp.toStyledString());
-    }
-    if (strcmp(url, "/status") == 0 && strcmp(method, "GET") == 0) {
-        const char* auth = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "Authorization");
-        if (!auth) {
-            resp["error"] = "Missing token";
-            return send_response(connection, 401, resp.toStyledString());
-        }
-        token = std::string(auth);
-        if (!validate_token(token, userID)) {
-            resp["error"] = "Invalid token";
-            return send_response(connection, 403, resp.toStyledString());
-        }
-        std::string outStatus;
-        int ret = NET_DVR_GetDeviceStatus(userID, outStatus);
-        if (!ret) {
-            resp["error"] = "Failed to get status";
-            return send_response(connection, 500, resp.toStyledString());
-        }
-        return send_response(connection, 200, outStatus);
-    }
-    if (strcmp(url, "/commands/playback") == 0 && strcmp(method, "POST") == 0) {
-        const char* auth = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "Authorization");
-        if (!auth) {
-            resp["error"] = "Missing token";
-            return send_response(connection, 401, resp.toStyledString());
-        }
-        token = std::string(auth);
-        if (!validate_token(token, userID)) {
-            resp["error"] = "Invalid token";
-            return send_response(connection, 403, resp.toStyledString());
-        }
-        post_data = get_post_data(connection);
-        Json::Value root;
-        Json::Reader reader;
-        if (!reader.parse(post_data, root)) {
-            resp["error"] = "Invalid JSON";
-            return send_response(connection, 400, resp.toStyledString());
-        }
-        std::string cmd = root.get("command", "").asString();
-        if (cmd.empty()) {
-            resp["error"] = "Missing command";
-            return send_response(connection, 400, resp.toStyledString());
-        }
-        std::string outResult;
-        int ret = NET_DVR_RemotePlaybackControl(userID, cmd, root, outResult);
-        if (!ret) {
-            resp["error"] = "Playback operation failed";
-            return send_response(connection, 500, resp.toStyledString());
-        }
-        return send_response(connection, 200, outResult);
-    }
-    if (strcmp(url, "/commands/reboot") == 0 && strcmp(method, "POST") == 0) {
-        const char* auth = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "Authorization");
-        if (!auth) {
-            resp["error"] = "Missing token";
-            return send_response(connection, 401, resp.toStyledString());
-        }
-        token = std::string(auth);
-        if (!validate_token(token, userID)) {
-            resp["error"] = "Invalid token";
-            return send_response(connection, 403, resp.toStyledString());
-        }
-        int ret = NET_DVR_RebootDVR(userID);
-        if (!ret) {
-            resp["error"] = "Reboot failed";
-            return send_response(connection, 500, resp.toStyledString());
-        }
-        resp["result"] = "Device rebooted";
-        return send_response(connection, 200, resp.toStyledString());
-    }
-    if (strcmp(url, "/config/display") == 0 && strcmp(method, "PUT") == 0) {
-        const char* auth = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "Authorization");
-        if (!auth) {
-            resp["error"] = "Missing token";
-            return send_response(connection, 401, resp.toStyledString());
-        }
-        token = std::string(auth);
-        if (!validate_token(token, userID)) {
-            resp["error"] = "Invalid token";
-            return send_response(connection, 403, resp.toStyledString());
-        }
-        post_data = get_post_data(connection);
-        Json::Value config;
-        Json::Reader reader;
-        if (!reader.parse(post_data, config)) {
-            resp["error"] = "Invalid JSON";
-            return send_response(connection, 400, resp.toStyledString());
-        }
-        std::string outResult;
-        int ret = NET_DVR_SetDisplayConfig(userID, config, outResult);
-        if (!ret) {
-            resp["error"] = "Display config update failed";
-            return send_response(connection, 500, resp.toStyledString());
-        }
-        return send_response(connection, 200, outResult);
-    }
-    resp["error"] = "Not found";
-    return send_response(connection, 404, resp.toStyledString());
+    send_http_response(client_fd, 200, "application/json", "{\"status\":\"activated\"}");
 }
 
-int main(int argc, char** argv) {
-    const char* portenv = getenv(PORT_ENV);
-    int port = portenv ? atoi(portenv) : 8080;
-    NET_DVR_Init();
-    struct MHD_Daemon* daemon = MHD_start_daemon(MHD_USE_SELECT_INTERNALLY, port, NULL, NULL,
-                                                 &request_handler, NULL, MHD_OPTION_END);
-    if (!daemon) {
-        std::cerr << "Failed to start HTTP server\n";
+void handle_commands_reboot(int client_fd, const HttpRequest &req) {
+    if (!check_session(req)) {
+        send_http_response(client_fd, 401, "application/json", "{\"error\":\"Unauthorized\"}");
+        return;
+    }
+    if (!sdk_reboot(g_session.user_id)) {
+        send_http_response(client_fd, 500, "application/json", "{\"error\":\"Reboot failed\"}");
+        return;
+    }
+    send_http_response(client_fd, 200, "application/json", "{\"status\":\"rebooting\"}");
+}
+
+void handle_status_get(int client_fd, const HttpRequest &req) {
+    if (!check_session(req)) {
+        send_http_response(client_fd, 401, "application/json", "{\"error\":\"Unauthorized\"}");
+        return;
+    }
+    std::string status_json = sdk_get_status(g_session.user_id);
+    send_http_response(client_fd, 200, "application/json", status_json);
+}
+
+void handle_config_display_put(int client_fd, const HttpRequest &req) {
+    if (!check_session(req)) {
+        send_http_response(client_fd, 401, "application/json", "{\"error\":\"Unauthorized\"}");
+        return;
+    }
+    if (!sdk_update_display_config(g_session.user_id, req.body)) {
+        send_http_response(client_fd, 500, "application/json", "{\"error\":\"Update failed\"}");
+        return;
+    }
+    send_http_response(client_fd, 200, "application/json", "{\"status\":\"ok\"}");
+}
+
+void handle_commands_playback_post(int client_fd, const HttpRequest &req) {
+    if (!check_session(req)) {
+        send_http_response(client_fd, 401, "application/json", "{\"error\":\"Unauthorized\"}");
+        return;
+    }
+    if (!sdk_playback_control(g_session.user_id, req.body)) {
+        send_http_response(client_fd, 500, "application/json", "{\"error\":\"Playback failed\"}");
+        return;
+    }
+    send_http_response(client_fd, 200, "application/json", "{\"status\":\"ok\"}");
+}
+
+// --- HTTP Server Main Loop ---
+
+void handle_client(int client_fd, const std::string &device_ip, int device_port) {
+    char buffer[BUFFER_SIZE];
+    ssize_t n = recv(client_fd, buffer, BUFFER_SIZE - 1, 0);
+    if (n <= 0) { close(client_fd); return; }
+    buffer[n] = '\0';
+
+    HttpRequest req;
+    if (!parse_http_request(buffer, req)) {
+        send_http_response(client_fd, 400, "application/json", "{\"error\":\"Malformed request\"}");
+        close(client_fd);
+        return;
+    }
+
+    if (req.method == "POST" && req.path == "/sessions") {
+        handle_sessions_post(client_fd, req, device_ip, device_port);
+    } else if (req.method == "DELETE" && req.path == "/sessions") {
+        handle_sessions_delete(client_fd, req);
+    } else if (req.method == "POST" && req.path == "/commands/activate") {
+        handle_commands_activate(client_fd, req, device_ip, device_port);
+    } else if (req.method == "POST" && req.path == "/commands/reboot") {
+        handle_commands_reboot(client_fd, req);
+    } else if (req.method == "GET" && req.path == "/status") {
+        handle_status_get(client_fd, req);
+    } else if (req.method == "PUT" && req.path == "/config/display") {
+        handle_config_display_put(client_fd, req);
+    } else if (req.method == "POST" && req.path == "/commands/playback") {
+        handle_commands_playback_post(client_fd, req);
+    } else {
+        send_http_response(client_fd, 404, "application/json", "{\"error\":\"Unknown endpoint\"}");
+    }
+    close(client_fd);
+}
+
+// --- Entry Point ---
+
+int main() {
+    std::string device_ip = get_env("DEVICE_IP", "192.168.1.64");
+    int device_port = std::stoi(get_env("DEVICE_PORT", "8000"));
+    std::string server_host = get_env("HTTP_HOST", "0.0.0.0");
+    int server_port = std::stoi(get_env("HTTP_PORT", "8080"));
+
+    srand(time(NULL));
+
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd == -1) { std::cerr << "Socket error\n"; return 1; }
+
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(server_port);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(server_fd, (sockaddr*)&addr, sizeof(addr)) < 0) {
+        std::cerr << "Bind error\n";
         return 1;
     }
-    std::cout << "HTTP server started on port " << port << std::endl;
-    getchar();
-    MHD_stop_daemon(daemon);
-    NET_DVR_Cleanup();
+
+    if (listen(server_fd, 10) < 0) {
+        std::cerr << "Listen error\n";
+        return 1;
+    }
+
+    std::cout << "HTTP server running on " << server_host << ":" << server_port << "\n";
+
+    while (true) {
+        sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        int client_fd = accept(server_fd, (sockaddr*)&client_addr, &client_len);
+        if (client_fd < 0) continue;
+        std::thread(handle_client, client_fd, device_ip, device_port).detach();
+    }
+
+    close(server_fd);
     return 0;
 }
