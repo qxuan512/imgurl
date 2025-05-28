@@ -4,434 +4,490 @@ import time
 import json
 import yaml
 import signal
-import threading
 import logging
+import threading
 from typing import Dict, Any, Optional
 
 from flask import Flask, jsonify
-from kubernetes import client as k8s_client, config as k8s_config
 import paho.mqtt.client as mqtt
 
-# --------------------- Logging Configuration ---------------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+from kubernetes import client as k8s_client
+from kubernetes import config as k8s_config
+from kubernetes.client.rest import ApiException
+
+# ===== Logging Configuration =====
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL),
-    format='[%(asctime)s] %(levelname)s - %(threadName)s - %(message)s',
-    stream=sys.stdout
+    level=LOG_LEVEL,
+    format="%(asctime)s [%(levelname)s] %(threadName)s - %(message)s",
 )
-logger = logging.getLogger("deviceshifu-mqtt-driver")
+logger = logging.getLogger(__name__)
 
-# --------------------- Global Shutdown Flag ---------------------
-shutdown_flag = threading.Event()
+# ===== Environment Variables =====
+EDGEDEVICE_NAME = os.environ.get("EDGEDEVICE_NAME", "deviceshifu-decoder")
+EDGEDEVICE_NAMESPACE = os.environ.get("EDGEDEVICE_NAMESPACE", "devices")
+CONFIG_MOUNT_PATH = os.environ.get("CONFIG_MOUNT_PATH", "/etc/edgedevice/config")
+MQTT_BROKER = os.environ.get("MQTT_BROKER", None)
+MQTT_BROKER_PORT = int(os.environ.get("MQTT_BROKER_PORT", 1883))
+MQTT_BROKER_USERNAME = os.environ.get("MQTT_BROKER_USERNAME", "")
+MQTT_BROKER_PASSWORD = os.environ.get("MQTT_BROKER_PASSWORD", "")
+MQTT_TOPIC_PREFIX = os.environ.get("MQTT_TOPIC_PREFIX", "shifu")
+HTTP_HOST = os.environ.get("HTTP_HOST", "0.0.0.0")
+HTTP_PORT = int(os.environ.get("HTTP_PORT", 8080))
 
-# --------------------- ShifuClient Definition ---------------------
+# ===== Constants =====
+INSTRUCTION_FILE = os.path.join(CONFIG_MOUNT_PATH, "instructions")
+DRIVER_PROPERTIES_FILE = os.path.join(CONFIG_MOUNT_PATH, "driverProperties")
+DEFAULT_PUBLISH_INTERVAL_MS = 5000
+
+# MQTT Topics
+TOPIC_MANAGE = "device/decoder/manage"
+TOPIC_CONFIG = "device/decoder/config"
+TOPIC_STATUS = "device/decoder/status"
+TOPIC_DECODE = "device/decoder/decode"
+
+# ======= ShifuClient Class =======
 class ShifuClient:
     def __init__(self):
-        self.device_name = os.getenv("EDGEDEVICE_NAME", "deviceshifu-video-decoder")
-        self.namespace = os.getenv("EDGEDEVICE_NAMESPACE", "devices")
-        self.config_mount_path = os.getenv("CONFIG_MOUNT_PATH", "/etc/edgedevice/config")
+        self.edge_device_name = EDGEDEVICE_NAME
+        self.edge_device_namespace = EDGEDEVICE_NAMESPACE
+        self.config_mount_path = CONFIG_MOUNT_PATH
+        self.k8s_api = None
         self._init_k8s_client()
 
     def _init_k8s_client(self):
         try:
-            if os.path.exists('/var/run/secrets/kubernetes.io/serviceaccount/token'):
-                k8s_config.load_incluster_config()
-                logger.info("Loaded in-cluster Kubernetes config.")
-            else:
-                k8s_config.load_kube_config()
-                logger.info("Loaded local Kubernetes config.")
-            self.k8s_api = k8s_client.CustomObjectsApi()
+            k8s_config.load_incluster_config()
+            logger.info("Loaded in-cluster Kubernetes config.")
         except Exception as e:
-            logger.error(f"Failed to initialize Kubernetes client: {e}")
-            self.k8s_api = None
+            try:
+                k8s_config.load_kube_config()
+                logger.info("Loaded local kubeconfig for Kubernetes.")
+            except Exception as ex:
+                logger.error(f"Failed to load Kubernetes config: {ex}")
+                self.k8s_api = None
+                return
+        self.k8s_api = k8s_client.CustomObjectsApi()
 
     def get_edge_device(self) -> Optional[Dict[str, Any]]:
         if not self.k8s_api:
-            logger.warning("Kubernetes API not initialized.")
+            logger.warning("Kubernetes API is not initialized.")
             return None
         try:
-            return self.k8s_api.get_namespaced_custom_object(
+            edge_device = self.k8s_api.get_namespaced_custom_object(
                 group="shifu.edgenesis.io",
                 version="v1alpha1",
-                namespace=self.namespace,
+                namespace=self.edge_device_namespace,
                 plural="edgedevices",
-                name=self.device_name
+                name=self.edge_device_name,
             )
-        except Exception as e:
-            logger.error(f"Error getting EdgeDevice CR: {e}")
+            logger.debug("EdgeDevice resource fetched from Kubernetes.")
+            return edge_device
+        except ApiException as e:
+            logger.error(f"Failed to get EdgeDevice: {e}")
             return None
 
     def get_device_address(self) -> Optional[str]:
-        device = self.get_edge_device()
-        if device and "spec" in device and "address" in device["spec"]:
-            return device["spec"]["address"]
-        logger.warning("Device address not found in EdgeDevice CR.")
-        return None
+        edge_device = self.get_edge_device()
+        if not edge_device:
+            return None
+        try:
+            return edge_device["spec"]["address"]
+        except Exception as e:
+            logger.error(f"Failed to extract device address: {e}")
+            return None
 
-    def update_device_status(self, status: str) -> None:
+    def update_device_status(self, status: Dict[str, Any]) -> None:
         if not self.k8s_api:
+            logger.warning("Kubernetes API is not initialized, cannot update status.")
             return
-        body = {"status": {"devicePhase": status}}
+        body = {"status": status}
         try:
             self.k8s_api.patch_namespaced_custom_object_status(
                 group="shifu.edgenesis.io",
                 version="v1alpha1",
-                namespace=self.namespace,
+                namespace=self.edge_device_namespace,
                 plural="edgedevices",
-                name=self.device_name,
-                body=body
+                name=self.edge_device_name,
+                body=body,
             )
-            logger.info(f"Updated EdgeDevice status to {status}")
-        except Exception as e:
-            logger.warning(f"Failed to update EdgeDevice status: {e}")
+            logger.info("EdgeDevice status updated in Kubernetes.")
+        except ApiException as e:
+            logger.error(f"Failed to update EdgeDevice status: {e}")
 
-    def read_mounted_config_file(self, filename: str) -> Optional[str]:
-        file_path = os.path.join(self.config_mount_path, filename)
+    def read_mounted_config_file(self, filename: str) -> Optional[Any]:
         try:
-            with open(file_path, "r") as f:
-                content = f.read()
-            logger.debug(f"Read config file: {file_path}")
-            return content
+            with open(filename, "r") as f:
+                config_data = yaml.safe_load(f)
+            logger.debug(f"Config file {filename} loaded.")
+            return config_data
         except Exception as e:
-            logger.error(f"Failed to read config file {file_path}: {e}")
+            logger.error(f"Failed to read config file {filename}: {e}")
             return None
 
     def get_instruction_config(self) -> Dict[str, Any]:
-        instructions_yaml = self.read_mounted_config_file("instructions")
-        if instructions_yaml is None:
+        instructions = self.read_mounted_config_file(INSTRUCTION_FILE)
+        if not instructions:
+            logger.warning("No instructions found in config file.")
             return {}
-        try:
-            return yaml.safe_load(instructions_yaml) or {}
-        except Exception as e:
-            logger.error(f"Failed to parse instruction config YAML: {e}")
+        return instructions
+
+    def get_driver_properties(self) -> Dict[str, Any]:
+        properties = self.read_mounted_config_file(DRIVER_PROPERTIES_FILE)
+        if not properties:
+            logger.warning("No driverProperties found in config file.")
             return {}
+        return properties
 
-# --------------------- Device Protocol Abstraction ---------------------
-class HikvisionDecoderDevice:
-    """
-    Stub implementation for Hikvision Decoder device protocol.
-    In production, replace methods below with real SDK/driver calls.
-    """
-    def __init__(self, address: Optional[str]):
-        self.address = address
-        self.connected = False
-
-    def connect(self) -> bool:
-        # Simulate successful device connection
-        logger.info(f"Connecting to Hikvision Decoder at {self.address} ...")
-        time.sleep(1)
-        self.connected = True
-        logger.info("Connected to Hikvision Decoder.")
-        return True
-
-    def disconnect(self) -> None:
-        logger.info("Disconnecting from Hikvision Decoder.")
-        self.connected = False
-
-    def get_status(self) -> Dict[str, Any]:
-        # Simulate status response
-        return {
-            "device_model": "DS-6300D(-JX/-T)",
-            "manufacturer": "Hikvision",
-            "timestamp": int(time.time()),
-            "decoder_channel_status": "normal",
-            "remote_playback_status": "stopped",
-            "display_configuration": {
-                "wall": "A",
-                "window": "1x4"
-            },
-            "local_network_info": {
-                "ip": self.address,
-                "mac": "11:22:33:44:55:66"
-            }
-        }
-
-    def get_alarm(self) -> Dict[str, Any]:
-        # Simulate alarm data
-        return {
-            "alarm_status": "clear",
-            "alarm_code": 0,
-            "description": "No alarm",
-            "timestamp": int(time.time())
-        }
-
-    def send_command(self, command: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        logger.info(f"Executing command '{command}' with params {params}")
-        # Simulate command execution
-        if command == "reboot":
-            return {"result": "success", "timestamp": int(time.time())}
-        elif command == "control":
-            return {"result": "success", "detail": "operation performed", "timestamp": int(time.time())}
-        else:
-            return {"result": "unknown command", "timestamp": int(time.time())}
-
-# --------------------- Main Driver ---------------------
+# ======= DeviceShifuMQTTDriver Class =======
 class DeviceShifuMQTTDriver:
     def __init__(self):
-        # Environment variables/config
-        self.device_name = os.getenv("EDGEDEVICE_NAME", "deviceshifu-video-decoder")
-        self.namespace = os.getenv("EDGEDEVICE_NAMESPACE", "devices")
-        self.config_mount_path = os.getenv("CONFIG_MOUNT_PATH", "/etc/edgedevice/config")
-        self.mqtt_broker = os.getenv("MQTT_BROKER", "localhost")
-        self.mqtt_port = int(os.getenv("MQTT_BROKER_PORT", 1883))
-        self.mqtt_username = os.getenv("MQTT_BROKER_USERNAME")
-        self.mqtt_password = os.getenv("MQTT_BROKER_PASSWORD")
-        self.mqtt_topic_prefix = os.getenv("MQTT_TOPIC_PREFIX", "shifu")
-        self.http_host = os.getenv("HTTP_HOST", "0.0.0.0")
-        self.http_port = int(os.getenv("HTTP_PORT", 8080))
-        self.log_level = os.getenv("LOG_LEVEL", "INFO").upper()
-
-        # Shifu, Device, MQTT and Data
+        # Device, MQTT, and config state
         self.shifu_client = ShifuClient()
-        self.instruction_config = self.shifu_client.get_instruction_config()
         self.device_address = self.shifu_client.get_device_address()
-        self.device = HikvisionDecoderDevice(self.device_address)
+        self.driver_properties = self.shifu_client.get_driver_properties()
+        self.instruction_config = self.shifu_client.get_instruction_config()
         self.latest_data: Dict[str, Any] = {}
         self.publish_intervals: Dict[str, int] = {}
-        self.publish_threads: Dict[str, threading.Thread] = {}
-        self.mqtt_client: Optional[mqtt.Client] = None
-        self.mqtt_connected = threading.Event()
-        self.mqtt_reconnect_backoff = 2  # seconds
-        self.mqtt_client_id = f"{self.device_name}-{int(time.time())}"
+        self.mqtt_client = None
+        self.mqtt_connected = False
+        self.client_id = f"{EDGEDEVICE_NAME}-{int(time.time())}"
+        self.shutdown_flag = threading.Event()
+        self.threads = []
+        self.flask_app = Flask(__name__)
+        self._parse_publish_intervals()
+        self._setup_routes()
         self.status_lock = threading.Lock()
+        self.status_report = {
+            "device": EDGEDEVICE_NAME,
+            "status": "INIT",
+            "mqtt": "DISCONNECTED",
+            "device_address": self.device_address,
+            "timestamp": int(time.time()),
+        }
 
-        # HTTP (Flask) Server
-        self.app = Flask(__name__)
-        self.http_thread: Optional[threading.Thread] = None
-
-        # Device connection status
-        self.device_connected = threading.Event()
-
-        # Thread management
-        self.threads: list = []
-
-    # ------------------ MQTT Setup ------------------
-    def connect_mqtt(self):
-        client = mqtt.Client(client_id=self.mqtt_client_id, clean_session=True)
-        if self.mqtt_username:
-            client.username_pw_set(self.mqtt_username, self.mqtt_password)
-        client.on_connect = self.on_mqtt_connect
-        client.on_message = self.on_mqtt_message
-        client.on_disconnect = self.on_mqtt_disconnect
-        client.reconnect_delay_set(min_delay=2, max_delay=30)
-        self.mqtt_client = client
-        while not shutdown_flag.is_set():
-            try:
-                logger.info(f"Connecting to MQTT broker at {self.mqtt_broker}:{self.mqtt_port} ...")
-                client.connect(self.mqtt_broker, self.mqtt_port, keepalive=60)
-                client.loop_start()
-                if self.mqtt_connected.wait(timeout=10):
-                    logger.info("Connected to MQTT broker.")
-                    break
-                else:
-                    logger.warning("MQTT connect timed out, retrying ...")
-            except Exception as e:
-                logger.error(f"MQTT connection failed: {e}")
-            time.sleep(self.mqtt_reconnect_backoff)
-
-    def on_mqtt_connect(self, client, userdata, flags, rc):
-        if rc == 0:
-            logger.info("MQTT connection established.")
-            self.mqtt_connected.set()
-            # Subscribe to relevant topics (control commands, etc.)
-            subscribe_topics = [
-                (f"{self.mqtt_topic_prefix}/{self.device_name}/control/reboot", 1),
-                (f"{self.mqtt_topic_prefix}/{self.device_name}/control/control", 2),
-            ]
-            for topic, qos in subscribe_topics:
-                try:
-                    client.subscribe(topic, qos=qos)
-                    logger.info(f"Subscribed to MQTT topic: {topic} (QoS={qos})")
-                except Exception as e:
-                    logger.error(f"Failed to subscribe to {topic}: {e}")
-        else:
-            logger.error(f"MQTT connection failed with RC={rc}")
-            self.mqtt_connected.clear()
-
-    def on_mqtt_disconnect(self, client, userdata, rc):
-        logger.warning(f"MQTT disconnected (rc={rc}).")
-        self.mqtt_connected.clear()
-        if not shutdown_flag.is_set():
-            logger.info("Attempting to reconnect to MQTT ...")
-            self.connect_mqtt()
-
-    def on_mqtt_message(self, client, userdata, msg):
-        topic = msg.topic
-        try:
-            payload = json.loads(msg.payload.decode())
-        except Exception:
-            payload = msg.payload.decode()
-        logger.info(f"Received MQTT message on {topic}: {payload}")
-        # Handle device command topics
-        if topic.endswith("/control/reboot"):
-            resp = self.device.send_command("reboot", payload if isinstance(payload, dict) else {})
-            self.publish_status_update()
-        elif topic.endswith("/control/control"):
-            resp = self.device.send_command("control", payload if isinstance(payload, dict) else {})
-            self.publish_status_update()
-        else:
-            logger.warning(f"Unhandled MQTT topic: {topic}")
-
-    def publish_mqtt(self, topic_suffix: str, data: Dict[str, Any], qos: int = 1, retain: bool = False):
-        if not self.mqtt_client or not self.mqtt_connected.is_set():
-            logger.warning("MQTT not connected; cannot publish.")
-            return
-        topic = f"{self.mqtt_topic_prefix}/{self.device_name}/{topic_suffix}"
-        try:
-            payload = json.dumps(data, default=str)
-            self.mqtt_client.publish(topic, payload, qos=qos, retain=retain)
-            logger.info(f"Published to {topic}: {payload}")
-        except Exception as e:
-            logger.error(f"Failed to publish to {topic}: {e}")
-
-    # ------------------ Instruction/Config Parsing ------------------
+    # ========== Configuration Parsing ==========
     def _parse_publish_intervals(self):
         """
-        Parse instruction config for publishIntervalMS and publishing mode.
+        Parse publishIntervalMS for each instruction from config.
         """
-        for instr, cfg in self.instruction_config.get("instructions", {}).items():
-            mode = cfg.get("protocolProperties", {}).get("mode", "").lower()
-            if mode == "publisher":
-                interval = cfg.get("protocolProperties", {}).get("publishIntervalMS", 1000)
-                self.publish_intervals[instr] = int(interval)
-                logger.info(f"Instruction '{instr}': mode=publisher, publishIntervalMS={interval}")
+        try:
+            instructions = self.instruction_config.get("instructions", {})
+            for name, instr in instructions.items():
+                publish_ms = int(instr.get("publishIntervalMS", DEFAULT_PUBLISH_INTERVAL_MS))
+                self.publish_intervals[name] = publish_ms
+            logger.info(f"Parsed publish intervals: {self.publish_intervals}")
+        except Exception as e:
+            logger.error(f"Error parsing publish intervals: {e}")
 
-    # ------------------ Periodic Publishing ------------------
+    # ========== Threaded Publishers ==========
     def _start_scheduled_publishers(self):
-        for instr, interval in self.publish_intervals.items():
-            t = threading.Thread(target=self._publish_topic_periodically, args=(instr, interval), name=f"publisher-{instr}", daemon=True)
-            self.publish_threads[instr] = t
+        """
+        Start threads for each publisher instruction for periodic publishing.
+        """
+        instructions = self.instruction_config.get("instructions", {})
+        for name, instr in instructions.items():
+            mode = instr.get("mode", "publisher").lower()
+            if mode == "publisher":
+                t = threading.Thread(
+                    target=self._publish_topic_periodically,
+                    args=(name, instr),
+                    name=f"Publisher-{name}",
+                    daemon=True,
+                )
+                t.start()
+                self.threads.append(t)
+                logger.info(f"Started periodic publisher thread for instruction: {name}")
+
+    def _publish_topic_periodically(self, instruction_name: str, instruction_cfg: Dict[str, Any]):
+        """
+        Periodically publish data for a given instruction.
+        """
+        topic = f"{MQTT_TOPIC_PREFIX}/{EDGEDEVICE_NAME}/{instruction_name}"
+        publish_interval = int(instruction_cfg.get("publishIntervalMS", DEFAULT_PUBLISH_INTERVAL_MS)) / 1000.0
+        qos = int(instruction_cfg.get("qos", 1))
+        logger.debug(f"Publisher thread for {instruction_name} on topic {topic} every {publish_interval}s")
+        while not self.shutdown_flag.is_set():
+            try:
+                # Simulate device data retrieval (replace with real SDK/RTSP calls)
+                data = self.retrieve_device_data(instruction_name)
+                self.latest_data[instruction_name] = data
+                payload = json.dumps(data, default=str)
+                if self.mqtt_connected:
+                    self.mqtt_client.publish(topic, payload, qos=qos)
+                    logger.info(f"Published {instruction_name} to {topic}: {payload}")
+                else:
+                    logger.warning(f"MQTT disconnected, not publishing {instruction_name}")
+            except Exception as e:
+                logger.error(f"Error publishing {instruction_name}: {e}")
+            time.sleep(publish_interval)
+
+    # ===== Device Data Retrieval Abstraction (Replace with actual SDK/RTSP calls) =====
+    def retrieve_device_data(self, instruction_name: str) -> Dict[str, Any]:
+        """
+        Simulated device data retrieval for each instruction.
+        Replace with actual interactions with the Hikvision Decoder device.
+        """
+        # Simulated data for demonstration purpose
+        timestamp = int(time.time())
+        if instruction_name == "status":
+            return {
+                "channels": [{"id": 1, "state": "active"}, {"id": 2, "state": "idle"}],
+                "device_state": "online",
+                "sdk_version": "5.3.0",
+                "alarm": False,
+                "timestamp": timestamp,
+            }
+        elif instruction_name == "decode":
+            return {"decode_state": "stopped", "timestamp": timestamp}
+        elif instruction_name == "manage":
+            return {"last_action": "none", "result": "ok", "timestamp": timestamp}
+        elif instruction_name == "config":
+            return {"display_mode": "fullscreen", "window_count": 4, "timestamp": timestamp}
+        else:
+            return {"info": f"Unknown instruction {instruction_name}", "timestamp": timestamp}
+
+    # ========== MQTT Connection ==========
+    def connect_mqtt(self):
+        """
+        Initialize and connect the MQTT client.
+        """
+        if not MQTT_BROKER:
+            logger.error("MQTT_BROKER not set. Exiting.")
+            sys.exit(1)
+        self.mqtt_client = mqtt.Client(client_id=self.client_id, clean_session=True)
+        if MQTT_BROKER_USERNAME:
+            self.mqtt_client.username_pw_set(MQTT_BROKER_USERNAME, MQTT_BROKER_PASSWORD)
+        self.mqtt_client.on_connect = self.on_connect
+        self.mqtt_client.on_message = self.on_message
+        self.mqtt_client.on_disconnect = self.on_disconnect
+        # Optional: Configure TLS here if needed
+
+        # Start MQTT network loop in background thread
+        try:
+            self.mqtt_client.connect(MQTT_BROKER, MQTT_BROKER_PORT, keepalive=60)
+            t = threading.Thread(target=self.mqtt_client.loop_forever, name="MQTTLoop", daemon=True)
             t.start()
             self.threads.append(t)
-
-    def _publish_topic_periodically(self, instruction: str, interval_ms: int):
-        topic_mapping = {
-            "status_report": "telemetry/status",
-            "alarm_status": "telemetry/alarm",
-        }
-        # Determine which data to pull based on instruction name
-        while not shutdown_flag.is_set():
-            try:
-                data = None
-                qos = 1
-                if instruction == "status_report":
-                    data = self.device.get_status()
-                    topic = topic_mapping["status_report"]
-                elif instruction == "alarm_status":
-                    data = self.device.get_alarm()
-                    topic = topic_mapping["alarm_status"]
-                else:
-                    logger.debug(f"Unknown publisher instruction: {instruction}")
-                    time.sleep(interval_ms / 1000.0)
-                    continue
-                self.latest_data[instruction] = data
-                self.publish_mqtt(topic, data, qos=qos)
-            except Exception as e:
-                logger.error(f"Error publishing {instruction}: {e}")
-            time.sleep(interval_ms / 1000.0)
-
-    def publish_status_update(self):
-        # Publish device status to status topic
-        try:
-            status_data = self.device.get_status()
-            self.latest_data["status_report"] = status_data
-            self.publish_mqtt("status", status_data, qos=1)
+            logger.info(f"MQTT client {self.client_id} connecting to {MQTT_BROKER}:{MQTT_BROKER_PORT}")
         except Exception as e:
-            logger.error(f"Error publishing status update: {e}")
+            logger.error(f"Failed to connect to MQTT broker: {e}")
+            self.mqtt_connected = False
 
-    # ------------------ HTTP Server Setup ------------------
-    def setup_routes(self):
-        @self.app.route("/health", methods=["GET"])
+    def on_connect(self, client, userdata, flags, rc):
+        """
+        MQTT on_connect callback.
+        """
+        if rc == 0:
+            self.mqtt_connected = True
+            logger.info("Connected to MQTT broker.")
+            # Subscribe to control topics
+            control_topics = [
+                f"{MQTT_TOPIC_PREFIX}/{EDGEDEVICE_NAME}/control/+",
+                f"{MQTT_TOPIC_PREFIX}/{EDGEDEVICE_NAME}/{TOPIC_MANAGE}",
+                f"{MQTT_TOPIC_PREFIX}/{EDGEDEVICE_NAME}/{TOPIC_CONFIG}",
+                f"{MQTT_TOPIC_PREFIX}/{EDGEDEVICE_NAME}/{TOPIC_DECODE}",
+            ]
+            for topic in control_topics:
+                self.mqtt_client.subscribe(topic, qos=1)
+                logger.info(f"Subscribed to MQTT topic {topic}")
+            # Subscribe to status topic for SUBSCRIBE instructions
+            self.mqtt_client.subscribe(f"{MQTT_TOPIC_PREFIX}/{EDGEDEVICE_NAME}/{TOPIC_STATUS}", qos=1)
+            logger.info(f"Subscribed to device status topic {TOPIC_STATUS}")
+
+            # Update status
+            with self.status_lock:
+                self.status_report["status"] = "RUNNING"
+                self.status_report["mqtt"] = "CONNECTED"
+                self.status_report["timestamp"] = int(time.time())
+        else:
+            logger.error(f"MQTT connection failed with code {rc}")
+            with self.status_lock:
+                self.status_report["status"] = "ERROR"
+                self.status_report["mqtt"] = "CONNECTION_FAILED"
+                self.status_report["timestamp"] = int(time.time())
+
+    def on_disconnect(self, client, userdata, rc):
+        """
+        MQTT on_disconnect callback.
+        """
+        self.mqtt_connected = False
+        logger.warning(f"Disconnected from MQTT broker (rc={rc}).")
+        with self.status_lock:
+            self.status_report["status"] = "DISCONNECTED"
+            self.status_report["mqtt"] = "DISCONNECTED"
+            self.status_report["timestamp"] = int(time.time())
+        # Reconnect logic
+        if not self.shutdown_flag.is_set():
+            logger.info("Attempting MQTT reconnection in 5 seconds...")
+            time.sleep(5)
+            try:
+                self.mqtt_client.reconnect()
+            except Exception as e:
+                logger.error(f"MQTT reconnection failed: {e}")
+
+    def on_message(self, client, userdata, msg):
+        """
+        MQTT on_message callback.
+        """
+        try:
+            topic = msg.topic
+            payload = msg.payload.decode("utf-8")
+            logger.info(f"Received MQTT message on {topic}: {payload}")
+            # Parse topic for control commands
+            if topic.endswith("/control/manage") or topic.endswith(f"/{TOPIC_MANAGE}"):
+                self.handle_manage_command(payload)
+            elif topic.endswith("/control/config") or topic.endswith(f"/{TOPIC_CONFIG}"):
+                self.handle_config_command(payload)
+            elif topic.endswith("/control/decode") or topic.endswith(f"/{TOPIC_DECODE}"):
+                self.handle_decode_command(payload)
+            else:
+                logger.warning(f"Received message on unhandled topic: {topic}")
+        except Exception as e:
+            logger.error(f"Error handling MQTT message: {e}")
+
+    # ====== Control Command Handlers ======
+    def handle_manage_command(self, payload: str):
+        """
+        Handle device management commands.
+        """
+        try:
+            cmd = json.loads(payload)
+            # Simulate handling management command (e.g., reboot, shutdown)
+            result = {"action": cmd.get("action", "unknown"), "result": "success", "timestamp": int(time.time())}
+            self.latest_data["manage"] = result
+            # Publish response to status topic
+            status_topic = f"{MQTT_TOPIC_PREFIX}/{EDGEDEVICE_NAME}/{TOPIC_STATUS}"
+            self.publish_status_update(result)
+            logger.info(f"Handled manage command: {cmd}")
+        except Exception as e:
+            logger.error(f"Failed to handle manage command: {e}")
+
+    def handle_config_command(self, payload: str):
+        """
+        Handle configuration commands.
+        """
+        try:
+            cfg = json.loads(payload)
+            # Simulate applying configuration
+            result = {"config": cfg, "result": "applied", "timestamp": int(time.time())}
+            self.latest_data["config"] = result
+            self.publish_status_update(result)
+            logger.info(f"Handled config command: {cfg}")
+        except Exception as e:
+            logger.error(f"Failed to handle config command: {e}")
+
+    def handle_decode_command(self, payload: str):
+        """
+        Handle decode commands (start/stop).
+        """
+        try:
+            cmd = json.loads(payload)
+            # Simulate decode action
+            result = {"decode_action": cmd.get("action", "unknown"), "result": "executed", "timestamp": int(time.time())}
+            self.latest_data["decode"] = result
+            self.publish_status_update(result)
+            logger.info(f"Handled decode command: {cmd}")
+        except Exception as e:
+            logger.error(f"Failed to handle decode command: {e}")
+
+    # ====== Status Publishing ======
+    def publish_status_update(self, data: Dict[str, Any]):
+        """
+        Publish status update to the status topic.
+        """
+        if not self.mqtt_connected:
+            logger.warning("Cannot publish status update: MQTT disconnected.")
+            return
+        try:
+            topic = f"{MQTT_TOPIC_PREFIX}/{EDGEDEVICE_NAME}/{TOPIC_STATUS}"
+            payload = json.dumps(data, default=str)
+            self.mqtt_client.publish(topic, payload, qos=1)
+            logger.info(f"Published status update to {topic}: {payload}")
+        except Exception as e:
+            logger.error(f"Failed to publish status update: {e}")
+
+    # ========== HTTP Server ==========
+    def _setup_routes(self):
+        @self.flask_app.route("/health", methods=["GET"])
         def health():
-            return jsonify({"status": "ok", "mqtt_connected": self.mqtt_connected.is_set(), "device_connected": self.device_connected.is_set()}), 200
+            return jsonify({"status": "healthy"}), 200
 
-        @self.app.route("/status", methods=["GET"])
+        @self.flask_app.route("/status", methods=["GET"])
         def status():
             with self.status_lock:
-                status = self.latest_data.get("status_report", {})
-            return jsonify(status), 200
+                status_copy = dict(self.status_report)
+            return jsonify(status_copy), 200
 
-    def run_http_server(self):
-        try:
-            logger.info(f"Starting HTTP server on {self.http_host}:{self.http_port}")
-            self.app.run(host=self.http_host, port=self.http_port, threaded=True, use_reloader=False)
-        except Exception as e:
-            logger.error(f"HTTP server exception: {e}")
+    def _start_http_server(self):
+        """
+        Start Flask HTTP server in a background thread.
+        """
+        t = threading.Thread(
+            target=lambda: self.flask_app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True, use_reloader=False),
+            name="HTTPServer",
+            daemon=True,
+        )
+        t.start()
+        self.threads.append(t)
+        logger.info(f"HTTP server started on {HTTP_HOST}:{HTTP_PORT}")
 
-    # ------------------ Lifecycle and Signal Handling ------------------
-    def signal_handler(self, sig, frame):
-        logger.info(f"Received signal {sig}, shutting down ...")
-        shutdown_flag.set()
+    # ========== Signal & Shutdown Handler ==========
+    def signal_handler(self, signum, frame):
+        logger.info(f"Received signal {signum}. Initiating graceful shutdown.")
         self.shutdown()
 
     def shutdown(self):
-        try:
-            logger.info("Shutting down DeviceShifu MQTT driver ...")
-            if self.mqtt_client:
-                self.mqtt_client.loop_stop()
+        """
+        Graceful shutdown logic.
+        """
+        if self.shutdown_flag.is_set():
+            return
+        logger.info("Shutting down DeviceShifuMQTTDriver...")
+        self.shutdown_flag.set()
+        # MQTT disconnect
+        if self.mqtt_client and self.mqtt_connected:
+            try:
                 self.mqtt_client.disconnect()
-            if hasattr(self.device, "disconnect"):
-                self.device.disconnect()
-            # Wait for threads
-            for t in self.threads:
-                if t.is_alive():
-                    t.join(timeout=2)
-            logger.info("Shutdown complete.")
-        except Exception as e:
-            logger.error(f"Error during shutdown: {e}")
+                logger.info("MQTT client disconnected.")
+            except Exception as e:
+                logger.error(f"Failed to disconnect MQTT client: {e}")
+        # Wait for all threads to finish
+        for t in self.threads:
+            if t.is_alive():
+                t.join(timeout=5)
+        logger.info("All background threads terminated. Shutdown complete.")
+        sys.exit(0)
 
-    # ------------------ Main Run ------------------
+    # ========== Main Run ==========
     def run(self):
-        # Register signal handlers
+        # Signal registration
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
 
-        # Setup HTTP routes
-        self.setup_routes()
-        self.http_thread = threading.Thread(target=self.run_http_server, name="HTTPServer", daemon=True)
-        self.http_thread.start()
-        self.threads.append(self.http_thread)
+        # Start HTTP server for health checks
+        self._start_http_server()
 
-        # Device connection
-        if self.device.connect():
-            self.device_connected.set()
-        else:
-            logger.error("Failed to connect to device.")
-            self.shifu_client.update_device_status("NotReady")
-            return
+        # Connect MQTT
+        self.connect_mqtt()
 
-        self.shifu_client.update_device_status("Ready")
-
-        # Parse config
-        self._parse_publish_intervals()
-
-        # Start MQTT
-        mqtt_thread = threading.Thread(target=self.connect_mqtt, name="MQTTConnector", daemon=True)
-        mqtt_thread.start()
-        self.threads.append(mqtt_thread)
-
-        # Wait for MQTT connection before starting publishers
-        if not self.mqtt_connected.wait(timeout=20):
-            logger.error("MQTT connection could not be established. Exiting driver.")
-            self.shifu_client.update_device_status("NotReady")
-            shutdown_flag.set()
-            self.shutdown()
-            return
-        self.shifu_client.update_device_status("Ready")
-
-        # Start publishers
+        # Start periodic publishers
         self._start_scheduled_publishers()
 
-        # Main loop: monitor threads and handle shutdown
+        # Device status update loop (every 30s)
         try:
-            while not shutdown_flag.is_set():
-                time.sleep(1)
+            while not self.shutdown_flag.is_set():
+                # Update EdgeDevice status in Kubernetes
+                with self.status_lock:
+                    self.status_report["timestamp"] = int(time.time())
+                self.shifu_client.update_device_status(self.status_report)
+                time.sleep(30)
         except Exception as e:
-            logger.error(f"Main loop exception: {e}")
+            logger.error(f"Error in main loop: {e}")
         finally:
             self.shutdown()
 
-# --------------------- Entry Point ---------------------
+# ========== Main Entrypoint ==========
 if __name__ == "__main__":
     driver = DeviceShifuMQTTDriver()
     driver.run()
