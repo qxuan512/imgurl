@@ -1,396 +1,470 @@
 #include <iostream>
-#include <cstdlib>
-#include <cstring>
-#include <string>
+#include <fstream>
 #include <sstream>
+#include <string>
+#include <map>
+#include <unordered_map>
 #include <vector>
 #include <thread>
 #include <mutex>
+#include <atomic>
 #include <condition_variable>
-#include <map>
-#include <fstream>
-#include <streambuf>
+#include <csignal>
+#include <cstdlib>
 #include <ctime>
-#include <unistd.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/types.h>
+#include <chrono>
+#include <cstdio>
+#include <memory>
+#include <stdexcept>
+#include <functional>
+#include <yaml-cpp/yaml.h>
+#include <nlohmann/json.hpp>
+#include <paho.mqtt.cpp/async_client.h>
+#include <kubernetes/client.h>
+#include <httplib.h>
 
-// HCNetSDK C++ header simulation (to be replaced with actual SDK headers)
-// #include "HCNetSDK.h"
+using json = nlohmann::json;
 
-#define BUFFER_SIZE 8192
+// Logging utility
+enum LogLevel {DEBUG, INFO, WARNING, ERROR};
+static LogLevel CURRENT_LOG_LEVEL = INFO;
 
-// --- Utility Functions ---
-
-std::string get_env(const char *key, const char *default_val = "") {
-    const char *val = std::getenv(key);
-    return val ? std::string(val) : std::string(default_val);
-}
-
-std::string now_iso8601() {
-    time_t t = std::time(nullptr);
-    char buf[32];
-    std::strftime(buf, sizeof(buf), "%FT%TZ", std::gmtime(&t));
-    return buf;
-}
-
-std::string http_status_message(int code) {
-    switch (code) {
-        case 200: return "OK";
-        case 201: return "Created";
-        case 204: return "No Content";
-        case 400: return "Bad Request";
-        case 401: return "Unauthorized";
-        case 403: return "Forbidden";
-        case 404: return "Not Found";
-        case 405: return "Method Not Allowed";
-        case 500: return "Internal Server Error";
-        case 503: return "Service Unavailable";
-        default:  return "Unknown";
+#define LOG(level, msg) \
+    if (level >= CURRENT_LOG_LEVEL) { \
+        std::cerr << "[" << #level << "] " << msg << std::endl; \
     }
+
+// Utility to get env vars with default
+std::string getenvOrDefault(const std::string& key, const std::string& def) {
+    const char* val = std::getenv(key.c_str());
+    if (!val) return def;
+    return std::string(val);
 }
 
-void send_http_response(int client_fd, int status_code, const std::string &content_type, const std::string &body) {
-    std::ostringstream oss;
-    oss << "HTTP/1.1 " << status_code << " " << http_status_message(status_code) << "\r\n";
-    oss << "Content-Type: " << content_type << "\r\n";
-    oss << "Content-Length: " << body.size() << "\r\n";
-    oss << "Access-Control-Allow-Origin: *\r\n";
-    oss << "Connection: close\r\n";
-    oss << "\r\n";
-    oss << body;
-    std::string response = oss.str();
-    send(client_fd, response.c_str(), response.size(), 0);
-}
+// --- ShifuClient ---
 
-// --- Global State and Device Session Management ---
+class ShifuClient {
+public:
+    ShifuClient() {
+        try {
+            init_k8s_client();
+        } catch (const std::exception& e) {
+            LOG(ERROR, "Failed to initialize kubernetes client: " << e.what());
+            throw;
+        }
+        edge_device_name_ = getenvOrDefault("EDGEDEVICE_NAME", "deviceshifu-NetworkVideoDecoder");
+        edge_device_namespace_ = getenvOrDefault("EDGEDEVICE_NAMESPACE", "devices");
+        config_mount_path_ = getenvOrDefault("CONFIG_MOUNT_PATH", "/etc/edgedevice/config");
+    }
 
-std::mutex state_mutex;
-struct DeviceSession {
-    std::string session_token;
-    bool logged_in;
-    std::string username;
-    std::string password;
-    // HCNetSDK session info; replace with actual handles
-    int user_id;
-    DeviceSession() : session_token(""), logged_in(false), user_id(-1) {}
-} g_session;
+    // Load mounted config file (instructions, driverProperties)
+    std::string read_mounted_config_file(const std::string& filename) {
+        std::string path = config_mount_path_ + "/" + filename;
+        std::ifstream f(path);
+        if (!f) {
+            LOG(ERROR, "Failed to open config file: " << path);
+            return "";
+        }
+        std::ostringstream ss;
+        ss << f.rdbuf();
+        return ss.str();
+    }
 
-// --- Device SDK Interaction Simulations ---
-// In actual implementation, replace these with direct SDK calls.
+    // Parse instructions YAML from file into map
+    YAML::Node get_instruction_config() {
+        std::string content = read_mounted_config_file("instructions");
+        if (content.empty()) {
+            LOG(WARNING, "Instructions config is empty");
+            return YAML::Node();
+        }
+        try {
+            YAML::Node node = YAML::Load(content);
+            return node;
+        } catch (const std::exception& e) {
+            LOG(ERROR, "YAML parse failed: " << e.what());
+            return YAML::Node();
+        }
+    }
 
-bool sdk_initialize() {
-    // return NET_DVR_Init();
-    return true;
-}
+    // Device address from EdgeDevice CR
+    std::string get_device_address() {
+        try {
+            auto dev = get_edge_device();
+            if (dev.contains("spec") && dev["spec"].contains("address")) {
+                return dev["spec"]["address"];
+            }
+        } catch (const std::exception& e) {
+            LOG(ERROR, "Failed to get device address: " << e.what());
+        }
+        return "";
+    }
 
-bool sdk_cleanup() {
-    // NET_DVR_Cleanup();
-    return true;
-}
+    // Get EdgeDevice object from k8s
+    json get_edge_device() {
+        try {
+            std::string result = k8s_client_->getNamespacedCustomObject(
+                "devices.kubeedge.io", "v1alpha2", edge_device_namespace_, "edgedevices", edge_device_name_
+            );
+            return json::parse(result);
+        } catch (const std::exception& e) {
+            LOG(ERROR, "K8S get_edge_device failed: " << e.what());
+            throw;
+        }
+    }
 
-bool sdk_login(const std::string &ip, int port, const std::string &user, const std::string &pass, int &user_id) {
-    // NET_DVR_DEVICEINFO_V30 devinfo;
-    // user_id = NET_DVR_Login_V30(ip.c_str(), port, user.c_str(), pass.c_str(), &devinfo);
-    // return user_id >= 0;
-    user_id = 1; // Simulated user id
-    return true;
-}
+    // Update EdgeDevice status
+    void update_device_status(const std::string& status, const std::string& msg = "") {
+        try {
+            auto dev = get_edge_device();
+            dev["status"]["devicePhase"] = status;
+            if (!msg.empty())
+                dev["status"]["message"] = msg;
+            std::string body = dev.dump();
+            k8s_client_->replaceNamespacedCustomObjectStatus(
+                "devices.kubeedge.io", "v1alpha2", edge_device_namespace_, "edgedevices", edge_device_name_, body
+            );
+        } catch (const std::exception& e) {
+            LOG(ERROR, "Failed to update device status: " << e.what());
+        }
+    }
 
-bool sdk_logout(int user_id) {
-    // return NET_DVR_Logout(user_id);
-    return true;
-}
+private:
+    void init_k8s_client() {
+        try {
+            // Try inCluster, then fallback to local kubeconfig
+            std::string kubeconfig = getenvOrDefault("KUBECONFIG", "");
+            if (!kubeconfig.empty()) {
+                k8s_client_ = std::make_unique<kubernetes::Client>(kubeconfig);
+            } else {
+                k8s_client_ = std::make_unique<kubernetes::Client>();
+            }
+        } catch (const std::exception& e) {
+            LOG(ERROR, "K8S client init error: " << e.what());
+            throw;
+        }
+    }
 
-bool sdk_activate(const std::string &ip, int port, const std::string &password) {
-    // NET_DVR_ActivateDevice(ip.c_str(), port, password.c_str());
-    return true;
-}
-
-bool sdk_reboot(int user_id) {
-    // NET_DVR_RebootDVR(user_id);
-    return true;
-}
-
-std::string sdk_get_status(int user_id) {
-    // Simulate status as JSON
-    std::ostringstream oss;
-    oss << "{";
-    oss << "\"timestamp\":\"" << now_iso8601() << "\",";
-    oss << "\"device\":{\"model\":\"DS-6300D-JX\",\"manufacturer\":\"Hikvision\"},";
-    oss << "\"channels\":[{\"id\":1,\"status\":\"online\"},{\"id\":2,\"status\":\"offline\"}],";
-    oss << "\"alarms\":[],";
-    oss << "\"sdk\":{\"state\":\"active\",\"version\":\"5.7.0\"},";
-    oss << "\"error_codes\":[]";
-    oss << "}";
-    return oss.str();
-}
-
-bool sdk_update_display_config(int user_id, const std::string &config_json) {
-    // Parse config_json and apply to SDK
-    return true;
-}
-
-bool sdk_playback_control(int user_id, const std::string &playback_json) {
-    // Parse playback_json and send playback commands to SDK
-    return true;
-}
-
-// --- HTTP Request Parsing ---
-
-struct HttpRequest {
-    std::string method;
-    std::string path;
-    std::string http_version;
-    std::map<std::string, std::string> headers;
-    std::string body;
+    std::string edge_device_name_;
+    std::string edge_device_namespace_;
+    std::string config_mount_path_;
+    std::unique_ptr<kubernetes::Client> k8s_client_;
 };
 
-bool parse_http_request(const std::string &raw, HttpRequest &req) {
-    std::istringstream iss(raw);
-    std::string line;
-    if (!std::getline(iss, line)) return false;
-    std::istringstream ls(line);
-    ls >> req.method >> req.path >> req.http_version;
-    while (std::getline(iss, line) && line != "\r") {
-        auto pos = line.find(':');
-        if (pos != std::string::npos) {
-            std::string key = line.substr(0, pos);
-            std::string val = line.substr(pos + 1);
-            while (!val.empty() && (val[0] == ' ' || val[0] == '\t')) val.erase(0, 1);
-            if (!val.empty() && val.back() == '\r') val.pop_back();
-            req.headers[key] = val;
+// --- Device Driver ---
+
+class DeviceShifuDriver {
+public:
+    DeviceShifuDriver() :
+        shutdown_flag(false),
+        latest_data_mutex(),
+        latest_data(),
+        shifu_client(),
+        mqtt_connected(false),
+        mqtt_reconnect_delay(1000),
+        mqtt_client(nullptr)
+    {
+        parse_env();
+        parse_config();
+        client_id = device_name + "-" + std::to_string(std::time(nullptr));
+    }
+
+    ~DeviceShifuDriver() {
+        shutdown();
+    }
+
+    void run() {
+        LOG(INFO, "Driver starting...");
+        shifu_client.update_device_status("Online");
+
+        // Start HTTP server in background
+        http_thread = std::thread(&DeviceShifuDriver::start_http_server, this);
+
+        // Start MQTT client & connection monitor
+        mqtt_thread = std::thread(&DeviceShifuDriver::mqtt_worker, this);
+
+        // Start periodic publishers per config
+        start_scheduled_publishers();
+
+        // Signal handling
+        std::signal(SIGINT, DeviceShifuDriver::signal_handler);
+        std::signal(SIGTERM, DeviceShifuDriver::signal_handler);
+
+        // Wait for threads to finish
+        http_thread.join();
+        mqtt_thread.join();
+        for (auto& th : publisher_threads) {
+            if (th.joinable()) th.join();
+        }
+        LOG(INFO, "Driver stopped.");
+    }
+
+    static void signal_handler(int) {
+        LOG(INFO, "Shutdown signal received");
+        instance()->shutdown_flag = true;
+        instance()->shutdown();
+    }
+
+    void shutdown() {
+        if (shutdown_flag.exchange(true)) return;
+        LOG(INFO, "Shutting down...");
+        try {
+            if (mqtt_client && mqtt_connected) {
+                mqtt_client->disconnect()->wait();
+            }
+        } catch (...) {}
+        if (http_server) http_server->stop();
+    }
+
+    // --- MQTT ---
+
+    void mqtt_worker() {
+        while (!shutdown_flag) {
+            try {
+                connect_mqtt();
+                while (mqtt_connected && !shutdown_flag) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                }
+            } catch (const std::exception& e) {
+                LOG(ERROR, "MQTT worker: " << e.what());
+            }
+            if (!shutdown_flag) {
+                LOG(WARNING, "MQTT connection lost. Reconnecting in " << mqtt_reconnect_delay << "ms");
+                std::this_thread::sleep_for(std::chrono::milliseconds(mqtt_reconnect_delay));
+            }
         }
     }
-    if (req.headers.count("Content-Length")) {
-        int content_length = std::stoi(req.headers["Content-Length"]);
-        std::string body(content_length, 0);
-        iss.read(&body[0], content_length);
-        req.body = body;
-    }
-    return true;
-}
 
-// --- Session Token Generation ---
+    void connect_mqtt() {
+        std::string address = "tcp://" + mqtt_broker + ":" + std::to_string(mqtt_port);
 
-std::string generate_token() {
-    static const char alpha[] = "0123456789abcdef";
-    std::ostringstream oss;
-    for (int i = 0; i < 32; ++i)
-        oss << alpha[rand() % (sizeof(alpha) - 1)];
-    return oss.str();
-}
+        mqtt_client = std::make_unique<mqtt::async_client>(address, client_id);
 
-// --- REST API Endpoints Implementation ---
+        mqtt::connect_options connOpts;
+        if (!mqtt_user.empty()) {
+            connOpts.set_user_name(mqtt_user);
+            connOpts.set_password(mqtt_pass);
+        }
+        connOpts.set_clean_session(true);
 
-void handle_sessions_post(int client_fd, const HttpRequest &req, const std::string &device_ip, int device_port) {
-    // JSON parse: {"username": "...", "password": "..."}
-    std::string user, pass;
-    auto u = req.body.find("\"username\"");
-    auto p = req.body.find("\"password\"");
-    if (u == std::string::npos || p == std::string::npos) {
-        send_http_response(client_fd, 400, "application/json", "{\"error\":\"Missing credentials\"}");
-        return;
-    }
-    auto uq = req.body.find(':', u);
-    auto pq = req.body.find(':', p);
-    if (uq == std::string::npos || pq == std::string::npos) {
-        send_http_response(client_fd, 400, "application/json", "{\"error\":\"Malformed JSON\"}");
-        return;
-    }
-    user = req.body.substr(uq + 1, req.body.find(',', uq) - uq - 1);
-    pass = req.body.substr(pq + 1, req.body.find('}', pq) - pq - 1);
-    user.erase(remove_if(user.begin(), user.end(), [](char c){return c==' '||c=='\"'||c==','||c=='}';}), user.end());
-    pass.erase(remove_if(pass.begin(), pass.end(), [](char c){return c==' '||c=='\"'||c==','||c=='}';}), pass.end());
+        mqtt_client->set_connected_handler([this](const std::string&) {
+            LOG(INFO, "MQTT connected");
+            mqtt_connected = true;
+            // Subscribe to control/command topics
+            for (const auto& sub : mqtt_subscribe_topics) {
+                mqtt_client->subscribe(sub, 1)->wait();
+                LOG(INFO, "Subscribed: " << sub);
+            }
+            // Status reporting
+            publish_status("online");
+        });
 
-    std::lock_guard<std::mutex> lock(state_mutex);
-    if (!sdk_initialize()) {
-        send_http_response(client_fd, 500, "application/json", "{\"error\":\"SDK init failed\"}");
-        return;
-    }
-    int user_id = -1;
-    if (!sdk_login(device_ip, device_port, user, pass, user_id)) {
-        send_http_response(client_fd, 401, "application/json", "{\"error\":\"Login failed\"}");
-        return;
-    }
-    g_session.session_token = generate_token();
-    g_session.logged_in = true;
-    g_session.username = user;
-    g_session.password = pass;
-    g_session.user_id = user_id;
-    std::ostringstream oss;
-    oss << "{\"session_token\":\"" << g_session.session_token << "\"}";
-    send_http_response(client_fd, 201, "application/json", oss.str());
-}
+        mqtt_client->set_connection_lost_handler([this](const std::string&) {
+            LOG(WARNING, "MQTT connection lost");
+            mqtt_connected = false;
+            publish_status("offline");
+        });
 
-void handle_sessions_delete(int client_fd, const HttpRequest &req) {
-    std::lock_guard<std::mutex> lock(state_mutex);
-    if (!g_session.logged_in) {
-        send_http_response(client_fd, 401, "application/json", "{\"error\":\"Not logged in\"}");
-        return;
-    }
-    if (!sdk_logout(g_session.user_id)) {
-        send_http_response(client_fd, 500, "application/json", "{\"error\":\"Logout failed\"}");
-        return;
-    }
-    sdk_cleanup();
-    g_session = DeviceSession();
-    send_http_response(client_fd, 204, "application/json", "");
-}
+        mqtt_client->set_message_callback([this](mqtt::const_message_ptr msg) {
+            handle_mqtt_message(msg);
+        });
 
-bool check_session(const HttpRequest &req) {
-    auto it = req.headers.find("Authorization");
-    if (it == req.headers.end()) return false;
-    std::string token = it->second;
-    if (token.find("Bearer ") == 0) token = token.substr(7);
-    std::lock_guard<std::mutex> lock(state_mutex);
-    return g_session.logged_in && (g_session.session_token == token);
-}
-
-void handle_commands_activate(int client_fd, const HttpRequest &req, const std::string &device_ip, int device_port) {
-    if (!check_session(req)) {
-        send_http_response(client_fd, 401, "application/json", "{\"error\":\"Unauthorized\"}");
-        return;
-    }
-    // JSON parse: {"password": "newpassword"} or reuse login password
-    std::string password = g_session.password;
-    auto p = req.body.find("\"password\"");
-    if (p != std::string::npos) {
-        auto pq = req.body.find(':', p);
-        if (pq != std::string::npos) {
-            password = req.body.substr(pq+1, req.body.find('}', pq)-pq-1);
-            password.erase(remove_if(password.begin(), password.end(), [](char c){return c==' '||c=='\"'||c==','||c=='}';}), password.end());
+        try {
+            mqtt_client->connect(connOpts)->wait();
+        } catch (const std::exception& e) {
+            LOG(ERROR, "MQTT connect failed: " << e.what());
+            mqtt_connected = false;
+            throw;
         }
     }
-    if (!sdk_activate(device_ip, device_port, password)) {
-        send_http_response(client_fd, 500, "application/json", "{\"error\":\"Activation failed\"}");
-        return;
-    }
-    send_http_response(client_fd, 200, "application/json", "{\"status\":\"activated\"}");
-}
 
-void handle_commands_reboot(int client_fd, const HttpRequest &req) {
-    if (!check_session(req)) {
-        send_http_response(client_fd, 401, "application/json", "{\"error\":\"Unauthorized\"}");
-        return;
-    }
-    if (!sdk_reboot(g_session.user_id)) {
-        send_http_response(client_fd, 500, "application/json", "{\"error\":\"Reboot failed\"}");
-        return;
-    }
-    send_http_response(client_fd, 200, "application/json", "{\"status\":\"rebooting\"}");
-}
-
-void handle_status_get(int client_fd, const HttpRequest &req) {
-    if (!check_session(req)) {
-        send_http_response(client_fd, 401, "application/json", "{\"error\":\"Unauthorized\"}");
-        return;
-    }
-    std::string status_json = sdk_get_status(g_session.user_id);
-    send_http_response(client_fd, 200, "application/json", status_json);
-}
-
-void handle_config_display_put(int client_fd, const HttpRequest &req) {
-    if (!check_session(req)) {
-        send_http_response(client_fd, 401, "application/json", "{\"error\":\"Unauthorized\"}");
-        return;
-    }
-    if (!sdk_update_display_config(g_session.user_id, req.body)) {
-        send_http_response(client_fd, 500, "application/json", "{\"error\":\"Update failed\"}");
-        return;
-    }
-    send_http_response(client_fd, 200, "application/json", "{\"status\":\"ok\"}");
-}
-
-void handle_commands_playback_post(int client_fd, const HttpRequest &req) {
-    if (!check_session(req)) {
-        send_http_response(client_fd, 401, "application/json", "{\"error\":\"Unauthorized\"}");
-        return;
-    }
-    if (!sdk_playback_control(g_session.user_id, req.body)) {
-        send_http_response(client_fd, 500, "application/json", "{\"error\":\"Playback failed\"}");
-        return;
-    }
-    send_http_response(client_fd, 200, "application/json", "{\"status\":\"ok\"}");
-}
-
-// --- HTTP Server Main Loop ---
-
-void handle_client(int client_fd, const std::string &device_ip, int device_port) {
-    char buffer[BUFFER_SIZE];
-    ssize_t n = recv(client_fd, buffer, BUFFER_SIZE - 1, 0);
-    if (n <= 0) { close(client_fd); return; }
-    buffer[n] = '\0';
-
-    HttpRequest req;
-    if (!parse_http_request(buffer, req)) {
-        send_http_response(client_fd, 400, "application/json", "{\"error\":\"Malformed request\"}");
-        close(client_fd);
-        return;
+    void publish_status(const std::string& status) {
+        if (!mqtt_connected) return;
+        std::string topic = topic_prefix + "/" + device_name + "/status";
+        json payload = {
+            {"status", status},
+            {"timestamp", std::time(nullptr)}
+        };
+        auto msg = mqtt::make_message(topic, payload.dump());
+        msg->set_qos(1);
+        mqtt_client->publish(msg);
     }
 
-    if (req.method == "POST" && req.path == "/sessions") {
-        handle_sessions_post(client_fd, req, device_ip, device_port);
-    } else if (req.method == "DELETE" && req.path == "/sessions") {
-        handle_sessions_delete(client_fd, req);
-    } else if (req.method == "POST" && req.path == "/commands/activate") {
-        handle_commands_activate(client_fd, req, device_ip, device_port);
-    } else if (req.method == "POST" && req.path == "/commands/reboot") {
-        handle_commands_reboot(client_fd, req);
-    } else if (req.method == "GET" && req.path == "/status") {
-        handle_status_get(client_fd, req);
-    } else if (req.method == "PUT" && req.path == "/config/display") {
-        handle_config_display_put(client_fd, req);
-    } else if (req.method == "POST" && req.path == "/commands/playback") {
-        handle_commands_playback_post(client_fd, req);
-    } else {
-        send_http_response(client_fd, 404, "application/json", "{\"error\":\"Unknown endpoint\"}");
+    void handle_mqtt_message(mqtt::const_message_ptr msg) {
+        LOG(INFO, "MQTT message received: " << msg->get_topic());
+        // Handle control/maintenance/display/decode commands here
+        // For demo, just log and echo to latest_data
+        std::lock_guard<std::mutex> lock(latest_data_mutex);
+        latest_data[msg->get_topic()] = json::parse(msg->to_string());
     }
-    close(client_fd);
-}
 
-// --- Entry Point ---
+    void publish_topic(const std::string& topic, const json& payload, int qos=1) {
+        if (!mqtt_connected) return;
+        try {
+            auto msg = mqtt::make_message(topic, payload.dump());
+            msg->set_qos(qos);
+            mqtt_client->publish(msg);
+        } catch (const std::exception& e) {
+            LOG(ERROR, "MQTT publish failed: " << e.what());
+        }
+    }
+
+    // --- HTTP Server ---
+
+    void start_http_server() {
+        http_server = std::make_unique<httplib::Server>();
+
+        http_server->Get("/health", [](const httplib::Request&, httplib::Response& res) {
+            res.set_content("{\"health\": \"ok\"}", "application/json");
+        });
+
+        http_server->Get("/status", [this](const httplib::Request&, httplib::Response& res) {
+            json status_json;
+            status_json["mqtt_connected"] = this->mqtt_connected;
+            std::lock_guard<std::mutex> lock(latest_data_mutex);
+            status_json["latest_data"] = latest_data;
+            res.set_content(status_json.dump(), "application/json");
+        });
+
+        LOG(INFO, "HTTP server listening on " << http_host << ":" << http_port);
+        http_server->listen(http_host.c_str(), http_port);
+    }
+
+    // --- Periodic Publisher ---
+
+    void start_scheduled_publishers() {
+        for (const auto& instr : instruction_publishers) {
+            publisher_threads.emplace_back(
+                &DeviceShifuDriver::publish_topic_periodically,
+                this, instr.first, instr.second.interval_ms, instr.second.topic, instr.second.qos
+            );
+        }
+    }
+
+    void publish_topic_periodically(std::string instruction, int interval_ms, std::string topic, int qos) {
+        while (!shutdown_flag) {
+            // Simulate device data retrieval
+            json payload = retrieve_device_data(instruction);
+            {
+                std::lock_guard<std::mutex> lock(latest_data_mutex);
+                latest_data[topic] = payload;
+            }
+            publish_topic(topic, payload, qos);
+            for (int i = 0; i < interval_ms / 100; ++i) {
+                if (shutdown_flag) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        }
+    }
+
+    json retrieve_device_data(const std::string& instruction) {
+        // Replace this with actual device SDK/logic
+        json data;
+        data["instruction"] = instruction;
+        data["timestamp"] = std::time(nullptr);
+        data["status"] = "OK";
+        return data;
+    }
+
+    // --- Config Parsing ---
+
+    void parse_env() {
+        device_name = getenvOrDefault("EDGEDEVICE_NAME", "deviceshifu-NetworkVideoDecoder");
+        device_ns = getenvOrDefault("EDGEDEVICE_NAMESPACE", "devices");
+        config_mount_path = getenvOrDefault("CONFIG_MOUNT_PATH", "/etc/edgedevice/config");
+        mqtt_broker = getenvOrDefault("MQTT_BROKER", "localhost");
+        mqtt_port = std::stoi(getenvOrDefault("MQTT_BROKER_PORT", "1883"));
+        mqtt_user = getenvOrDefault("MQTT_BROKER_USERNAME", "");
+        mqtt_pass = getenvOrDefault("MQTT_BROKER_PASSWORD", "");
+        topic_prefix = getenvOrDefault("MQTT_TOPIC_PREFIX", "shifu");
+        http_host = getenvOrDefault("HTTP_HOST", "0.0.0.0");
+        http_port = std::stoi(getenvOrDefault("HTTP_PORT", "8080"));
+        std::string log_level = getenvOrDefault("LOG_LEVEL", "INFO");
+        if (log_level == "DEBUG") CURRENT_LOG_LEVEL = DEBUG;
+        else if (log_level == "INFO") CURRENT_LOG_LEVEL = INFO;
+        else if (log_level == "WARNING") CURRENT_LOG_LEVEL = WARNING;
+        else if (log_level == "ERROR") CURRENT_LOG_LEVEL = ERROR;
+    }
+
+    void parse_config() {
+        YAML::Node instructions = shifu_client.get_instruction_config();
+        // Fallback: if no config, use API info
+        if (!instructions) {
+            // Hardcoded from API info
+            add_publisher("maintenance", "device/commands/maintenance", 10000, 1);
+            add_publisher("display", "device/commands/display", 10000, 1);
+            add_publisher("decode", "device/commands/decode", 10000, 1);
+            add_subscriber("device/telemetry/status", 1);
+        } else {
+            // Parse instructions for detailed config
+            for (const auto& it : instructions) {
+                std::string name = it.first.as<std::string>();
+                YAML::Node desc = it.second;
+                std::string mode = desc["protocolProperties"]["mode"].as<std::string>("publisher");
+                int interval = desc["protocolProperties"]["publishIntervalMS"].as<int>(10000);
+                std::string topic = desc["mqttTopic"].as<std::string>(topic_prefix + "/" + device_name + "/" + name);
+                int qos = desc["protocolProperties"]["qos"].as<int>(1);
+                if (mode == "publisher") {
+                    add_publisher(name, topic, interval, qos);
+                } else if (mode == "subscriber") {
+                    add_subscriber(topic, qos);
+                }
+            }
+        }
+    }
+
+    void add_publisher(const std::string& name, const std::string& topic, int interval_ms, int qos) {
+        instruction_publishers[name] = {topic, interval_ms, qos};
+    }
+
+    void add_subscriber(const std::string& topic, int qos) {
+        mqtt_subscribe_topics.push_back(topic);
+    }
+
+    // --- Singleton for signal handling ---
+    static DeviceShifuDriver* instance(DeviceShifuDriver* inst = nullptr) {
+        static DeviceShifuDriver* driver_instance = nullptr;
+        if (inst) driver_instance = inst;
+        return driver_instance;
+    }
+
+private:
+    struct PublisherConfig {
+        std::string topic;
+        int interval_ms;
+        int qos;
+    };
+
+    std::string device_name, device_ns, config_mount_path, mqtt_broker, mqtt_user, mqtt_pass, topic_prefix, http_host, client_id;
+    int mqtt_port, http_port;
+    std::atomic<bool> shutdown_flag;
+
+    std::mutex latest_data_mutex;
+    std::unordered_map<std::string, json> latest_data;
+
+    ShifuClient shifu_client;
+
+    std::vector<std::thread> publisher_threads;
+    std::thread http_thread, mqtt_thread;
+
+    std::vector<std::string> mqtt_subscribe_topics;
+    std::map<std::string, PublisherConfig> instruction_publishers;
+
+    std::unique_ptr<mqtt::async_client> mqtt_client;
+    std::atomic<bool> mqtt_connected;
+    int mqtt_reconnect_delay;
+    std::unique_ptr<httplib::Server> http_server;
+};
+
+// --- Main ---
 
 int main() {
-    std::string device_ip = get_env("DEVICE_IP", "192.168.1.64");
-    int device_port = std::stoi(get_env("DEVICE_PORT", "8000"));
-    std::string server_host = get_env("HTTP_HOST", "0.0.0.0");
-    int server_port = std::stoi(get_env("HTTP_PORT", "8080"));
-
-    srand(time(NULL));
-
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd == -1) { std::cerr << "Socket error\n"; return 1; }
-
-    int opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(server_port);
-    addr.sin_addr.s_addr = INADDR_ANY;
-
-    if (bind(server_fd, (sockaddr*)&addr, sizeof(addr)) < 0) {
-        std::cerr << "Bind error\n";
+    try {
+        auto driver = std::make_unique<DeviceShifuDriver>();
+        DeviceShifuDriver::instance(driver.get());
+        driver->run();
+    } catch (const std::exception& e) {
+        LOG(ERROR, "Fatal error: " << e.what());
         return 1;
     }
-
-    if (listen(server_fd, 10) < 0) {
-        std::cerr << "Listen error\n";
-        return 1;
-    }
-
-    std::cout << "HTTP server running on " << server_host << ":" << server_port << "\n";
-
-    while (true) {
-        sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-        int client_fd = accept(server_fd, (sockaddr*)&client_addr, &client_len);
-        if (client_fd < 0) continue;
-        std::thread(handle_client, client_fd, device_ip, device_port).detach();
-    }
-
-    close(server_fd);
     return 0;
 }
