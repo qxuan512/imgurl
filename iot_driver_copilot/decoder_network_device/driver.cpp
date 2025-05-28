@@ -1,184 +1,283 @@
-```cpp
+// hikvision_decoder_http_driver.cpp
+
 #include <iostream>
 #include <string>
+#include <cstdlib>
 #include <vector>
 #include <map>
-#include <cstdlib>
 #include <thread>
 #include <sstream>
 #include <fstream>
-#include <streambuf>
-#include <mutex>
-#include <regex>
 #include <algorithm>
+#include <functional>
+#include <mutex>
+#include <condition_variable>
+#include <cstring>
 
-#define CPPHTTPLIB_OPENSSL_SUPPORT
-#include "httplib.h"
-#include "tinyxml2.h"
+// Minimal HTTP server (C++11): No external dependencies
+// Only for demonstration and driver logic
 
-// ==================== Environment Variable Access ===========================
-std::string get_env(const std::string &key, const std::string &default_val = "") {
-    const char* val = std::getenv(key.c_str());
-    return val ? std::string(val) : default_val;
-}
+#ifdef _WIN32
+#include <winsock2.h>
+#pragma comment(lib,"ws2_32.lib")
+typedef int socklen_t;
+#else
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <netinet/in.h>
+#define INVALID_SOCKET -1
+#define SOCKET_ERROR   -1
+typedef int SOCKET;
+#endif
 
-// ==================== Device SDK/Protocol Layer (Stubs) =====================
-// In a real implementation, these would interface with the device via HCNetSDK or similar APIs.
+// --- Device Protocol Simulation Layer ---
+// (In practice, use HCNetSDK or network calls. Here, simulate responses.)
 
 struct ChannelConfig {
     int id;
     bool enabled;
     std::string name;
-    std::map<std::string, std::string> settings;
+    std::string stream;
 };
 
 struct DisplayConfig {
     std::string layout;
-    int scenes;
-    std::vector<std::string> windows;
+    std::vector<std::string> scenes;
 };
 
 struct DeviceStatus {
     std::string decoder_state;
     std::string alarm;
     std::string remote_play;
-    std::string firmware_upgrade;
-    int loop_polling;
-    std::string operational_state;
+    int upgrade_progress;
+    std::string polling_info;
 };
 
-std::mutex device_mutex;
-std::vector<ChannelConfig> mock_channels = {
-    {1, true,  "Channel 1", {{"resolution","1080p"}}},
-    {2, false, "Channel 2", {{"resolution","720p"}}},
-    {3, true,  "Channel 3", {{"resolution","1080p"}}}
+// Simulated state storage
+std::vector<ChannelConfig> channels = {
+    {1, true,  "Main Entrance", "rtsp://192.168.1.100/stream1"},
+    {2, false, "Back Door",     "rtsp://192.168.1.100/stream2"},
+    {3, true,  "Lobby",         "rtsp://192.168.1.100/stream3"}
 };
 
-DisplayConfig mock_display = {"4x4", 2, {"window1", "window2"}};
-DeviceStatus mock_status = {"active", "none", "stopped", "idle", 1, "running"};
+DisplayConfig display_config = {"2x2", {"SceneA", "SceneB"}};
 
-std::vector<ChannelConfig> get_channels(const std::map<std::string, std::string>& filters) {
-    std::lock_guard<std::mutex> lock(device_mutex);
-    std::vector<ChannelConfig> result;
-    for (const auto &ch : mock_channels) {
-        bool ok = true;
-        if (filters.count("id")) {
-            ok &= std::to_string(ch.id) == filters.at("id");
-        }
-        if (filters.count("enabled")) {
-            ok &= ((ch.enabled && filters.at("enabled") == "true") || (!ch.enabled && filters.at("enabled") == "false"));
-        }
-        if (ok) result.push_back(ch);
-    }
-    return result;
+DeviceStatus device_status = {
+    "Running", "Normal", "Stopped", 37, "Loop1"
+};
+
+std::mutex state_mutex;
+
+// --- Utility ---
+std::string getenv_default(const char* name, const std::string& def) {
+    const char* val = std::getenv(name);
+    return val ? val : def;
 }
 
-bool update_channel(int id, bool enabled, const std::map<std::string, std::string>& settings) {
-    std::lock_guard<std::mutex> lock(device_mutex);
-    for (auto& ch : mock_channels) {
-        if (ch.id == id) {
-            ch.enabled = enabled;
-            for (const auto& kv : settings) ch.settings[kv.first] = kv.second;
-            return true;
-        }
-    }
-    return false;
+std::string int_to_str(int x) {
+    std::ostringstream oss;
+    oss << x;
+    return oss.str();
 }
-
-bool update_channels_bulk(const std::vector<std::pair<int,bool>>& updates) {
-    std::lock_guard<std::mutex> lock(device_mutex);
-    for (auto& up : updates) {
-        bool found = false;
-        for (auto& ch : mock_channels) {
-            if (ch.id == up.first) {
-                ch.enabled = up.second;
-                found = true;
-                break;
-            }
-        }
-        if (!found) return false;
-    }
-    return true;
-}
-
-DisplayConfig get_display() {
-    std::lock_guard<std::mutex> lock(device_mutex);
-    return mock_display;
-}
-
-bool update_display(const DisplayConfig& config) {
-    std::lock_guard<std::mutex> lock(device_mutex);
-    mock_display = config;
-    return true;
-}
-
-DeviceStatus get_status() {
-    std::lock_guard<std::mutex> lock(device_mutex);
-    return mock_status;
-}
-
-bool send_control_command(const std::string& type, const std::map<std::string, std::string>& params) {
-    std::lock_guard<std::mutex> lock(device_mutex);
-    if (type == "reset") {
-        mock_status.operational_state = "rebooting";
-        return true;
-    }
-    // Simulate other controls...
-    return true;
-}
-
-bool decode_control(const std::string& action) {
-    std::lock_guard<std::mutex> lock(device_mutex);
-    if (action == "start") mock_status.decoder_state = "decoding";
-    else if (action == "stop") mock_status.decoder_state = "idle";
-    else return false;
-    return true;
-}
-
-bool reboot_device() {
-    std::lock_guard<std::mutex> lock(device_mutex);
-    mock_status.operational_state = "rebooting";
-    return true;
-}
-
-// =================== JSON Serialization/Parsing =============================
-// (Simple, minimal. For production use a robust library.)
 
 std::string json_escape(const std::string& s) {
     std::string out;
     for (char c : s) {
-        if (c == '\"') out += "\\\"";
-        else if (c == '\\') out += "\\\\";
-        else if (c == '\n') out += "\\n";
-        else if (c == '\r') out += "\\r";
-        else out += c;
+        if (c == '"' || c == '\\') out += '\\';
+        out += c;
     }
     return out;
 }
 
-std::string channel_to_json(const ChannelConfig& ch) {
-    std::ostringstream oss;
-    oss << "{";
-    oss << "\"id\":" << ch.id << ",";
-    oss << "\"enabled\":" << (ch.enabled ? "true" : "false") << ",";
-    oss << "\"name\":\"" << json_escape(ch.name) << "\",";
-    oss << "\"settings\":{";
-    bool first=true;
-    for (const auto& kv : ch.settings) {
-        if (!first) oss << ",";
-        oss << "\"" << json_escape(kv.first) << "\":\"" << json_escape(kv.second) << "\"";
-        first=false;
-    }
-    oss << "}}";
-    return oss.str();
-}
+// --- Minimal HTTP Server Implementation ---
+class HttpServer {
+public:
+    HttpServer(const std::string& host, int port)
+        : host_(host), port_(port), running_(false) {}
+    ~HttpServer() { stop(); }
 
-std::string channels_to_json(const std::vector<ChannelConfig>& chs) {
+    void route(const std::string& method, const std::string& path, std::function<void(const std::string&, const std::map<std::string,std::string>&, const std::string&, std::ostream&)> handler) {
+        std::string key = method + ":" + path;
+        handlers_[key] = handler;
+    }
+
+    void start() {
+        running_ = true;
+        server_thread_ = std::thread([this] { this->run(); });
+    }
+
+    void stop() {
+        running_ = false;
+#ifdef _WIN32
+        closesocket(listen_sock_);
+        WSACleanup();
+#else
+        close(listen_sock_);
+#endif
+        if (server_thread_.joinable()) server_thread_.join();
+    }
+
+private:
+    std::string host_;
+    int port_;
+    bool running_;
+    std::thread server_thread_;
+    SOCKET listen_sock_;
+    std::map<std::string, std::function<void(const std::string&, const std::map<std::string,std::string>&, const std::string&, std::ostream&)>> handlers_;
+
+    void run() {
+#ifdef _WIN32
+        WSADATA wsa;
+        WSAStartup(MAKEWORD(2,2),&wsa);
+#endif
+        listen_sock_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (listen_sock_ == INVALID_SOCKET) return;
+
+        sockaddr_in addr;
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = inet_addr(host_.c_str());
+        addr.sin_port = htons(port_);
+
+        int optval = 1;
+        setsockopt(listen_sock_, SOL_SOCKET, SO_REUSEADDR, (char*)&optval, sizeof(optval));
+
+        if (bind(listen_sock_, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) return;
+        if (listen(listen_sock_, 8) == SOCKET_ERROR) return;
+
+        while (running_) {
+            sockaddr_in client_addr;
+            socklen_t client_len = sizeof(client_addr);
+            SOCKET client = accept(listen_sock_, (struct sockaddr*)&client_addr, &client_len);
+            if (client == INVALID_SOCKET) continue;
+            std::thread(&HttpServer::handle_client, this, client).detach();
+        }
+    }
+
+    void handle_client(SOCKET client) {
+        char buf[8192];
+        int received = recv(client, buf, sizeof(buf)-1, 0);
+        if (received <= 0) {
+#ifdef _WIN32
+            closesocket(client);
+#else
+            close(client);
+#endif
+            return;
+        }
+        buf[received] = 0;
+        std::istringstream request_stream(buf);
+        std::string request_line;
+        std::getline(request_stream, request_line);
+        request_line.erase(request_line.find_last_not_of("\r\n")+1);
+
+        std::string method, path, version;
+        std::istringstream rl(request_line);
+        rl >> method >> path >> version;
+
+        std::map<std::string,std::string> headers;
+        std::string header_line;
+        while (std::getline(request_stream, header_line)) {
+            if (header_line == "\r" || header_line.empty()) break;
+            auto pos = header_line.find(':');
+            if (pos != std::string::npos) {
+                std::string key = header_line.substr(0, pos);
+                std::string val = header_line.substr(pos+1);
+                val.erase(0, val.find_first_not_of(" \t\r\n"));
+                val.erase(val.find_last_not_of(" \t\r\n")+1);
+                headers[key] = val;
+            }
+        }
+        std::string body;
+        if (headers.count("Content-Length")) {
+            int len = std::stoi(headers["Content-Length"]);
+            body.resize(len);
+            request_stream.read(&body[0], len);
+        }
+
+        // Parse query string
+        std::string path_only = path;
+        std::map<std::string, std::string> query_params;
+        auto qpos = path.find('?');
+        if (qpos != std::string::npos) {
+            path_only = path.substr(0, qpos);
+            std::string query = path.substr(qpos+1);
+            std::istringstream qss(query);
+            std::string kv;
+            while (std::getline(qss, kv, '&')) {
+                auto eq = kv.find('=');
+                if (eq != std::string::npos) {
+                    query_params[kv.substr(0,eq)] = kv.substr(eq+1);
+                }
+            }
+        }
+
+        std::ostringstream response;
+        bool handled = false;
+        for (const auto& h : handlers_) {
+            std::string route_method = h.first.substr(0, h.first.find(":"));
+            std::string route_path   = h.first.substr(h.first.find(":")+1);
+
+            // Support path with {id} variables
+            if (method == route_method && match_path(route_path, path_only, query_params)) {
+                h.second(path_only, query_params, body, response);
+                handled = true;
+                break;
+            }
+        }
+        if (!handled) {
+            response << "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Not Found\"}";
+        }
+        std::string resp_str = response.str();
+        send(client, resp_str.c_str(), (int)resp_str.length(), 0);
+#ifdef _WIN32
+        closesocket(client);
+#else
+        close(client);
+#endif
+    }
+
+    // Path matching with {id} support
+    bool match_path(const std::string& route, const std::string& actual, std::map<std::string,std::string>& query_params) {
+        std::vector<std::string> r_parts, a_parts;
+        split(route, '/', r_parts);
+        split(actual, '/', a_parts);
+        if (r_parts.size() != a_parts.size()) return false;
+        for (size_t i=0; i<r_parts.size(); ++i) {
+            if (!r_parts[i].empty() && r_parts[i][0] == '{' && r_parts[i].back() == '}') {
+                std::string key = r_parts[i].substr(1, r_parts[i].size()-2);
+                query_params[key] = a_parts[i];
+            } else if (r_parts[i] != a_parts[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+    void split(const std::string& s, char delim, std::vector<std::string>& out) {
+        std::istringstream iss(s);
+        std::string item;
+        while (std::getline(iss, item, delim)) {
+            if (!item.empty()) out.push_back(item);
+        }
+    }
+};
+
+// --- JSON Generators ---
+std::string channels_to_json(const std::vector<ChannelConfig>& chs, int page=0, int page_size=0) {
     std::ostringstream oss;
     oss << "[";
-    for (size_t i=0; i<chs.size(); ++i) {
-        if (i) oss << ",";
-        oss << channel_to_json(chs[i]);
+    int count = 0, skipped = 0;
+    for (const auto& ch : chs) {
+        if (page_size > 0 && skipped < page*page_size) { skipped++; continue; }
+        if (page_size > 0 && count >= page_size) break;
+        if (count > 0) oss << ",";
+        oss << "{"
+            << "\"id\":" << ch.id << ","
+            << "\"enabled\":" << (ch.enabled ? "true":"false") << ","
+            << "\"name\":\"" << json_escape(ch.name) << "\","
+            << "\"stream\":\"" << json_escape(ch.stream) << "\""
+            << "}";
+        count++;
     }
     oss << "]";
     return oss.str();
@@ -188,203 +287,215 @@ std::string display_to_json(const DisplayConfig& d) {
     std::ostringstream oss;
     oss << "{";
     oss << "\"layout\":\"" << json_escape(d.layout) << "\",";
-    oss << "\"scenes\":" << d.scenes << ",";
-    oss << "\"windows\":[";
-    for (size_t i=0; i<d.windows.size(); ++i) {
-        if (i) oss << ",";
-        oss << "\"" << json_escape(d.windows[i]) << "\"";
+    oss << "\"scenes\":[";
+    for (size_t i=0; i<d.scenes.size(); ++i) {
+        if (i>0) oss << ",";
+        oss << "\"" << json_escape(d.scenes[i]) << "\"";
     }
-    oss << "]}";
+    oss << "]";
+    oss << "}";
     return oss.str();
 }
 
 std::string status_to_json(const DeviceStatus& s) {
     std::ostringstream oss;
-    oss << "{";
-    oss << "\"decoder_state\":\"" << json_escape(s.decoder_state) << "\",";
-    oss << "\"alarm\":\"" << json_escape(s.alarm) << "\",";
-    oss << "\"remote_play\":\"" << json_escape(s.remote_play) << "\",";
-    oss << "\"firmware_upgrade\":\"" << json_escape(s.firmware_upgrade) << "\",";
-    oss << "\"loop_polling\":" << s.loop_polling << ",";
-    oss << "\"operational_state\":\"" << json_escape(s.operational_state) << "\"";
-    oss << "}";
+    oss << "{"
+        << "\"decoder_state\":\"" << json_escape(s.decoder_state) << "\","
+        << "\"alarm\":\"" << json_escape(s.alarm) << "\","
+        << "\"remote_play\":\"" << json_escape(s.remote_play) << "\","
+        << "\"upgrade_progress\":" << s.upgrade_progress << ","
+        << "\"polling_info\":\"" << json_escape(s.polling_info) << "\""
+        << "}";
     return oss.str();
 }
 
-// Very simple JSON parser for our expected input
-std::map<std::string, std::string> parse_json_body(const std::string& body) {
-    std::map<std::string, std::string> m;
-    std::regex rx("\"([^\"]+)\":\\s*(\"[^\"]+\"|\\d+|true|false|null)");
-    auto begin = std::sregex_iterator(body.begin(), body.end(), rx);
-    auto end = std::sregex_iterator();
-    for (auto i = begin; i != end; ++i) {
-        std::string k = (*i)[1].str();
-        std::string v = (*i)[2].str();
-        if (!v.empty() && v.front() == '"' && v.back() == '"') v = v.substr(1, v.size()-2);
-        m[k]=v;
+// --- API Handlers ---
+void handle_get_channels(const std::string& path, const std::map<std::string,std::string>& params, const std::string& body, std::ostream& out) {
+    std::lock_guard<std::mutex> lock(state_mutex);
+    std::vector<ChannelConfig> filtered = channels;
+    // Filtering
+    if (params.count("id")) {
+        int id = std::stoi(params.at("id"));
+        filtered.erase(std::remove_if(filtered.begin(), filtered.end(), [id](const ChannelConfig& c){ return c.id != id; }), filtered.end());
     }
-    return m;
+    // Pagination
+    int page = 0, page_size = 0;
+    if (params.count("page")) page = std::stoi(params.at("page"));
+    if (params.count("page_size")) page_size = std::stoi(params.at("page_size"));
+    std::string resp = channels_to_json(filtered, page, page_size);
+    out << "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n" << resp;
 }
 
-// ================ HTTP Server & Route Handlers ==============================
-
-void run_http_server(const std::string& host, int port) {
-    httplib::Server svr;
-
-    // GET /channels
-    svr.Get(R"(/channels)", [](const httplib::Request& req, httplib::Response& res) {
-        std::map<std::string, std::string> filters;
-        if (req.has_param("id")) filters["id"] = req.get_param_value("id");
-        if (req.has_param("enabled")) filters["enabled"] = req.get_param_value("enabled");
-        auto channels = get_channels(filters);
-        res.set_content(channels_to_json(channels), "application/json");
-    });
-
-    // PUT /channels (bulk enable/disable)
-    svr.Put(R"(/channels)", [](const httplib::Request& req, httplib::Response& res) {
-        // Expect JSON: [{"id":1,"enabled":true},...]
-        try {
-            std::vector<std::pair<int,bool>> updates;
-            std::regex rx(R"(\{[^\}]*"id"\s*:\s*(\d+)[^\}]*"enabled"\s*:\s*(true|false)[^\}]*\})");
-            auto begin = std::sregex_iterator(req.body.begin(), req.body.end(), rx);
-            auto end = std::sregex_iterator();
-            for (auto i = begin; i != end; ++i) {
-                int id = std::stoi((*i)[1]);
-                bool enabled = ((*i)[2] == "true");
-                updates.push_back({id, enabled});
-            }
-            if (!updates.empty() && update_channels_bulk(updates)) {
-                res.set_content(R"({"status":"success"})", "application/json");
-            } else {
-                res.status = 400;
-                res.set_content(R"({"error":"Failed to update channels"})", "application/json");
-            }
-        } catch (...) {
-            res.status = 400;
-            res.set_content(R"({"error":"Invalid input"})", "application/json");
+void handle_put_channels(const std::string& path, const std::map<std::string,std::string>& params, const std::string& body, std::ostream& out) {
+    // Update decoder channel configuration (enable/disable)
+    std::lock_guard<std::mutex> lock(state_mutex);
+    // Expect: [{"id":1,"enabled":true}, ...]
+    size_t pos = 0;
+    std::vector<std::pair<int,bool>> updates;
+    while ((pos = body.find("\"id\":",pos)) != std::string::npos) {
+        size_t id_start = body.find(":", pos)+1;
+        size_t id_end = body.find(",", id_start);
+        int id = std::stoi(body.substr(id_start, id_end-id_start));
+        size_t en_pos = body.find("\"enabled\":", id_end);
+        bool enabled = false;
+        if (en_pos != std::string::npos) {
+            enabled = (body.find("true", en_pos) < body.find("}", en_pos));
         }
-    });
-
-    // PUT /channels/{id}
-    svr.Put(R"(/channels/(\d+))", [](const httplib::Request& req, httplib::Response& res) {
-        int id = std::stoi(req.matches[1]);
-        auto m = parse_json_body(req.body);
-        bool enabled = (m.count("enabled") && (m["enabled"] == "true"));
-        auto settings = m;
-        settings.erase("enabled");
-        if (update_channel(id, enabled, settings)) {
-            res.set_content(R"({"status":"success"})", "application/json");
-        } else {
-            res.status = 404;
-            res.set_content(R"({"error":"Channel not found"})", "application/json");
+        updates.push_back({id, enabled});
+        pos = id_end;
+    }
+    for (auto& up : updates) {
+        for (auto& ch : channels) {
+            if (ch.id == up.first) ch.enabled = up.second;
         }
-    });
-
-    // POST /control
-    svr.Post(R"(/control)", [](const httplib::Request& req, httplib::Response& res) {
-        auto m = parse_json_body(req.body);
-        if (!m.count("type")) {
-            res.status = 400;
-            res.set_content(R"({"error":"Missing command type"})", "application/json");
-            return;
-        }
-        std::string type = m["type"];
-        m.erase("type");
-        if (send_control_command(type, m)) {
-            res.set_content(R"({"status":"success"})", "application/json");
-        } else {
-            res.status = 400;
-            res.set_content(R"({"error":"Command failed"})", "application/json");
-        }
-    });
-
-    // POST /commands/decode
-    svr.Post(R"(/commands/decode)", [](const httplib::Request& req, httplib::Response& res) {
-        auto m = parse_json_body(req.body);
-        if (!m.count("action")) {
-            res.status = 400;
-            res.set_content(R"({"error":"Missing action"})", "application/json");
-            return;
-        }
-        if (decode_control(m["action"])) {
-            res.set_content(R"({"status":"success"})", "application/json");
-        } else {
-            res.status = 400;
-            res.set_content(R"({"error":"Invalid action"})", "application/json");
-        }
-    });
-
-    // POST /commands/reboot
-    svr.Post(R"(/commands/reboot)", [](const httplib::Request& req, httplib::Response& res) {
-        if (reboot_device()) {
-            res.set_content(R"({"status":"rebooting"})", "application/json");
-        } else {
-            res.status = 500;
-            res.set_content(R"({"error":"Failed to reboot"})", "application/json");
-        }
-    });
-
-    // GET /status
-    svr.Get(R"(/status)", [](const httplib::Request& req, httplib::Response& res) {
-        auto status = get_status();
-        res.set_content(status_to_json(status), "application/json");
-    });
-
-    // GET /display
-    svr.Get(R"(/display)", [](const httplib::Request& req, httplib::Response& res) {
-        auto display = get_display();
-        res.set_content(display_to_json(display), "application/json");
-    });
-
-    // PUT /display
-    svr.Put(R"(/display)", [](const httplib::Request& req, httplib::Response& res) {
-        auto m = parse_json_body(req.body);
-        DisplayConfig conf = get_display();
-        if (m.count("layout")) conf.layout = m["layout"];
-        if (m.count("scenes")) conf.scenes = std::stoi(m["scenes"]);
-        // Windows as comma-separated string for demo
-        if (m.count("windows")) {
-            conf.windows.clear();
-            std::stringstream ss(m["windows"]);
-            std::string item;
-            while(std::getline(ss, item, ',')) conf.windows.push_back(item);
-        }
-        if (update_display(conf)) {
-            res.set_content(display_to_json(conf), "application/json");
-        } else {
-            res.status = 400;
-            res.set_content(R"({"error":"Failed to update display"})", "application/json");
-        }
-    });
-
-    std::cout << "HTTP server listening on " << host << ":" << port << std::endl;
-    svr.listen(host.c_str(), port);
+    }
+    out << "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"result\":\"success\"}";
 }
 
-// ==================== Main Entrypoint =======================================
+void handle_put_channel_id(const std::string& path, const std::map<std::string,std::string>& params, const std::string& body, std::ostream& out) {
+    // Update a specific decoder channel configuration
+    if (!params.count("id")) {
+        out << "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Missing channel id\"}";
+        return;
+    }
+    int id = std::stoi(params.at("id"));
+    bool found = false;
+    bool enabled = false;
+    size_t en_pos = body.find("\"enabled\":");
+    if (en_pos != std::string::npos) {
+        enabled = (body.find("true", en_pos) < body.find("}", en_pos));
+    }
+    std::lock_guard<std::mutex> lock(state_mutex);
+    for (auto& ch : channels) {
+        if (ch.id == id) {
+            ch.enabled = enabled;
+            found = true;
+        }
+    }
+    if (!found) {
+        out << "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Channel not found\"}";
+    } else {
+        out << "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"result\":\"success\"}";
+    }
+}
 
-int main(int argc, char* argv[]) {
-    std::string host = get_env("HTTP_HOST", "0.0.0.0");
-    int port = std::stoi(get_env("HTTP_PORT", "8080"));
+void handle_post_control(const std::string& path, const std::map<std::string,std::string>& params, const std::string& body, std::ostream& out) {
+    // Issue control commands
+    // Expect JSON: {"command":"reset","params":{...}}
+    if (body.find("\"command\"") == std::string::npos) {
+        out << "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Missing command\"}";
+        return;
+    }
+    std::string command;
+    size_t cmd_pos = body.find("\"command\"");
+    size_t val_start = body.find("\"", cmd_pos+9);
+    size_t val_end = body.find("\"", val_start+1);
+    if (val_start != std::string::npos && val_end != std::string::npos)
+        command = body.substr(val_start+1, val_end-val_start-1);
 
-    // Device connection info (used in real SDK logic)
-    std::string dev_ip = get_env("DEVICE_IP", "192.168.1.64");
-    std::string dev_user = get_env("DEVICE_USER", "admin");
-    std::string dev_pass = get_env("DEVICE_PASS", "12345");
+    std::lock_guard<std::mutex> lock(state_mutex);
+    std::string result = "unknown";
+    if (command == "reset") {
+        device_status.decoder_state = "Resetting";
+        result = "resetting";
+    } else if (command == "reboot") {
+        device_status.decoder_state = "Rebooting";
+        result = "rebooting";
+    } else if (command == "start_decode") {
+        device_status.decoder_state = "Decoding";
+        result = "started";
+    } else if (command == "stop_decode") {
+        device_status.decoder_state = "Idle";
+        result = "stopped";
+    } else {
+        result = "unknown command";
+    }
+    out << "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"result\":\"" << result << "\"}";
+}
 
-    run_http_server(host, port);
+void handle_post_commands_decode(const std::string& path, const std::map<std::string,std::string>& params, const std::string& body, std::ostream& out) {
+    // Control dynamic decode operations
+    // {"action":"start"|"stop"}
+    bool start = body.find("\"action\":\"start\"") != std::string::npos;
+    std::lock_guard<std::mutex> lock(state_mutex);
+    if (start) device_status.decoder_state = "Decoding";
+    else device_status.decoder_state = "Idle";
+    out << "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"result\":\"" << (start ? "started":"stopped") << "\"}";
+}
+
+void handle_post_commands_reboot(const std::string& path, const std::map<std::string,std::string>& params, const std::string& body, std::ostream& out) {
+    // Reboot the device
+    std::lock_guard<std::mutex> lock(state_mutex);
+    device_status.decoder_state = "Rebooting";
+    out << "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"result\":\"rebooting\"}";
+}
+
+void handle_put_display(const std::string& path, const std::map<std::string,std::string>& params, const std::string& body, std::ostream& out) {
+    // Modify the display output configuration
+    // {"layout":"3x3", "scenes":["Main","Sub"]}
+    std::lock_guard<std::mutex> lock(state_mutex);
+    size_t l_pos = body.find("\"layout\"");
+    if (l_pos != std::string::npos) {
+        size_t v1 = body.find("\"", l_pos+8);
+        size_t v2 = body.find("\"", v1+1);
+        if (v1 != std::string::npos && v2 != std::string::npos)
+            display_config.layout = body.substr(v1+1, v2-v1-1);
+    }
+    size_t s_pos = body.find("\"scenes\"");
+    if (s_pos != std::string::npos) {
+        display_config.scenes.clear();
+        size_t arr_start = body.find("[", s_pos);
+        size_t arr_end = body.find("]", arr_start);
+        if (arr_start != std::string::npos && arr_end != std::string::npos) {
+            std::string arr = body.substr(arr_start+1, arr_end-arr_start-1);
+            std::istringstream iss(arr);
+            std::string scene;
+            while (std::getline(iss, scene, ',')) {
+                scene.erase(std::remove(scene.begin(), scene.end(), '\"'), scene.end());
+                scene.erase(std::remove_if(scene.begin(), scene.end(), ::isspace), scene.end());
+                if (!scene.empty()) display_config.scenes.push_back(scene);
+            }
+        }
+    }
+    out << "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n" << display_to_json(display_config);
+}
+
+void handle_get_display(const std::string& path, const std::map<std::string,std::string>& params, const std::string& body, std::ostream& out) {
+    std::lock_guard<std::mutex> lock(state_mutex);
+    out << "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n" << display_to_json(display_config);
+}
+
+void handle_get_status(const std::string& path, const std::map<std::string,std::string>& params, const std::string& body, std::ostream& out) {
+    std::lock_guard<std::mutex> lock(state_mutex);
+    out << "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n" << status_to_json(device_status);
+}
+
+// --- MAIN ---
+int main() {
+    std::string host = getenv_default("SERVER_HOST", "0.0.0.0");
+    int port = std::stoi(getenv_default("SERVER_PORT", "8080"));
+
+    HttpServer server(host, port);
+
+    // API Routing
+    server.route("GET",  "/channels",         handle_get_channels);
+    server.route("PUT",  "/channels",         handle_put_channels);
+    server.route("PUT",  "/channels/{id}",    handle_put_channel_id);
+    server.route("POST", "/control",          handle_post_control);
+    server.route("POST", "/commands/decode",  handle_post_commands_decode);
+    server.route("POST", "/commands/reboot",  handle_post_commands_reboot);
+    server.route("PUT",  "/display",          handle_put_display);
+    server.route("GET",  "/display",          handle_get_display);
+    server.route("GET",  "/status",           handle_get_status);
+
+    std::cout << "Hikvision Decoder HTTP Driver running on " << host << ":" << port << std::endl;
+    server.start();
+
+    // Wait forever
+    std::mutex mtx;
+    std::unique_lock<std::mutex> lck(mtx);
+    std::condition_variable cv;
+    cv.wait(lck);
+
     return 0;
 }
-```
-**Dependencies:**  
-- [cpp-httplib](https://github.com/yhirose/cpp-httplib) (for HTTP server)  
-- [tinyxml2](https://github.com/leethomason/tinyxml2) (stubs included, not used in current code but referenced for XML handling if needed)  
-
-**Environment variables required:**  
-- `HTTP_HOST` (default: `0.0.0.0`)  
-- `HTTP_PORT` (default: `8080`)  
-- `DEVICE_IP`, `DEVICE_USER`, `DEVICE_PASS` for device connection
-
-**Build notes:**  
-- Link with pthread and OpenSSL if using HTTPS (`-lssl -lcrypto -lpthread`).
-- Add `cpp-httplib.h` and `tinyxml2.h/.cpp` to your project.
