@@ -1,474 +1,431 @@
-```c
-// hikvision_decoder_http_driver.c
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdbool.h>
 #include <microhttpd.h>
-#include <pthread.h>
+#include <stdbool.h>
 #include <time.h>
-#include <unistd.h>
+#include <ctype.h>
+#include <stdarg.h>
 #include <errno.h>
-#include <jansson.h>
 
-// ----------------- Device SDK Mockup/Placeholder Functions ----------------- //
-// In real implementation, link against Hikvision SDK and use actual API calls.
+/* ==== Configuration from Environment Variables ==== */
+#define ENV_SERVER_PORT "DRV_HTTP_PORT"
+#define ENV_SERVER_HOST "DRV_HTTP_HOST"
+#define ENV_DEVICE_IP   "DRV_DEVICE_IP"
+#define ENV_DEVICE_PORT "DRV_DEVICE_PORT"
+#define ENV_DEVICE_USER "DRV_DEVICE_USER"
+#define ENV_DEVICE_PASS "DRV_DEVICE_PASS"
 
+#define DEFAULT_SERVER_PORT 8080
+#define MAX_POST_DATA_SIZE 8192
+#define MAX_SESSION_TOKEN   128
+#define SESSION_TIMEOUT_SEC 3600
+
+/* ==== Device Session and State ==== */
 typedef struct {
+    char token[MAX_SESSION_TOKEN];
+    time_t last_active;
     bool logged_in;
-    char session_token[64];
-} DeviceSession;
+} session_t;
 
-static DeviceSession device_session = { false, "" };
+static session_t g_session = {0};
 
-static pthread_mutex_t device_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* ==== Device Connection Info ==== */
+typedef struct {
+    char ip[64];
+    int  port;
+    char username[64];
+    char password[64];
+} device_info_t;
 
-static int device_login(const char* username, const char* password, char* session_token, size_t token_len) {
-    pthread_mutex_lock(&device_mutex);
-    if (device_session.logged_in) {
-        pthread_mutex_unlock(&device_mutex);
-        return -2; // Already logged in
-    }
-    // Mock: accept "admin"/"12345"
-    if (strcmp(username, "admin") == 0 && strcmp(password, "12345") == 0) {
-        snprintf(session_token, token_len, "SESSION%ld", time(NULL));
-        strcpy(device_session.session_token, session_token);
-        device_session.logged_in = true;
-        pthread_mutex_unlock(&device_mutex);
-        return 0; // Success
-    }
-    pthread_mutex_unlock(&device_mutex);
-    return -1; // Fail
+static device_info_t g_device = {0};
+
+/* ==== Utility Functions ==== */
+static int json_response(struct MHD_Connection *conn, int status, const char *fmt, ...) {
+    char buf[4096];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+
+    struct MHD_Response *response = MHD_create_response_from_buffer(strlen(buf), (void*)buf, MHD_RESPMEM_MUST_COPY);
+    MHD_add_response_header(response, "Content-Type", "application/json");
+    int ret = MHD_queue_response(conn, status, response);
+    MHD_destroy_response(response);
+    return ret;
 }
 
-static int device_logout(const char* session_token) {
-    pthread_mutex_lock(&device_mutex);
-    if (device_session.logged_in && strcmp(session_token, device_session.session_token) == 0) {
-        device_session.logged_in = false;
-        device_session.session_token[0] = 0;
-        pthread_mutex_unlock(&device_mutex);
-        return 0;
-    }
-    pthread_mutex_unlock(&device_mutex);
-    return -1;
+static int plain_response(struct MHD_Connection *conn, int status, const char *msg) {
+    struct MHD_Response *response = MHD_create_response_from_buffer(strlen(msg), (void*)msg, MHD_RESPMEM_MUST_COPY);
+    int ret = MHD_queue_response(conn, status, response);
+    MHD_destroy_response(response);
+    return ret;
 }
 
-static bool device_is_logged_in(const char* token) {
-    pthread_mutex_lock(&device_mutex);
-    bool r = (device_session.logged_in && strcmp(token, device_session.session_token) == 0);
-    pthread_mutex_unlock(&device_mutex);
-    return r;
+static void trim(char *s) {
+    char *p = s;
+    while (*p && isspace(*p)) p++;
+    if (p != s) memmove(s, p, strlen(p)+1);
+    size_t l = strlen(s);
+    while (l && isspace(s[l-1])) s[--l] = '\0';
 }
 
-static json_t* device_get_status(void) {
-    json_t* status = json_object();
-    json_object_set_new(status, "device", json_string("Decoder Device"));
-    json_object_set_new(status, "state", json_string("running"));
-    json_object_set_new(status, "channels_active", json_integer(8));
-    json_object_set_new(status, "alarm", json_string("none"));
-    json_object_set_new(status, "error_code", json_integer(0));
-    return status;
+/* ==== Session Token ==== */
+static void generate_token(char *out, size_t maxlen) {
+    const char *chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    size_t clen = strlen(chars);
+    srand(time(NULL) ^ (intptr_t)&out);
+    for (size_t i = 0; i < maxlen-1; ++i)
+        out[i] = chars[rand()%clen];
+    out[maxlen-1] = 0;
 }
 
-static json_t* device_get_config(const char* filter) {
-    json_t* config = json_object();
-    if (!filter || strstr(filter, "display")) {
-        json_object_set_new(config, "display_channels", json_integer(4));
-    }
-    if (!filter || strstr(filter, "decode")) {
-        json_object_set_new(config, "decode_channels", json_integer(8));
-    }
-    if (!filter || strstr(filter, "scene")) {
-        json_object_set_new(config, "scene_mode", json_string("default"));
-    }
-    return config;
-}
+/* ==== Device "Native" Mockup API (Would map to Hikvision SDK in real) ==== */
 
-static int device_update_config(json_t* payload) {
-    // Accept any JSON payload as OK (mock)
+#define MOCK_CONFIG "{\"display_channels\": 4, \"decode_channels\": 4, \"scene\": \"MainWall\", \"param\": {\"brightness\": 80}}"
+#define MOCK_STATUS "{\"state\": \"online\", \"channels\": 4, \"alarms\": 0, \"error_codes\": [], \"system_info\": {\"model\": \"DS-6300D-JX\", \"version\": \"V8.1.2_build2024\"}}"
+#define MOCK_STATE "{\"operational\": \"OK\", \"error_codes\": [], \"channel_conditions\": [\"active\", \"idle\", \"idle\", \"active\"]}"
+
+static int device_login(const char *user, const char *pass) {
+    // In real: connect to device and authenticate via SDK
+    if (strcmp(user, g_device.username) == 0 && strcmp(pass, g_device.password) == 0) {
+        g_session.logged_in = true;
+        g_session.last_active = time(NULL);
+        return 1;
+    }
     return 0;
 }
 
-static int device_alarm_control(const char* action, json_t* params) {
-    // Accept "start"/"stop"
-    if (strcmp(action, "start") == 0 || strcmp(action, "stop") == 0)
-        return 0;
-    return -1;
+static void device_logout(void) {
+    g_session.logged_in = false;
 }
 
-static int device_decode_control(const char* action, json_t* params) {
-    // Accept "start"/"stop"
-    if (strcmp(action, "start") == 0 || strcmp(action, "stop") == 0)
+static int device_is_logged_in(void) {
+    if (!g_session.logged_in) return 0;
+    if (time(NULL) - g_session.last_active > SESSION_TIMEOUT_SEC) {
+        g_session.logged_in = false;
         return 0;
-    return -1;
+    }
+    return 1;
 }
 
-static int device_reboot(void) {
-    return 0; // success
+static const char* device_get_config(void) {
+    // In real: retrieve config structure from device and convert to JSON
+    return MOCK_CONFIG;
+}
+
+static int device_set_config(const char *json) {
+    // In real: send new config to device, parse JSON, map to C struct, and call SDK
+    (void)json;
+    return 0;
+}
+
+static const char* device_get_status(void) {
+    // In real: retrieve status from device, convert to JSON
+    return MOCK_STATUS;
+}
+
+static const char* device_get_state(void) {
+    return MOCK_STATE;
+}
+
+static int device_alarm(const char *action) {
+    // In real: start or stop alarm monitoring via SDK
+    (void)action;
+    return 0;
+}
+
+static int device_decode(const char *action) {
+    // In real: start or stop decoding via SDK
+    (void)action;
+    return 0;
 }
 
 static int device_shutdown(void) {
-    return 0; // success
+    // In real: send shutdown command via SDK
+    return 0;
 }
 
-static json_t* device_get_state(void) {
-    json_t* state = json_object();
-    json_object_set_new(state, "operational_status", json_string("OK"));
-    json_object_set_new(state, "error_codes", json_integer(0));
-    json_object_set_new(state, "channel_conditions", json_string("normal"));
-    return state;
+static int device_reboot(void) {
+    // In real: send reboot command via SDK
+    return 0;
 }
 
-// ---------------------- HTTP Server Configuration -------------------------- //
-
-#define POSTBUFFERSIZE 8192
-#define MAX_JSON_SIZE 65536
-
+/* ==== HTTP POST Data Handling ==== */
 typedef struct {
-    char* data;
+    char *data;
     size_t size;
+    size_t capacity;
 } post_data_t;
 
-typedef struct {
-    char session_token[64];
-} connection_info_t;
-
-typedef struct {
-    char* post_data;
-    size_t post_data_size;
-} request_context_t;
-
-static const char* get_env(const char* name, const char* defval) {
-    const char* v = getenv(name);
-    return v ? v : defval;
+static int post_data_append(post_data_t *pd, const char *data, size_t size) {
+    if (pd->size + size > pd->capacity) return 0;
+    memcpy(pd->data + pd->size, data, size);
+    pd->size += size;
+    pd->data[pd->size] = 0;
+    return 1;
 }
 
-static const char* SERVER_HOST;
-static int SERVER_PORT;
-static const char* DEVICE_IP;
-static int DEVICE_PORT;
-static const char* DEVICE_USER;
-static const char* DEVICE_PASS;
+/* ==== API Routing ==== */
+typedef enum {
+    API_LOGIN,
+    API_LOGOUT,
+    API_CONFIG_GET,
+    API_CONFIG_PUT,
+    API_STATUS,
+    API_STATE,
+    API_CMD_ALARM,
+    API_CMD_DECODE,
+    API_CMD_REBOOT,
+    API_CMD_SHUTDOWN,
+    API_REBOOT,
+    API_SHUTDOWN,
+    API_UNKNOWN
+} api_endpoint_t;
 
-// ---------------------- Helper Functions ----------------------------------- //
-
-static int send_json_response(struct MHD_Connection* connection, int status, json_t* json) {
-    char* response_str = json_dumps(json, JSON_COMPACT);
-    struct MHD_Response* response = MHD_create_response_from_buffer(strlen(response_str), (void*)response_str, MHD_RESPMEM_MUST_FREE);
-    MHD_add_response_header(response, "Content-Type", "application/json");
-    int ret = MHD_queue_response(connection, status, response);
-    MHD_destroy_response(response);
-    return ret;
+static api_endpoint_t match_api(const char *url, const char *method) {
+    if (strcmp(url, "/login")==0 && strcmp(method, "POST")==0) return API_LOGIN;
+    if (strcmp(url, "/logout")==0 && strcmp(method, "POST")==0) return API_LOGOUT;
+    if (strcmp(url, "/config")==0 && strcmp(method, "GET")==0) return API_CONFIG_GET;
+    if (strcmp(url, "/config")==0 && strcmp(method, "PUT")==0) return API_CONFIG_PUT;
+    if (strcmp(url, "/status")==0 && strcmp(method, "GET")==0) return API_STATUS;
+    if (strcmp(url, "/state")==0 && strcmp(method, "GET")==0) return API_STATE;
+    if (strcmp(url, "/cmd/alarm")==0 && strcmp(method, "POST")==0) return API_CMD_ALARM;
+    if (strcmp(url, "/cmd/decode")==0 && strcmp(method, "POST")==0) return API_CMD_DECODE;
+    if (strcmp(url, "/cmd/reboot")==0 && strcmp(method, "POST")==0) return API_CMD_REBOOT;
+    if (strcmp(url, "/reboot")==0 && strcmp(method, "POST")==0) return API_REBOOT;
+    if (strcmp(url, "/shutdown")==0 && strcmp(method, "POST")==0) return API_SHUTDOWN;
+    return API_UNKNOWN;
 }
 
-static int send_simple_response(struct MHD_Connection* connection, int status, const char* msg) {
-    struct MHD_Response* response = MHD_create_response_from_buffer(strlen(msg), (void*)msg, MHD_RESPMEM_PERSISTENT);
-    MHD_add_response_header(response, "Content-Type", "text/plain");
-    int ret = MHD_queue_response(connection, status, response);
-    MHD_destroy_response(response);
-    return ret;
+/* ==== API Endpoint Handlers ==== */
+
+static int handle_login(struct MHD_Connection *conn, const char *payload) {
+    char user[64] = {0}, pass[64] = {0};
+    const char *pu = strstr(payload, "\"username\"");
+    const char *pp = strstr(payload, "\"password\"");
+    if (!pu || !pp) return json_response(conn, 400, "{\"error\":\"Missing credentials\"}");
+    sscanf(pu, "\"username\"%*s:%*s\"%63[^\"]", user);
+    sscanf(pp, "\"password\"%*s:%*s\"%63[^\"]", pass);
+    trim(user); trim(pass);
+    if (device_login(user, pass)) {
+        generate_token(g_session.token, sizeof(g_session.token));
+        g_session.last_active = time(NULL);
+        return json_response(conn, 200, "{\"token\":\"%s\"}", g_session.token);
+    }
+    return json_response(conn, 401, "{\"error\":\"Invalid credentials\"}");
 }
 
-static const char* get_session_token(struct MHD_Connection* connection) {
-    const char* token = MHD_lookup_connection_value(connection, MHD_COOKIE_KIND, "session_token");
-    if (!token) {
-        token = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "X-Session-Token");
-    }
-    return token;
+static int handle_logout(struct MHD_Connection *conn) {
+    if (!device_is_logged_in()) return json_response(conn, 401, "{\"error\":\"Not authenticated\"}");
+    device_logout();
+    return json_response(conn, 200, "{\"message\":\"Logged out\"}");
 }
 
-// ---------------------- API Handlers --------------------------------------- //
-
-static int handle_login(struct MHD_Connection* connection, const char* upload_data, size_t* upload_data_size, request_context_t* context) {
-    if (*upload_data_size != 0) {
-        // Accumulate POST data
-        size_t oldsize = context->post_data_size;
-        context->post_data = realloc(context->post_data, oldsize + *upload_data_size + 1);
-        memcpy(context->post_data + oldsize, upload_data, *upload_data_size);
-        context->post_data_size = oldsize + *upload_data_size;
-        context->post_data[context->post_data_size] = '\0';
-        *upload_data_size = 0;
-        return MHD_YES;
-    }
-    // Parse JSON
-    json_error_t err;
-    json_t* root = json_loads(context->post_data, 0, &err);
-    if (!root) {
-        return send_simple_response(connection, MHD_HTTP_BAD_REQUEST, "Invalid JSON");
-    }
-    const char* username = json_string_value(json_object_get(root, "username"));
-    const char* password = json_string_value(json_object_get(root, "password"));
-    char session_token[64] = "";
-    int rv = device_login(username, password, session_token, sizeof(session_token));
-    json_decref(root);
-    if (rv == 0) {
-        json_t* resp = json_object();
-        json_object_set_new(resp, "session_token", json_string(session_token));
-        struct MHD_Response* response = MHD_create_response_from_buffer(strlen(json_dumps(resp, JSON_COMPACT)), (void*)json_dumps(resp, JSON_COMPACT), MHD_RESPMEM_MUST_FREE);
-        MHD_add_response_header(response, "Set-Cookie", session_token);
-        MHD_add_response_header(response, "Content-Type", "application/json");
-        MHD_queue_response(connection, MHD_HTTP_OK, response);
-        MHD_destroy_response(response);
-        json_decref(resp);
-        return MHD_YES;
-    } else if (rv == -2) {
-        return send_simple_response(connection, MHD_HTTP_CONFLICT, "Already logged in");
-    } else {
-        return send_simple_response(connection, MHD_HTTP_UNAUTHORIZED, "Login failed");
-    }
+static int handle_get_config(struct MHD_Connection *conn) {
+    if (!device_is_logged_in()) return json_response(conn, 401, "{\"error\":\"Not authenticated\"}");
+    const char *cfg = device_get_config();
+    return json_response(conn, 200, "%s", cfg);
 }
 
-static int handle_logout(struct MHD_Connection* connection) {
-    const char* token = get_session_token(connection);
-    if (!token || !device_is_logged_in(token)) {
-        return send_simple_response(connection, MHD_HTTP_UNAUTHORIZED, "Not logged in");
-    }
-    if (device_logout(token) == 0) {
-        json_t* resp = json_object();
-        json_object_set_new(resp, "message", json_string("Logged out"));
-        int ret = send_json_response(connection, MHD_HTTP_OK, resp);
-        json_decref(resp);
-        return ret;
-    }
-    return send_simple_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, "Logout failed");
+static int handle_put_config(struct MHD_Connection *conn, const char *payload) {
+    if (!device_is_logged_in()) return json_response(conn, 401, "{\"error\":\"Not authenticated\"}");
+    if (!payload) return json_response(conn, 400, "{\"error\":\"Missing config payload\"}");
+    if (device_set_config(payload) == 0)
+        return json_response(conn, 200, "{\"message\":\"Config updated\"}");
+    else
+        return json_response(conn, 500, "{\"error\":\"Config update failed\"}");
 }
 
-static int handle_get_status(struct MHD_Connection* connection) {
-    const char* token = get_session_token(connection);
-    if (!token || !device_is_logged_in(token)) {
-        return send_simple_response(connection, MHD_HTTP_UNAUTHORIZED, "Not logged in");
-    }
-    json_t* status = device_get_status();
-    int ret = send_json_response(connection, MHD_HTTP_OK, status);
-    json_decref(status);
-    return ret;
+static int handle_status(struct MHD_Connection *conn) {
+    if (!device_is_logged_in()) return json_response(conn, 401, "{\"error\":\"Not authenticated\"}");
+    const char *st = device_get_status();
+    return json_response(conn, 200, "%s", st);
 }
 
-static int handle_get_state(struct MHD_Connection* connection) {
-    const char* token = get_session_token(connection);
-    if (!token || !device_is_logged_in(token)) {
-        return send_simple_response(connection, MHD_HTTP_UNAUTHORIZED, "Not logged in");
-    }
-    json_t* state = device_get_state();
-    int ret = send_json_response(connection, MHD_HTTP_OK, state);
-    json_decref(state);
-    return ret;
+static int handle_state(struct MHD_Connection *conn) {
+    if (!device_is_logged_in()) return json_response(conn, 401, "{\"error\":\"Not authenticated\"}");
+    const char *state = device_get_state();
+    return json_response(conn, 200, "%s", state);
 }
 
-static int handle_get_config(struct MHD_Connection* connection, const char* filter) {
-    const char* token = get_session_token(connection);
-    if (!token || !device_is_logged_in(token)) {
-        return send_simple_response(connection, MHD_HTTP_UNAUTHORIZED, "Not logged in");
-    }
-    json_t* config = device_get_config(filter);
-    int ret = send_json_response(connection, MHD_HTTP_OK, config);
-    json_decref(config);
-    return ret;
+static int handle_cmd_alarm(struct MHD_Connection *conn, const char *payload) {
+    if (!device_is_logged_in()) return json_response(conn, 401, "{\"error\":\"Not authenticated\"}");
+    const char *pa = strstr(payload, "\"action\"");
+    if (!pa) return json_response(conn, 400, "{\"error\":\"Missing action\"}");
+    char action[16] = {0};
+    sscanf(pa, "\"action\"%*s:%*s\"%15[^\"]", action);
+    trim(action);
+    if (device_alarm(action) == 0)
+        return json_response(conn, 200, "{\"message\":\"Alarm %s\"}", action);
+    else
+        return json_response(conn, 500, "{\"error\":\"Alarm command failed\"}");
 }
 
-static int handle_update_config(struct MHD_Connection* connection, const char* upload_data, size_t* upload_data_size, request_context_t* context) {
-    if (*upload_data_size != 0) {
-        // Accumulate POST data
-        size_t oldsize = context->post_data_size;
-        context->post_data = realloc(context->post_data, oldsize + *upload_data_size + 1);
-        memcpy(context->post_data + oldsize, upload_data, *upload_data_size);
-        context->post_data_size = oldsize + *upload_data_size;
-        context->post_data[context->post_data_size] = '\0';
-        *upload_data_size = 0;
-        return MHD_YES;
-    }
-    const char* token = get_session_token(connection);
-    if (!token || !device_is_logged_in(token)) {
-        return send_simple_response(connection, MHD_HTTP_UNAUTHORIZED, "Not logged in");
-    }
-    json_error_t err;
-    json_t* root = json_loads(context->post_data, 0, &err);
-    if (!root) {
-        return send_simple_response(connection, MHD_HTTP_BAD_REQUEST, "Invalid JSON");
-    }
-    int rv = device_update_config(root);
-    json_decref(root);
-    if (rv == 0) {
-        return send_simple_response(connection, MHD_HTTP_OK, "Config updated");
-    }
-    return send_simple_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, "Config update failed");
+static int handle_cmd_decode(struct MHD_Connection *conn, const char *payload) {
+    if (!device_is_logged_in()) return json_response(conn, 401, "{\"error\":\"Not authenticated\"}");
+    const char *pa = strstr(payload, "\"action\"");
+    if (!pa) return json_response(conn, 400, "{\"error\":\"Missing action\"}");
+    char action[16] = {0};
+    sscanf(pa, "\"action\"%*s:%*s\"%15[^\"]", action);
+    trim(action);
+    if (device_decode(action) == 0)
+        return json_response(conn, 200, "{\"message\":\"Decode %s\"}", action);
+    else
+        return json_response(conn, 500, "{\"error\":\"Decode command failed\"}");
 }
 
-static int handle_alarm(struct MHD_Connection* connection, const char* upload_data, size_t* upload_data_size, request_context_t* context) {
-    if (*upload_data_size != 0) {
-        size_t oldsize = context->post_data_size;
-        context->post_data = realloc(context->post_data, oldsize + *upload_data_size + 1);
-        memcpy(context->post_data + oldsize, upload_data, *upload_data_size);
-        context->post_data_size = oldsize + *upload_data_size;
-        context->post_data[context->post_data_size] = '\0';
-        *upload_data_size = 0;
-        return MHD_YES;
-    }
-    const char* token = get_session_token(connection);
-    if (!token || !device_is_logged_in(token)) {
-        return send_simple_response(connection, MHD_HTTP_UNAUTHORIZED, "Not logged in");
-    }
-    json_error_t err;
-    json_t* root = json_loads(context->post_data, 0, &err);
-    if (!root) {
-        return send_simple_response(connection, MHD_HTTP_BAD_REQUEST, "Invalid JSON");
-    }
-    const char* action = json_string_value(json_object_get(root, "action"));
-    int rv = device_alarm_control(action, root);
-    json_decref(root);
-    if (rv == 0) {
-        return send_simple_response(connection, MHD_HTTP_OK, "Alarm action performed");
-    }
-    return send_simple_response(connection, MHD_HTTP_BAD_REQUEST, "Invalid alarm action");
+static int handle_cmd_reboot(struct MHD_Connection *conn) {
+    if (!device_is_logged_in()) return json_response(conn, 401, "{\"error\":\"Not authenticated\"}");
+    if (device_reboot() == 0)
+        return json_response(conn, 200, "{\"message\":\"Rebooting\"}");
+    else
+        return json_response(conn, 500, "{\"error\":\"Reboot failed\"}");
 }
 
-static int handle_decode(struct MHD_Connection* connection, const char* upload_data, size_t* upload_data_size, request_context_t* context) {
-    if (*upload_data_size != 0) {
-        size_t oldsize = context->post_data_size;
-        context->post_data = realloc(context->post_data, oldsize + *upload_data_size + 1);
-        memcpy(context->post_data + oldsize, upload_data, *upload_data_size);
-        context->post_data_size = oldsize + *upload_data_size;
-        context->post_data[context->post_data_size] = '\0';
-        *upload_data_size = 0;
-        return MHD_YES;
-    }
-    const char* token = get_session_token(connection);
-    if (!token || !device_is_logged_in(token)) {
-        return send_simple_response(connection, MHD_HTTP_UNAUTHORIZED, "Not logged in");
-    }
-    json_error_t err;
-    json_t* root = json_loads(context->post_data, 0, &err);
-    if (!root) {
-        return send_simple_response(connection, MHD_HTTP_BAD_REQUEST, "Invalid JSON");
-    }
-    const char* action = json_string_value(json_object_get(root, "action"));
-    int rv = device_decode_control(action, root);
-    json_decref(root);
-    if (rv == 0) {
-        return send_simple_response(connection, MHD_HTTP_OK, "Decode action performed");
-    }
-    return send_simple_response(connection, MHD_HTTP_BAD_REQUEST, "Invalid decode action");
+static int handle_reboot(struct MHD_Connection *conn) {
+    return handle_cmd_reboot(conn);
 }
 
-static int handle_reboot(struct MHD_Connection* connection) {
-    const char* token = get_session_token(connection);
-    if (!token || !device_is_logged_in(token)) {
-        return send_simple_response(connection, MHD_HTTP_UNAUTHORIZED, "Not logged in");
-    }
-    if (device_reboot() == 0) {
-        return send_simple_response(connection, MHD_HTTP_OK, "Reboot initiated");
-    }
-    return send_simple_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, "Reboot failed");
+static int handle_shutdown(struct MHD_Connection *conn) {
+    if (!device_is_logged_in()) return json_response(conn, 401, "{\"error\":\"Not authenticated\"}");
+    if (device_shutdown() == 0)
+        return json_response(conn, 200, "{\"message\":\"Shutdown initiated\"}");
+    else
+        return json_response(conn, 500, "{\"error\":\"Shutdown failed\"}");
 }
 
-static int handle_shutdown(struct MHD_Connection* connection) {
-    const char* token = get_session_token(connection);
-    if (!token || !device_is_logged_in(token)) {
-        return send_simple_response(connection, MHD_HTTP_UNAUTHORIZED, "Not logged in");
-    }
-    if (device_shutdown() == 0) {
-        return send_simple_response(connection, MHD_HTTP_OK, "Shutdown initiated");
-    }
-    return send_simple_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, "Shutdown failed");
-}
-
-// ---------------------- HTTP Routing --------------------------------------- //
-
-struct handler_map_entry {
-    const char* method;
-    const char* path;
-    int (*handler)(struct MHD_Connection*, const char*, size_t*, request_context_t*);
-    int (*simple_handler)(struct MHD_Connection*);
+/* ==== HTTP Request Handler ==== */
+struct connection_info_struct {
+    post_data_t post_data;
+    api_endpoint_t endpoint;
 };
 
-static struct handler_map_entry handler_map[] = {
-    {"POST", "/login", handle_login, NULL},
-    {"POST", "/logout", NULL, handle_logout},
-    {"GET",  "/status", NULL, handle_get_status},
-    {"GET",  "/state", NULL, handle_get_state},
-    {"GET",  "/config", NULL, NULL}, // filter handled in dispatcher
-    {"PUT",  "/config", handle_update_config, NULL},
-    {"POST", "/cmd/alarm", handle_alarm, NULL},
-    {"POST", "/cmd/decode", handle_decode, NULL},
-    {"POST", "/cmd/reboot", NULL, handle_reboot},
-    {"POST", "/reboot", NULL, handle_reboot},
-    {"POST", "/shutdown", NULL, handle_shutdown},
-    {NULL, NULL, NULL, NULL}
-};
+static int iterate_post(void *coninfo_cls, enum MHD_ValueKind kind, const char *key, const char *filename, const char *content_type, const char *transfer_encoding, const char *data, uint64_t off, size_t size) {
+    struct connection_info_struct *coninfo = (struct connection_info_struct*)coninfo_cls;
+    if (off + size > MAX_POST_DATA_SIZE) return MHD_NO;
+    if (!post_data_append(&coninfo->post_data, data, size)) return MHD_NO;
+    return MHD_YES;
+}
 
-static int dispatcher(void* cls, struct MHD_Connection* connection,
-                      const char* url, const char* method,
-                      const char* version, const char* upload_data,
-                      size_t* upload_data_size, void** con_cls) {
-    request_context_t* ctx = *con_cls;
-    if (!ctx) {
-        ctx = calloc(1, sizeof(request_context_t));
-        *con_cls = ctx;
+static int answer_to_connection(void *cls, struct MHD_Connection *connection, const char *url, const char *method, const char *version, const char *upload_data, size_t *upload_data_size, void **con_cls) {
+    static int dummy;
+    if (*con_cls == NULL) {
+        struct connection_info_struct *coninfo = calloc(1, sizeof(*coninfo));
+        coninfo->post_data.data = calloc(1, MAX_POST_DATA_SIZE+1);
+        coninfo->post_data.capacity = MAX_POST_DATA_SIZE;
+        coninfo->endpoint = match_api(url, method);
+        *con_cls = coninfo;
         return MHD_YES;
     }
-    // Find handler
-    for (int i = 0; handler_map[i].method != NULL; ++i) {
-        if (strcmp(handler_map[i].method, method) == 0 &&
-            strcmp(handler_map[i].path, url) == 0) {
-            if (handler_map[i].handler)
-                return handler_map[i].handler(connection, upload_data, upload_data_size, ctx);
-            if (handler_map[i].simple_handler)
-                return handler_map[i].simple_handler(connection);
-        }
+    struct connection_info_struct *coninfo = *con_cls;
+
+    /* POST/PUT: accumulate data */
+    if ((strcmp(method, "POST")==0 || strcmp(method, "PUT")==0) && *upload_data_size) {
+        post_data_append(&coninfo->post_data, upload_data, *upload_data_size);
+        *upload_data_size = 0;
+        return MHD_YES;
     }
-    // /config GET special: allow filter by query string
-    if (strcmp(method, "GET") == 0 && strcmp(url, "/config") == 0) {
-        const char* filter = MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "filter");
-        int r = handle_get_config(connection, filter);
-        free(ctx->post_data);
-        free(ctx);
-        *con_cls = NULL;
-        return r;
+
+    /* Check Auth for all except /login */
+    if (coninfo->endpoint != API_LOGIN) {
+        const char *token = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "X-Session-Token");
+        if (!token || strcmp(token, g_session.token)!=0 || !device_is_logged_in())
+            return json_response(connection, 401, "{\"error\":\"Not authenticated\"}");
+        g_session.last_active = time(NULL);
     }
-    // Method not allowed
-    if (*upload_data_size != 0) { *upload_data_size = 0; }
-    free(ctx->post_data);
-    free(ctx);
+
+    int ret = MHD_NO;
+    switch (coninfo->endpoint) {
+        case API_LOGIN:
+            ret = handle_login(connection, coninfo->post_data.data);
+            break;
+        case API_LOGOUT:
+            ret = handle_logout(connection);
+            break;
+        case API_CONFIG_GET:
+            ret = handle_get_config(connection);
+            break;
+        case API_CONFIG_PUT:
+            ret = handle_put_config(connection, coninfo->post_data.data);
+            break;
+        case API_STATUS:
+            ret = handle_status(connection);
+            break;
+        case API_STATE:
+            ret = handle_state(connection);
+            break;
+        case API_CMD_ALARM:
+            ret = handle_cmd_alarm(connection, coninfo->post_data.data);
+            break;
+        case API_CMD_DECODE:
+            ret = handle_cmd_decode(connection, coninfo->post_data.data);
+            break;
+        case API_CMD_REBOOT:
+            ret = handle_cmd_reboot(connection);
+            break;
+        case API_REBOOT:
+            ret = handle_reboot(connection);
+            break;
+        case API_SHUTDOWN:
+            ret = handle_shutdown(connection);
+            break;
+        default:
+            ret = json_response(connection, 404, "{\"error\":\"Endpoint not found\"}");
+            break;
+    }
+    return ret;
+}
+
+static void request_completed_callback(void *cls, struct MHD_Connection *connection, void **con_cls, enum MHD_RequestTerminationCode toe) {
+    struct connection_info_struct *coninfo = *con_cls;
+    if (coninfo) {
+        if (coninfo->post_data.data)
+            free(coninfo->post_data.data);
+        free(coninfo);
+    }
     *con_cls = NULL;
-    return send_simple_response(connection, MHD_HTTP_NOT_FOUND, "Not found");
 }
 
-static void request_completed_callback(void* cls, struct MHD_Connection* connection,
-                                      void** con_cls, enum MHD_RequestTerminationCode toe) {
-    request_context_t* ctx = *con_cls;
-    if (ctx) {
-        free(ctx->post_data);
-        free(ctx);
-        *con_cls = NULL;
-    }
+/* ==== Environment Variable Helpers ==== */
+static void get_envstr(const char *env, char *out, size_t maxlen, const char *def) {
+    const char *v = getenv(env);
+    if (v && *v) strncpy(out, v, maxlen-1);
+    else if (def) strncpy(out, def, maxlen-1);
+    else out[0] = 0;
 }
 
-// ---------------------- MAIN ----------------------------------------------- //
+static int get_envint(const char *env, int def) {
+    const char *v = getenv(env);
+    if (v && *v) return atoi(v);
+    return def;
+}
 
-int main(int argc, char* argv[]) {
-    SERVER_HOST = get_env("SERVER_HOST", "0.0.0.0");
-    SERVER_PORT = atoi(get_env("SERVER_PORT", "8080"));
-    DEVICE_IP   = get_env("DEVICE_IP", "192.168.1.100");
-    DEVICE_PORT = atoi(get_env("DEVICE_PORT", "8000"));
-    DEVICE_USER = get_env("DEVICE_USER", "admin");
-    DEVICE_PASS = get_env("DEVICE_PASS", "12345");
+/* ==== Main ==== */
+int main(int argc, char *argv[]) {
+    struct MHD_Daemon *daemon;
+    int port = get_envint(ENV_SERVER_PORT, DEFAULT_SERVER_PORT);
+    get_envstr(ENV_DEVICE_IP, g_device.ip, sizeof(g_device.ip), "192.168.1.100");
+    g_device.port = get_envint(ENV_DEVICE_PORT, 8000);
+    get_envstr(ENV_DEVICE_USER, g_device.username, sizeof(g_device.username), "admin");
+    get_envstr(ENV_DEVICE_PASS, g_device.password, sizeof(g_device.password), "12345");
 
-    struct MHD_Daemon* daemon;
-    daemon = MHD_start_daemon(MHD_USE_SELECT_INTERNALLY, SERVER_PORT, NULL, NULL,
-                              &dispatcher, NULL, 
-                              MHD_OPTION_NOTIFY_COMPLETED, request_completed_callback, NULL,
-                              MHD_OPTION_END);
-    if (daemon == NULL) {
-        fprintf(stderr, "Failed to start HTTP server on %s:%d\n", SERVER_HOST, SERVER_PORT);
+    daemon = MHD_start_daemon(
+        MHD_USE_SELECT_INTERNALLY, port, NULL, NULL,
+        &answer_to_connection, NULL,
+        MHD_OPTION_NOTIFY_COMPLETED, request_completed_callback, NULL,
+        MHD_OPTION_END);
+
+    if (NULL == daemon) {
+        fprintf(stderr, "Failed to start HTTP server on port %d\n", port);
         return 1;
     }
-    printf("Hikvision Decoder HTTP Driver running at http://%s:%d\n", SERVER_HOST, SERVER_PORT);
+    printf("HTTP driver listening on port %d\n", port);
     fflush(stdout);
-    while(1) {
-        sleep(1);
-    }
+
+    // Run forever
+    while (1) sleep(60);
+
     MHD_stop_daemon(daemon);
     return 0;
 }
-```
