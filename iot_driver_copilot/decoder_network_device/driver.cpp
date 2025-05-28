@@ -1,444 +1,390 @@
-```cpp
 #include <iostream>
 #include <cstdlib>
-#include <cstring>
 #include <string>
-#include <unordered_map>
-#include <mutex>
 #include <thread>
+#include <map>
+#include <vector>
 #include <sstream>
 #include <fstream>
-#include <vector>
-#include <memory>
-#include <json/json.h>
-#include <microhttpd.h>
-#include "HCNetSDK.h"
+#include <cstring>
+#include <mutex>
+#include <algorithm>
+#include <functional>
+#include <ctime>
+#include <json/json.h> // Requires jsoncpp (header-only, no command execution)
+#ifdef _WIN32
+#include <winsock2.h>
+#pragma comment(lib, "ws2_32.lib")
+#define CLOSESOCK closesocket
+#else
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#define CLOSESOCK close
+#endif
 
-#define RESPONSE_BUFFER_SIZE 8192
-#define MAX_SESSIONS 32
+// -- Device SDK integration points (Stub/Mock Section) --
+// In a real driver, these would be actual calls to the Hikvision SDK (HCNetSDK).
+// Here, they are mocked for demonstration.
 
-// Utility Macro for Env Var
-#define GET_ENV(VAR, DEF) (std::getenv(VAR) ? std::getenv(VAR) : DEF)
-
-// ==== Global Config ====
-const char* SERVER_HOST = GET_ENV("HTTP_SERVER_HOST", "0.0.0.0");
-const uint16_t SERVER_PORT = (uint16_t)atoi(GET_ENV("HTTP_SERVER_PORT", "8080"));
-const char* DEVICE_IP = GET_ENV("DEVICE_IP", "192.168.1.100");
-const int DEVICE_PORT = atoi(GET_ENV("DEVICE_PORT", "8000"));
-const char* DEVICE_USERNAME = GET_ENV("DEVICE_USERNAME", "admin");
-const char* DEVICE_PASSWORD = GET_ENV("DEVICE_PASSWORD", "12345");
-
-// ==== Session Management ====
-struct SessionInfo {
-    LONG lUserID;
-    std::string token;
+struct DecoderChannel {
+    int id;
+    bool enabled;
+    std::string name;
+    std::string status;
 };
 
-std::mutex g_sessionMutex;
-std::unordered_map<std::string, SessionInfo> g_sessions;
-
-// ==== HCNetSDK Wrapper ====
-class HikvisionDevice {
-public:
-    HikvisionDevice() : lUserID(-1), initialized(false) {
-        std::lock_guard<std::mutex> lk(g_sdkMutex);
-        if (!initialized) {
-            NET_DVR_Init();
-            initialized = true;
-        }
-    }
-
-    ~HikvisionDevice() {
-        logout();
-    }
-
-    bool login(const std::string& ip, int port, const std::string& user, const std::string& pwd) {
-        logout();
-        NET_DVR_DEVICEINFO_V40 deviceInfo = {0};
-        lUserID = NET_DVR_Login_V40(ip.c_str(), port, user.c_str(), pwd.c_str(), &deviceInfo);
-        return lUserID >= 0;
-    }
-
-    void logout() {
-        if (lUserID >= 0) {
-            NET_DVR_Logout(lUserID);
-            lUserID = -1;
-        }
-    }
-
-    LONG user() const { return lUserID; }
-
-    // --- Device Operations ---
-
-    bool getConfig(const std::string& type, Json::Value& out) {
-        if (lUserID < 0) return false;
-
-        // Only a few types are stubbed for illustration. Expand for more.
-        if (type == "display") {
-            // Fetch display config via XML/SDK
-            char buffer[RESPONSE_BUFFER_SIZE] = {0};
-            DWORD retLen = 0;
-            if (NET_DVR_GetDeviceAbility(lUserID, NET_DVR_XML_CONFIG, "display", NULL, 0, buffer, sizeof(buffer), &retLen)) {
-                std::string xml(buffer, retLen);
-                out["type"] = "display";
-                out["config_xml"] = xml;
-                return true;
-            }
-            return false;
-        } else if (type == "channel") {
-            // Fetch channel config via XML/SDK
-            char buffer[RESPONSE_BUFFER_SIZE] = {0};
-            DWORD retLen = 0;
-            if (NET_DVR_GetDeviceAbility(lUserID, NET_DVR_XML_CONFIG, "channel", NULL, 0, buffer, sizeof(buffer), &retLen)) {
-                std::string xml(buffer, retLen);
-                out["type"] = "channel";
-                out["config_xml"] = xml;
-                return true;
-            }
-            return false;
-        }
-        // else, stub
-        out["type"] = type;
-        out["config"] = "Not implemented";
-        return true;
-    }
-
-    bool setConfig(const std::string& type, const Json::Value& in, Json::Value& out) {
-        if (lUserID < 0) return false;
-
-        // Only a few types are stubbed for illustration. Expand for more.
-        if (type == "display") {
-            // Would push config via NET_DVR_SetDeviceAbility or similar
-            out["type"] = "display";
-            out["result"] = "Display config update not implemented";
-            return true;
-        } else if (type == "channel") {
-            out["type"] = "channel";
-            out["result"] = "Channel config update not implemented";
-            return true;
-        }
-        out["type"] = type;
-        out["result"] = "Not implemented";
-        return true;
-    }
-
-    bool getStatus(Json::Value& out) {
-        if (lUserID < 0) return false;
-        // Example: get device status via ability
-        char buffer[RESPONSE_BUFFER_SIZE] = {0};
-        DWORD retLen = 0;
-        if (NET_DVR_GetDeviceAbility(lUserID, NET_DVR_XML_CONFIG, "status", NULL, 0, buffer, sizeof(buffer), &retLen)) {
-            std::string xml(buffer, retLen);
-            out["status_xml"] = xml;
-            return true;
-        }
-        out["status"] = "Not implemented";
-        return true;
-    }
-
-    bool controlDecode(const Json::Value& in, Json::Value& out) {
-        // Example stub
-        out["decode"] = "Decode control not implemented";
-        return true;
-    }
-
-    bool upgrade(const Json::Value& in, Json::Value& out) {
-        // Example stub
-        out["upgrade"] = "Firmware upgrade not implemented";
-        return true;
-    }
-
-    bool reboot(const Json::Value& in, Json::Value& out) {
-        if (lUserID < 0) return false;
-        if (NET_DVR_RebootDVR(lUserID)) {
-            out["result"] = "Device rebooting";
-            return true;
-        }
-        out["error"] = "Failed to reboot";
-        return false;
-    }
-
-private:
-    LONG lUserID;
-    static bool initialized;
-    static std::mutex g_sdkMutex;
-};
-bool HikvisionDevice::initialized = false;
-std::mutex HikvisionDevice::g_sdkMutex;
-
-// ==== Token Utilities ====
-std::string generate_token() {
-    static int counter = 0;
-    return "session_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "_" + std::to_string(counter++);
-}
-
-bool parse_json(const char* data, size_t size, Json::Value& out) {
-    Json::CharReaderBuilder rbuilder;
-    std::string errs;
-    std::istringstream iss(std::string(data, size));
-    return Json::parseFromStream(rbuilder, iss, &out, &errs);
-}
-
-std::string json_to_str(const Json::Value& v) {
-    Json::StreamWriterBuilder wbuilder;
-    return Json::writeString(wbuilder, v);
-}
-
-// ==== HTTP Server Handler ====
-struct ReqContext {
-    std::string session_token;
-    std::shared_ptr<HikvisionDevice> device;
+struct DeviceStatus {
+    std::string decoderState;
+    std::string alarmStatus;
+    std::string remotePlayStatus;
+    std::string firmwareUpgrade;
 };
 
-static int send_response(struct MHD_Connection* connection, int status_code, const char* content_type, const std::string& body) {
-    struct MHD_Response* response = MHD_create_response_from_buffer(body.size(), (void*)body.data(), MHD_RESPMEM_MUST_COPY);
-    MHD_add_response_header(response, "Content-Type", content_type);
-    int ret = MHD_queue_response(connection, status_code, response);
-    MHD_destroy_response(response);
-    return ret;
+struct DisplayConfig {
+    std::string layout;
+    std::string scene;
+};
+
+std::vector<DecoderChannel> mockChannels = {
+    {1, true, "MainDecoder1", "Active"},
+    {2, false, "MainDecoder2", "Inactive"},
+    {3, true, "MainDecoder3", "Active"}
+};
+DeviceStatus mockDeviceStatus = {"Running", "NoAlarms", "Stopped", "Idle"};
+DisplayConfig mockDisplayConfig = {"2x2", "Default"};
+
+// Mock 'SDK' functions
+std::mutex device_mutex;
+std::vector<DecoderChannel> device_get_channels() {
+    std::lock_guard<std::mutex> lock(device_mutex);
+    return mockChannels;
+}
+DecoderChannel* device_find_channel(int id) {
+    std::lock_guard<std::mutex> lock(device_mutex);
+    for (auto& ch : mockChannels) if (ch.id == id) return &ch;
+    return nullptr;
+}
+void device_update_channel(int id, bool enabled, const std::string& name) {
+    std::lock_guard<std::mutex> lock(device_mutex);
+    for (auto& ch : mockChannels) {
+        if (ch.id == id) {
+            ch.enabled = enabled;
+            if (!name.empty()) ch.name = name;
+        }
+    }
+}
+DeviceStatus device_get_status() {
+    std::lock_guard<std::mutex> lock(device_mutex);
+    return mockDeviceStatus;
+}
+void device_set_display_config(const std::string& layout, const std::string& scene) {
+    std::lock_guard<std::mutex> lock(device_mutex);
+    if (!layout.empty()) mockDisplayConfig.layout = layout;
+    if (!scene.empty()) mockDisplayConfig.scene = scene;
+}
+void device_control_command(const std::string& type, const Json::Value& params) {
+    std::lock_guard<std::mutex> lock(device_mutex);
+    if (type == "reset")
+        mockDeviceStatus.decoderState = "Resetting";
+    else if (type == "start_decode")
+        mockDeviceStatus.decoderState = "Decoding";
+    else if (type == "stop_decode")
+        mockDeviceStatus.decoderState = "Stopped";
+    // ... Add more command emulation as required
 }
 
-static bool get_session(const char* token, std::shared_ptr<HikvisionDevice>& device) {
-    std::lock_guard<std::mutex> lk(g_sessionMutex);
-    auto it = g_sessions.find(token ? token : "");
-    if (it != g_sessions.end()) {
-        if (!it->second.token.empty()) {
-            device = std::make_shared<HikvisionDevice>();
-            device->login(DEVICE_IP, DEVICE_PORT, DEVICE_USERNAME, DEVICE_PASSWORD);
-            return true;
-        }
-    }
-    return false;
-}
+// -- End Mock Section --
 
-// ==== HTTP Routing ====
-static int api_handler(void* cls, struct MHD_Connection* connection,
-                       const char* url, const char* method,
-                       const char* version, const char* upload_data,
-                       size_t* upload_data_size, void** con_cls) {
+// -- HTTP Server Utilities --
 
-    static std::unordered_map<std::string, std::string> session_tokens; // For login/logout POST
-    static std::unordered_map<std::string, std::shared_ptr<HikvisionDevice>> cached_devices;
+const int BUFSIZE = 8192;
 
-    static std::string last_token;
-    static std::shared_ptr<HikvisionDevice> last_device;
+struct HttpRequest {
+    std::string method;
+    std::string path;
+    std::map<std::string, std::string> headers;
+    std::string body;
+    std::map<std::string, std::string> query_params;
+    std::string path_param; // Used for /channels/{id}
+};
 
-    // Session context for this request
-    ReqContext* context = static_cast<ReqContext*>(*con_cls);
+struct HttpResponse {
+    int code;
+    std::string status;
+    std::string content_type;
+    std::string body;
+    std::vector<std::string> extra_headers;
+};
 
-    // For new connection, initialize context
-    if (!context) {
-        context = new ReqContext();
-        *con_cls = context;
-    }
-
-    // Only handle POST data on first call (upload_data_size > 0)
-    if (*upload_data_size > 0) {
-        if (context->session_token.empty())
-            context->session_token.assign(upload_data, *upload_data_size);
-        *upload_data_size = 0;
-        return MHD_YES;
-    }
-
-    std::string path(url ? url : "");
-    std::string m(method ? method : "");
-    std::string response;
-    int status = MHD_HTTP_OK;
-    Json::Value out;
-
-    // Extract session token from header (if any)
-    const char* token_hdr = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "X-Session-Token");
-    std::string session_token = token_hdr ? token_hdr : "";
-
-    // --------- ROUTE HANDLING ---------
-    if (path == "/login" && m == "POST") {
-        // Parse JSON credentials
-        char* json_data = context->session_token.empty() ? nullptr : &context->session_token[0];
-        Json::Value creds;
-        if (!json_data || !parse_json(json_data, strlen(json_data), creds)) {
-            out["error"] = "Invalid JSON";
-            response = json_to_str(out);
-            status = MHD_HTTP_BAD_REQUEST;
-            goto END;
-        }
-        std::string user = creds.get("username", DEVICE_USERNAME).asString();
-        std::string pwd = creds.get("password", DEVICE_PASSWORD).asString();
-        auto device = std::make_shared<HikvisionDevice>();
-        if (!device->login(DEVICE_IP, DEVICE_PORT, user, pwd)) {
-            out["error"] = "Failed to login to device";
-            response = json_to_str(out);
-            status = MHD_HTTP_UNAUTHORIZED;
-            goto END;
-        }
-        std::string token = generate_token();
-        {
-            std::lock_guard<std::mutex> lk(g_sessionMutex);
-            if (g_sessions.size() > MAX_SESSIONS) g_sessions.clear();
-            g_sessions[token] = {device->user(), token};
-        }
-        out["session_token"] = token;
-        response = json_to_str(out);
-        status = MHD_HTTP_OK;
-        goto END;
-    }
-    if (path == "/logout" && m == "POST") {
-        if (session_token.empty()) {
-            out["error"] = "No session token";
-            response = json_to_str(out);
-            status = MHD_HTTP_UNAUTHORIZED;
-            goto END;
-        }
-        std::lock_guard<std::mutex> lk(g_sessionMutex);
-        auto it = g_sessions.find(session_token);
-        if (it != g_sessions.end()) {
-            g_sessions.erase(it);
-            out["result"] = "Session terminated";
-            response = json_to_str(out);
-            status = MHD_HTTP_OK;
+void url_decode_inplace(std::string &s) {
+    size_t len = s.length();
+    std::string res;
+    for (size_t i = 0; i < len; ++i) {
+        if (s[i] == '%' && i + 2 < len) {
+            int val = 0;
+            sscanf(s.substr(i + 1, 2).c_str(), "%x", &val);
+            res += static_cast<char>(val);
+            i += 2;
+        } else if (s[i] == '+') {
+            res += ' ';
         } else {
-            out["error"] = "Session not found";
-            response = json_to_str(out);
-            status = MHD_HTTP_UNAUTHORIZED;
+            res += s[i];
         }
-        goto END;
     }
-
-    // All other endpoints require session
-    std::shared_ptr<HikvisionDevice> device;
-    if (!get_session(session_token.c_str(), device)) {
-        out["error"] = "Unauthorized: Invalid or missing session token";
-        response = json_to_str(out);
-        status = MHD_HTTP_UNAUTHORIZED;
-        goto END;
-    }
-
-    // ---- GET /status ----
-    if ((path == "/status") && (m == "GET")) {
-        if (!device->getStatus(out)) {
-            out["error"] = "Failed to retrieve device status";
-            status = MHD_HTTP_INTERNAL_SERVER_ERROR;
-        }
-        response = json_to_str(out);
-        goto END;
-    }
-
-    // ---- GET /config ----
-    if ((path == "/config") && (m == "GET")) {
-        // Query param: type
-        const char* type = MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "type");
-        std::string conf_type = type ? type : "display";
-        if (!device->getConfig(conf_type, out)) {
-            out["error"] = "Failed to fetch config";
-            status = MHD_HTTP_INTERNAL_SERVER_ERROR;
-        }
-        response = json_to_str(out);
-        goto END;
-    }
-
-    // ---- PUT /config ----
-    if ((path == "/config") && (m == "PUT")) {
-        // Query param: type
-        const char* type = MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "type");
-        std::string conf_type = type ? type : "display";
-        // JSON payload in context->session_token
-        Json::Value payload;
-        if (!parse_json(context->session_token.c_str(), context->session_token.size(), payload)) {
-            out["error"] = "Invalid JSON";
-            status = MHD_HTTP_BAD_REQUEST;
-            response = json_to_str(out);
-            goto END;
-        }
-        if (!device->setConfig(conf_type, payload, out)) {
-            out["error"] = "Failed to update config";
-            status = MHD_HTTP_INTERNAL_SERVER_ERROR;
-        }
-        response = json_to_str(out);
-        goto END;
-    }
-
-    // ---- POST /command/decode or /decode ----
-    if ((path == "/command/decode" || path == "/decode") && (m == "POST")) {
-        Json::Value payload;
-        if (!parse_json(context->session_token.c_str(), context->session_token.size(), payload)) {
-            out["error"] = "Invalid JSON";
-            status = MHD_HTTP_BAD_REQUEST;
-            response = json_to_str(out);
-            goto END;
-        }
-        if (!device->controlDecode(payload, out)) {
-            out["error"] = "Failed to control decode";
-            status = MHD_HTTP_INTERNAL_SERVER_ERROR;
-        }
-        response = json_to_str(out);
-        goto END;
-    }
-
-    // ---- POST /command/reboot or /reboot ----
-    if ((path == "/command/reboot" || path == "/reboot") && (m == "POST")) {
-        Json::Value payload;
-        if (!context->session_token.empty() &&
-            !parse_json(context->session_token.c_str(), context->session_token.size(), payload)) {
-            out["error"] = "Invalid JSON";
-            status = MHD_HTTP_BAD_REQUEST;
-            response = json_to_str(out);
-            goto END;
-        }
-        if (!device->reboot(payload, out)) {
-            out["error"] = "Failed to reboot";
-            status = MHD_HTTP_INTERNAL_SERVER_ERROR;
-        }
-        response = json_to_str(out);
-        goto END;
-    }
-
-    // ---- POST /upgrade or /command/upgrade ----
-    if ((path == "/upgrade" || path == "/command/upgrade") && (m == "POST")) {
-        Json::Value payload;
-        if (!parse_json(context->session_token.c_str(), context->session_token.size(), payload)) {
-            out["error"] = "Invalid JSON";
-            status = MHD_HTTP_BAD_REQUEST;
-            response = json_to_str(out);
-            goto END;
-        }
-        if (!device->upgrade(payload, out)) {
-            out["error"] = "Failed to start upgrade";
-            status = MHD_HTTP_INTERNAL_SERVER_ERROR;
-        }
-        response = json_to_str(out);
-        goto END;
-    }
-
-    // ---- Not Found ----
-    out["error"] = "Endpoint not found";
-    response = json_to_str(out);
-    status = MHD_HTTP_NOT_FOUND;
-
-END:
-    delete context;
-    *con_cls = nullptr;
-    return send_response(connection, status, "application/json", response);
+    s.swap(res);
 }
 
-// ==== MAIN SERVER STARTUP ====
-int main(int argc, char* argv[]) {
-    // Load HCNetSDK library
-    NET_DVR_Init();
-    // Start HTTP server
-    struct MHD_Daemon* daemon = MHD_start_daemon(
-        MHD_USE_SELECT_INTERNALLY,
-        SERVER_PORT,
-        NULL, NULL,
-        &api_handler, NULL,
-        MHD_OPTION_END
-    );
-    if (!daemon) {
-        std::cerr << "Failed to start HTTP server on port " << SERVER_PORT << std::endl;
+std::map<std::string, std::string> parse_query(const std::string& query) {
+    std::map<std::string, std::string> params;
+    std::stringstream ss(query);
+    std::string item;
+    while (std::getline(ss, item, '&')) {
+        size_t eq = item.find('=');
+        if (eq != std::string::npos) {
+            std::string k = item.substr(0, eq);
+            std::string v = item.substr(eq + 1);
+            url_decode_inplace(k); url_decode_inplace(v);
+            params[k] = v;
+        }
+    }
+    return params;
+}
+
+bool starts_with(const std::string& s, const std::string& prefix) {
+    return s.size() >= prefix.size() && std::equal(prefix.begin(), prefix.end(), s.begin());
+}
+
+// Parse HTTP request from raw buffer
+bool parse_http_request(const std::string& raw, HttpRequest& req) {
+    std::istringstream iss(raw);
+    std::string line;
+    if (!std::getline(iss, line)) return false;
+    size_t method_end = line.find(' ');
+    size_t path_end = line.find(' ', method_end + 1);
+    if (method_end == std::string::npos || path_end == std::string::npos) return false;
+    req.method = line.substr(0, method_end);
+    std::string url = line.substr(method_end + 1, path_end - method_end - 1);
+
+    size_t qmark = url.find('?');
+    if (qmark != std::string::npos) {
+        req.path = url.substr(0, qmark);
+        req.query_params = parse_query(url.substr(qmark + 1));
+    } else {
+        req.path = url;
+    }
+    std::transform(req.path.begin(), req.path.end(), req.path.begin(), ::tolower);
+
+    // Headers
+    while (std::getline(iss, line) && line != "\r") {
+        if (line.empty() || line == "\n" || line == "\r\n") break;
+        size_t col = line.find(':');
+        if (col != std::string::npos) {
+            std::string k = line.substr(0, col);
+            std::string v = line.substr(col + 1);
+            k.erase(std::remove_if(k.begin(), k.end(), ::isspace), k.end());
+            v.erase(0, v.find_first_not_of(" \t\r\n"));
+            v.erase(v.find_last_not_of(" \t\r\n") + 1);
+            std::transform(k.begin(), k.end(), k.begin(), ::tolower);
+            req.headers[k] = v;
+        }
+    }
+    // Body
+    std::string rest((std::istreambuf_iterator<char>(iss)), {});
+    req.body = rest;
+
+    // Extract path_param for /channels/{id}
+    if (starts_with(req.path, "/channels/")) {
+        req.path_param = req.path.substr(std::string("/channels/").length());
+        req.path = "/channels/{id}";
+    }
+
+    return true;
+}
+
+void send_http_response(int client_fd, const HttpResponse& resp) {
+    std::ostringstream oss;
+    oss << "HTTP/1.1 " << resp.code << " " << resp.status << "\r\n";
+    oss << "Content-Type: " << resp.content_type << "\r\n";
+    oss << "Content-Length: " << resp.body.size() << "\r\n";
+    for (const auto& h : resp.extra_headers)
+        oss << h << "\r\n";
+    oss << "Connection: close\r\n\r\n";
+    oss << resp.body;
+    std::string response = oss.str();
+    send(client_fd, response.c_str(), response.size(), 0);
+}
+
+// -- API Handlers --
+
+HttpResponse handle_get_channels(const HttpRequest& req) {
+    auto channels = device_get_channels();
+    // Filtering and pagination (optional, basic demo)
+    int page = 1, page_size = channels.size();
+    if (req.query_params.count("page")) page = std::stoi(req.query_params.at("page"));
+    if (req.query_params.count("page_size")) page_size = std::stoi(req.query_params.at("page_size"));
+    int from = (page - 1) * page_size;
+    int to = std::min((int)channels.size(), from + page_size);
+
+    Json::Value root(Json::arrayValue);
+    for (int i = from; i < to; ++i) {
+        Json::Value ch;
+        ch["id"] = channels[i].id;
+        ch["enabled"] = channels[i].enabled;
+        ch["name"] = channels[i].name;
+        ch["status"] = channels[i].status;
+        root.append(ch);
+    }
+    Json::StreamWriterBuilder builder;
+    std::string body = Json::writeString(builder, root);
+    return {200, "OK", "application/json", body, {}};
+}
+
+HttpResponse handle_get_status(const HttpRequest& req) {
+    DeviceStatus status = device_get_status();
+    Json::Value root;
+    root["decoderState"] = status.decoderState;
+    root["alarmStatus"] = status.alarmStatus;
+    root["remotePlayStatus"] = status.remotePlayStatus;
+    root["firmwareUpgrade"] = status.firmwareUpgrade;
+    Json::StreamWriterBuilder builder;
+    std::string body = Json::writeString(builder, root);
+    return {200, "OK", "application/json", body, {}};
+}
+
+HttpResponse handle_put_display(const HttpRequest& req) {
+    Json::Value payload;
+    Json::CharReaderBuilder reader;
+    std::string errs;
+    std::istringstream iss(req.body);
+    if (!Json::parseFromStream(reader, iss, &payload, &errs)) {
+        return {400, "Bad Request", "application/json", "{\"error\":\"Invalid JSON payload.\"}", {}};
+    }
+    std::string layout = payload.get("layout", "").asString();
+    std::string scene = payload.get("scene", "").asString();
+    device_set_display_config(layout, scene);
+
+    Json::Value root;
+    root["result"] = "success";
+    Json::StreamWriterBuilder builder;
+    std::string body = Json::writeString(builder, root);
+    return {200, "OK", "application/json", body, {}};
+}
+
+HttpResponse handle_put_channel_id(const HttpRequest& req) {
+    int id = std::stoi(req.path_param);
+    Json::Value payload;
+    Json::CharReaderBuilder reader;
+    std::string errs;
+    std::istringstream iss(req.body);
+    if (!Json::parseFromStream(reader, iss, &payload, &errs)) {
+        return {400, "Bad Request", "application/json", "{\"error\":\"Invalid JSON payload.\"}", {}};
+    }
+    bool enabled = payload.get("enabled", false).asBool();
+    std::string name = payload.get("name", "").asString();
+    if (!device_find_channel(id)) {
+        return {404, "Not Found", "application/json", "{\"error\":\"Channel not found.\"}", {}};
+    }
+    device_update_channel(id, enabled, name);
+    Json::Value root; root["result"] = "success";
+    Json::StreamWriterBuilder builder;
+    std::string body = Json::writeString(builder, root);
+    return {200, "OK", "application/json", body, {}};
+}
+
+HttpResponse handle_post_control(const HttpRequest& req) {
+    Json::Value payload;
+    Json::CharReaderBuilder reader;
+    std::string errs;
+    std::istringstream iss(req.body);
+    if (!Json::parseFromStream(reader, iss, &payload, &errs)) {
+        return {400, "Bad Request", "application/json", "{\"error\":\"Invalid JSON payload.\"}", {}};
+    }
+    std::string type = payload.get("command", "").asString();
+    Json::Value params = payload.get("params", Json::Value(Json::objectValue));
+    if (type.empty())
+        return {400, "Bad Request", "application/json", "{\"error\":\"Missing command type.\"}", {}};
+    device_control_command(type, params);
+
+    Json::Value root; root["result"] = "success";
+    Json::StreamWriterBuilder builder;
+    std::string body = Json::writeString(builder, root);
+    return {200, "OK", "application/json", body, {}};
+}
+
+// -- Main HTTP Router --
+
+HttpResponse route_request(const HttpRequest& req) {
+    if (req.method == "GET" && req.path == "/channels")
+        return handle_get_channels(req);
+    if (req.method == "GET" && req.path == "/status")
+        return handle_get_status(req);
+    if (req.method == "PUT" && req.path == "/display")
+        return handle_put_display(req);
+    if (req.method == "PUT" && req.path == "/channels/{id}")
+        return handle_put_channel_id(req);
+    if (req.method == "POST" && req.path == "/control")
+        return handle_post_control(req);
+    return {404, "Not Found", "application/json", "{\"error\":\"Not found.\"}", {}};
+}
+
+// -- HTTP Server Loop --
+
+void handle_client(int client_fd) {
+    char buffer[BUFSIZE + 1];
+    int n = recv(client_fd, buffer, BUFSIZE, 0);
+    if (n <= 0) { CLOSESOCK(client_fd); return; }
+    buffer[n] = '\0';
+    std::string raw(buffer, n);
+    HttpRequest req;
+    if (!parse_http_request(raw, req)) {
+        HttpResponse resp = {400, "Bad Request", "application/json", "{\"error\":\"Malformed request.\"}", {}};
+        send_http_response(client_fd, resp);
+        CLOSESOCK(client_fd);
+        return;
+    }
+    HttpResponse resp = route_request(req);
+    send_http_response(client_fd, resp);
+    CLOSESOCK(client_fd);
+}
+
+int main() {
+    // --- Configuration from environment ---
+    std::string device_ip = getenv("DEVICE_IP") ? getenv("DEVICE_IP") : "127.0.0.1";
+    int device_port = getenv("DEVICE_PORT") ? std::stoi(getenv("DEVICE_PORT")) : 8000; // Not used in mock
+    std::string http_host = getenv("HTTP_HOST") ? getenv("HTTP_HOST") : "0.0.0.0";
+    int http_port = getenv("HTTP_PORT") ? std::stoi(getenv("HTTP_PORT")) : 8080;
+
+#ifdef _WIN32
+    WSADATA wsa_data;
+    WSAStartup(MAKEWORD(2,2), &wsa_data);
+#endif
+
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) { std::cerr << "Socket error\n"; return 1; }
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
+    sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = (http_host == "0.0.0.0") ? INADDR_ANY : inet_addr(http_host.c_str());
+    addr.sin_port = htons(http_port);
+    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        std::cerr << "Bind failed\n";
         return 1;
     }
-    std::cout << "HTTP server started on port " << SERVER_PORT << std::endl;
-    while (1) std::this_thread::sleep_for(std::chrono::seconds(60));
-    MHD_stop_daemon(daemon);
-    NET_DVR_Cleanup();
+    listen(server_fd, 10);
+    std::cout << "HTTP server running on " << http_host << ":" << http_port << std::endl;
+
+    while (true) {
+        sockaddr_in client_addr; socklen_t client_len = sizeof(client_addr);
+        int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
+        if (client_fd < 0) continue;
+        std::thread th(handle_client, client_fd); th.detach();
+    }
+
+    CLOSESOCK(server_fd);
+#ifdef _WIN32
+    WSACleanup();
+#endif
     return 0;
 }
-```
