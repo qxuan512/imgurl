@@ -1,23 +1,21 @@
 #include <iostream>
-#include <cstdlib>
 #include <string>
+#include <cstdlib>
 #include <map>
+#include <vector>
 #include <mutex>
 #include <thread>
-#include <vector>
 #include <sstream>
 #include <fstream>
-#include <cstring>
-#include <cctype>
 #include <algorithm>
-#include <stdexcept>
-
-// =========== Minimal HTTP Server Implementation ============
-
+#include <cstring>
+#include <cstdio>
+#include <ctime>
+#include <json/json.h> // Requires https://github.com/open-source-parsers/jsoncpp
 #ifdef _WIN32
 #include <winsock2.h>
 typedef int socklen_t;
-#pragma comment(lib, "Ws2_32.lib")
+#pragma comment(lib, "ws2_32.lib")
 #else
 #include <unistd.h>
 #include <sys/socket.h>
@@ -25,500 +23,526 @@ typedef int socklen_t;
 #include <netinet/in.h>
 #endif
 
-// =========== Device SDK Protocol Simulation ===============
-// In production, replace these with actual SDK API calls
-
-struct Session {
-    std::string token;
-    bool logged_in = false;
-};
-
-struct DeviceStatus {
-    std::string channel_status = "OK";
-    std::string alarm_status = "None";
-    std::string error_codes = "";
-    std::string sdk_state = "Running";
-};
-
-struct DeviceConfig {
-    std::string decoder_channels = "4";
-    std::string loop_decode = "Enabled";
-    std::string scene = "Default";
-};
-
-static std::mutex session_mutex;
-static Session device_session;
-static DeviceStatus device_status;
-static DeviceConfig device_config;
-
-std::string generate_token() {
-    static int counter = 1000;
-    return "token_" + std::to_string(counter++);
+// --- Environment Helpers ---
+std::string getEnv(const std::string& key, const std::string& def = "") {
+    const char* val = std::getenv(key.c_str());
+    return val ? std::string(val) : def;
 }
 
-bool sdk_login(const std::string& user, const std::string& pass, std::string& out_token) {
-    std::lock_guard<std::mutex> lock(session_mutex);
-    if (user == "admin" && pass == "12345") {
-        device_session.logged_in = true;
-        device_session.token = generate_token();
-        out_token = device_session.token;
-        return true;
+// --- Global Configuration ---
+struct Config {
+    std::string device_ip;
+    int device_port;
+    std::string username;
+    std::string password;
+    std::string http_host;
+    int http_port;
+    std::mutex session_mutex;
+    std::string session_token;
+    bool session_active = false;
+    // Simulated device state for demo
+    Json::Value device_status;
+    Json::Value device_config;
+    Config() {
+        device_ip = getEnv("DEVICE_IP", "192.168.1.100");
+        device_port = std::stoi(getEnv("DEVICE_PORT", "8000"));
+        username = getEnv("DEVICE_USER", "admin");
+        password = getEnv("DEVICE_PASS", "admin123");
+        http_host = getEnv("HTTP_HOST", "0.0.0.0");
+        http_port = std::stoi(getEnv("HTTP_PORT", "8080"));
+        // Simulated defaults for demonstration
+        device_status["channels"] = Json::arrayValue;
+        device_status["alarms"] = Json::arrayValue;
+        device_status["errors"] = Json::arrayValue;
+        device_status["sdk_state"] = "idle";
+        device_status["playback"] = "stopped";
+        device_config["decoder_channels"] = 4;
+        device_config["loop_decode"] = false;
+        device_config["scene"] = "default";
+        device_config["window_management"] = "auto";
     }
-    return false;
-}
+} config;
 
-bool sdk_logout(const std::string& token) {
-    std::lock_guard<std::mutex> lock(session_mutex);
-    if (device_session.token == token && device_session.logged_in) {
-        device_session.logged_in = false;
-        device_session.token = "";
-        return true;
-    }
-    return false;
-}
-
-bool sdk_is_logged_in(const std::string& token) {
-    std::lock_guard<std::mutex> lock(session_mutex);
-    return device_session.logged_in && device_session.token == token;
-}
-
-bool sdk_reboot(const std::string& token) {
-    std::lock_guard<std::mutex> lock(session_mutex);
-    if (sdk_is_logged_in(token)) {
-        // Simulate reboot
-        device_status.sdk_state = "Rebooting";
-        std::this_thread::sleep_for(std::chrono::milliseconds(800));
-        device_status.sdk_state = "Running";
-        return true;
-    }
-    return false;
-}
-
-bool sdk_get_status(const std::string& token, DeviceStatus& out_status) {
-    if (sdk_is_logged_in(token)) {
-        out_status = device_status;
-        return true;
-    }
-    return false;
-}
-
-bool sdk_get_config(const std::string& token, DeviceConfig& out_config) {
-    if (sdk_is_logged_in(token)) {
-        out_config = device_config;
-        return true;
-    }
-    return false;
-}
-
-bool sdk_update_config(const std::string& token, const DeviceConfig& in_config) {
-    if (sdk_is_logged_in(token)) {
-        device_config = in_config;
-        return true;
-    }
-    return false;
-}
-
-bool sdk_control_decode(const std::string& token, const std::string& action, const std::string& channel, const std::string& mode) {
-    if (sdk_is_logged_in(token)) {
-        if (action == "start") {
-            device_status.channel_status = "Decoding on " + channel + "/" + mode;
-        } else if (action == "stop") {
-            device_status.channel_status = "Stopped";
-        }
-        return true;
-    }
-    return false;
-}
-
-bool sdk_playback(const std::string& token, const std::string& action, const std::string& channel, const std::string& speed) {
-    if (sdk_is_logged_in(token)) {
-        device_status.sdk_state = "Playback: " + action + " on " + channel + " at " + speed;
-        return true;
-    }
-    return false;
-}
-
-// ========== JSON Utilities =============
-std::string json_escape(const std::string& s) {
-    std::ostringstream o;
-    for (auto c : s) {
-        switch (c) {
-        case '"': o << "\\\""; break;
-        case '\\': o << "\\\\"; break;
-        case '\b': o << "\\b"; break;
-        case '\f': o << "\\f"; break;
-        case '\n': o << "\\n"; break;
-        case '\r': o << "\\r"; break;
-        case '\t': o << "\\t"; break;
-        default:
-            if ('\x00' <= c && c <= '\x1f') {
-                o << "\\u"
-                  << std::hex << std::setw(4) << std::setfill('0') << int(c);
-            } else {
-                o << c;
-            }
+// --- Utility: URL Decoding, String Split ---
+std::string urlDecode(const std::string& s) {
+    std::string result;
+    char ch;
+    int i, ii;
+    for (i = 0; i < s.length(); i++) {
+        if (int(s[i]) == 37) {
+            sscanf(s.substr(i + 1, 2).c_str(), "%x", &ii);
+            ch = static_cast<char>(ii);
+            result += ch;
+            i = i + 2;
+        } else {
+            result += s[i];
         }
     }
-    return o.str();
+    return result;
+}
+std::vector<std::string> split(const std::string& s, char delim) {
+    std::vector<std::string> out;
+    std::stringstream ss(s);
+    std::string item;
+    while (std::getline(ss, item, delim)) out.push_back(item);
+    return out;
+}
+std::string trim(const std::string& s) {
+    auto start = s.begin();
+    while (start != s.end() && isspace(*start)) start++;
+    auto end = s.end();
+    do { end--; } while (distance(start, end) > 0 && isspace(*end));
+    return std::string(start, end + 1);
 }
 
-std::string status_to_json(const DeviceStatus& st) {
-    std::ostringstream ss;
-    ss << "{"
-       << "\"channel_status\":\"" << json_escape(st.channel_status) << "\","
-       << "\"alarm_status\":\"" << json_escape(st.alarm_status) << "\","
-       << "\"error_codes\":\"" << json_escape(st.error_codes) << "\","
-       << "\"sdk_state\":\"" << json_escape(st.sdk_state) << "\""
-       << "}";
-    return ss.str();
-}
-
-std::string config_to_json(const DeviceConfig& cfg) {
-    std::ostringstream ss;
-    ss << "{"
-       << "\"decoder_channels\":\"" << json_escape(cfg.decoder_channels) << "\","
-       << "\"loop_decode\":\"" << json_escape(cfg.loop_decode) << "\","
-       << "\"scene\":\"" << json_escape(cfg.scene) << "\""
-       << "}";
-    return ss.str();
-}
-
-// ========== HTTP Utilities =============
+// --- HTTP Utilities ---
 struct HttpRequest {
     std::string method;
     std::string path;
-    std::map<std::string, std::string> query;
+    std::string query;
     std::map<std::string, std::string> headers;
     std::string body;
 };
 
 struct HttpResponse {
     int status;
-    std::string content_type;
+    std::string statusText;
+    std::string contentType;
     std::string body;
     std::map<std::string, std::string> headers;
 };
-
-std::string url_decode(const std::string &SRC) {
-    std::string ret;
-    char ch;
-    int i, ii;
-    for (i=0; i<SRC.length(); i++) {
-        if (int(SRC[i]) == 37) {
-            sscanf(SRC.substr(i+1,2).c_str(), "%x", &ii);
-            ch=static_cast<char>(ii);
-            ret+=ch;
-            i=i+2;
-        } else {
-            ret+=SRC[i];
-        }
+std::string getStatusText(int status) {
+    switch (status) {
+        case 200: return "OK";
+        case 201: return "Created";
+        case 204: return "No Content";
+        case 400: return "Bad Request";
+        case 401: return "Unauthorized";
+        case 403: return "Forbidden";
+        case 404: return "Not Found";
+        case 409: return "Conflict";
+        case 500: return "Internal Server Error";
+        default: return "Unknown";
     }
-    return ret;
 }
-
-std::map<std::string, std::string> parse_query(const std::string& query) {
-    std::map<std::string, std::string> params;
-    std::istringstream ss(query);
-    std::string item;
-    while (std::getline(ss, item, '&')) {
-        auto pos = item.find('=');
-        if (pos != std::string::npos) {
-            params[url_decode(item.substr(0, pos))] = url_decode(item.substr(pos + 1));
-        }
+std::string makeHttpResponse(const HttpResponse& resp) {
+    std::ostringstream oss;
+    oss << "HTTP/1.1 " << resp.status << " " << resp.statusText << "\r\n";
+    oss << "Content-Type: " << resp.contentType << "\r\n";
+    oss << "Server: Hikvision-Decoder-HTTP-Driver/1.0\r\n";
+    for (const auto& h : resp.headers) {
+        oss << h.first << ": " << h.second << "\r\n";
     }
-    return params;
+    oss << "Content-Length: " << resp.body.size() << "\r\n\r\n";
+    oss << resp.body;
+    return oss.str();
 }
-
-HttpRequest parse_http_request(const std::string& request) {
+HttpRequest parseHttpRequest(const std::string& raw) {
     HttpRequest req;
-    std::istringstream ss(request);
+    std::istringstream iss(raw);
     std::string line;
-    std::getline(ss, line);
-    std::istringstream ls(line);
-
-    ls >> req.method;
-    std::string full_path;
-    ls >> full_path;
-    auto qpos = full_path.find('?');
-    if (qpos != std::string::npos) {
-        req.path = full_path.substr(0, qpos);
-        req.query = parse_query(full_path.substr(qpos + 1));
-    } else {
-        req.path = full_path;
+    std::getline(iss, line);
+    auto parts = split(line, ' ');
+    if (parts.size() >= 2) {
+        req.method = parts[0];
+        auto pathq = parts[1];
+        auto qpos = pathq.find('?');
+        if (qpos != std::string::npos) {
+            req.path = pathq.substr(0, qpos);
+            req.query = pathq.substr(qpos + 1);
+        } else {
+            req.path = pathq;
+            req.query = "";
+        }
     }
-
-    // Headers
-    while (std::getline(ss, line) && line != "\r") {
-        if (line.empty() || line == "\n" || line == "\r\n") break;
-        auto col = line.find(':');
-        if (col != std::string::npos) {
-            std::string key = line.substr(0, col);
-            std::string val = line.substr(col + 1);
-            key.erase(std::remove_if(key.begin(), key.end(), ::isspace), key.end());
-            val.erase(0, val.find_first_not_of(" \t\r\n"));
-            val.erase(val.find_last_not_of(" \t\r\n") + 1);
+    while (std::getline(iss, line) && line != "\r") {
+        auto colon = line.find(':');
+        if (colon != std::string::npos) {
+            std::string key = trim(line.substr(0, colon));
+            std::string val = trim(line.substr(colon + 1));
+            if (!val.empty() && val.back() == '\r') val.pop_back();
             req.headers[key] = val;
         }
     }
     // Body
     std::string body;
-    while (std::getline(ss, line)) {
+    while (std::getline(iss, line)) {
         body += line + "\n";
     }
-    if (!body.empty()) {
-        req.body = body;
-    }
+    req.body = body;
+    if (!req.body.empty() && req.body.back() == '\n') req.body.pop_back();
     return req;
 }
-
-std::string http_response_to_string(const HttpResponse& resp) {
-    std::ostringstream ss;
-    ss << "HTTP/1.1 " << resp.status << " ";
-    switch (resp.status) {
-        case 200: ss << "OK"; break;
-        case 201: ss << "Created"; break;
-        case 204: ss << "No Content"; break;
-        case 400: ss << "Bad Request"; break;
-        case 401: ss << "Unauthorized"; break;
-        case 404: ss << "Not Found"; break;
-        case 500: ss << "Internal Server Error"; break;
-        default: ss << "Unknown";
+// --- Session/Auth Token Simulation ---
+std::string generateSessionToken() {
+    char buf[33];
+    srand((unsigned)time(0));
+    for (int i = 0; i < 32; ++i) {
+        int n = rand() % 16;
+        buf[i] = "0123456789abcdef"[n];
     }
-    ss << "\r\n";
-    ss << "Content-Type: " << resp.content_type << "\r\n";
-    for (auto& h : resp.headers) {
-        ss << h.first << ": " << h.second << "\r\n";
-    }
-    ss << "Content-Length: " << resp.body.size() << "\r\n";
-    ss << "\r\n";
-    ss << resp.body;
-    return ss.str();
+    buf[32] = 0;
+    return std::string(buf);
+}
+bool checkAuthToken(const HttpRequest& req) {
+    auto it = req.headers.find("Authorization");
+    if (it == req.headers.end()) return false;
+    std::lock_guard<std::mutex> lock(config.session_mutex);
+    return config.session_active && it->second == "Bearer " + config.session_token;
 }
 
-// ========== JSON Parse Helpers (minimal, non-strict) =======
-std::map<std::string, std::string> json_to_map(const std::string& json) {
-    std::map<std::string, std::string> m;
-    std::string s = json;
-    s.erase(std::remove_if(s.begin(), s.end(), ::isspace), s.end());
-    if (s.front() == '{') s = s.substr(1);
-    if (s.back() == '}') s = s.substr(0, s.size()-1);
-    std::istringstream ss(s);
-    std::string item;
-    while (std::getline(ss, item, ',')) {
-        auto c = item.find(':');
-        if (c != std::string::npos) {
-            std::string k = item.substr(0, c);
-            std::string v = item.substr(c+1);
-            if (!k.empty() && k.front() == '"') k = k.substr(1, k.size()-2);
-            if (!v.empty() && v.front() == '"') v = v.substr(1, v.size()-2);
-            m[k] = v;
+// --- Simulated Device SDK/Protocol Functions ---
+bool device_login(const std::string& user, const std::string& pass, std::string& token) {
+    if (user == config.username && pass == config.password) {
+        token = generateSessionToken();
+        std::lock_guard<std::mutex> lock(config.session_mutex);
+        config.session_token = token;
+        config.session_active = true;
+        return true;
+    }
+    return false;
+}
+void device_logout() {
+    std::lock_guard<std::mutex> lock(config.session_mutex);
+    config.session_active = false;
+    config.session_token.clear();
+}
+bool device_reboot() {
+    // Simulate reboot
+    std::lock_guard<std::mutex> lock(config.session_mutex);
+    config.session_active = false;
+    config.session_token.clear();
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    config.session_active = true;
+    config.session_token = generateSessionToken();
+    return true;
+}
+Json::Value device_get_status(const std::map<std::string, std::string>& filters) {
+    Json::Value out = config.device_status;
+    if (!filters.empty()) {
+        // Simulate filtering
+        Json::Value filtered = Json::objectValue;
+        for (const auto& kv : filters) {
+            if (out.isMember(kv.first)) filtered[kv.first] = out[kv.first];
+        }
+        return filtered;
+    }
+    return out;
+}
+Json::Value device_get_config(const std::map<std::string, std::string>& filters) {
+    Json::Value out = config.device_config;
+    if (!filters.empty()) {
+        Json::Value filtered = Json::objectValue;
+        for (const auto& kv : filters) {
+            if (out.isMember(kv.first)) filtered[kv.first] = out[kv.first];
+        }
+        return filtered;
+    }
+    return out;
+}
+bool device_set_config(const Json::Value& changes) {
+    for (const auto& key : changes.getMemberNames()) {
+        config.device_config[key] = changes[key];
+    }
+    return true;
+}
+bool device_decode_control(const std::string& action, const Json::Value& params) {
+    if (action == "start") {
+        config.device_status["sdk_state"] = "decoding";
+    } else if (action == "stop") {
+        config.device_status["sdk_state"] = "idle";
+    } else {
+        return false;
+    }
+    return true;
+}
+bool device_playback_control(const Json::Value& params) {
+    // Simulate parameter parsing
+    if (params.isMember("action")) {
+        std::string action = params["action"].asString();
+        if (action == "start") {
+            config.device_status["playback"] = "playing";
+        } else if (action == "stop") {
+            config.device_status["playback"] = "stopped";
         }
     }
-    return m;
+    return true;
 }
 
-// =========== API Handler Functions =========================
-
+// --- HTTP Route Handlers ---
 HttpResponse handle_login(const HttpRequest& req) {
-    auto params = json_to_map(req.body);
-    std::string user = params["username"];
-    std::string pass = params["password"];
+    HttpResponse resp;
+    resp.contentType = "application/json";
+    Json::Value body;
+    Json::CharReaderBuilder builder;
+    Json::Value payload;
+    std::string errs;
+    if (!Json::parseFromStream(builder, std::istringstream(req.body), &payload, &errs)) {
+        resp.status = 400; resp.statusText = getStatusText(400);
+        body["error"] = "Invalid JSON";
+        resp.body = Json::writeString(Json::StreamWriterBuilder(), body);
+        return resp;
+    }
+    std::string user = payload.get("username", "").asString();
+    std::string pass = payload.get("password", "").asString();
     std::string token;
-    if (sdk_login(user, pass, token)) {
-        return {200, "application/json", "{\"token\":\"" + token + "\"}", {}};
+    if (device_login(user, pass, token)) {
+        resp.status = 200; resp.statusText = getStatusText(200);
+        body["token"] = token;
+    } else {
+        resp.status = 401; resp.statusText = getStatusText(401);
+        body["error"] = "Authentication failed";
     }
-    return {401, "application/json", "{\"error\":\"Invalid credentials\"}", {}};
+    resp.body = Json::writeString(Json::StreamWriterBuilder(), body);
+    return resp;
 }
-
 HttpResponse handle_logout(const HttpRequest& req) {
-    auto it = req.headers.find("Authorization");
-    if (it == req.headers.end()) {
-        return {401, "application/json", "{\"error\":\"Missing token\"}", {}};
+    HttpResponse resp;
+    resp.contentType = "application/json";
+    if (!checkAuthToken(req)) {
+        resp.status = 401; resp.statusText = getStatusText(401);
+        resp.body = "{\"error\":\"Invalid or missing token\"}";
+        return resp;
     }
-    std::string token = it->second;
-    if (sdk_logout(token)) {
-        return {200, "application/json", "{\"result\":\"Logged out\"}", {}};
-    }
-    return {401, "application/json", "{\"error\":\"Invalid token\"}", {}};
+    device_logout();
+    resp.status = 200; resp.statusText = getStatusText(200);
+    resp.body = "{\"status\":\"logged out\"}";
+    return resp;
 }
-
 HttpResponse handle_status(const HttpRequest& req) {
-    auto it = req.headers.find("Authorization");
-    if (it == req.headers.end()) {
-        return {401, "application/json", "{\"error\":\"Missing token\"}", {}};
+    HttpResponse resp;
+    resp.contentType = "application/json";
+    if (!checkAuthToken(req)) {
+        resp.status = 401; resp.statusText = getStatusText(401);
+        resp.body = "{\"error\":\"Unauthorized\"}";
+        return resp;
     }
-    DeviceStatus st;
-    if (sdk_get_status(it->second, st)) {
-        return {200, "application/json", status_to_json(st), {}};
+    // Parse query params for filtering
+    std::map<std::string, std::string> filters;
+    if (!req.query.empty()) {
+        auto kvs = split(req.query, '&');
+        for (const auto& kv : kvs) {
+            auto sep = kv.find('=');
+            if (sep != std::string::npos) filters[urlDecode(kv.substr(0, sep))] = urlDecode(kv.substr(sep + 1));
+        }
     }
-    return {401, "application/json", "{\"error\":\"Invalid token\"}", {}};
+    Json::Value status = device_get_status(filters);
+    resp.status = 200; resp.statusText = getStatusText(200);
+    resp.body = Json::writeString(Json::StreamWriterBuilder(), status);
+    return resp;
 }
-
-HttpResponse handle_get_config(const HttpRequest& req) {
-    auto it = req.headers.find("Authorization");
-    if (it == req.headers.end()) {
-        return {401, "application/json", "{\"error\":\"Missing token\"}", {}};
+HttpResponse handle_config_get(const HttpRequest& req) {
+    HttpResponse resp;
+    resp.contentType = "application/json";
+    if (!checkAuthToken(req)) {
+        resp.status = 401; resp.statusText = getStatusText(401);
+        resp.body = "{\"error\":\"Unauthorized\"}";
+        return resp;
     }
-    DeviceConfig cfg;
-    if (sdk_get_config(it->second, cfg)) {
-        return {200, "application/json", config_to_json(cfg), {}};
+    std::map<std::string, std::string> filters;
+    if (!req.query.empty()) {
+        auto kvs = split(req.query, '&');
+        for (const auto& kv : kvs) {
+            auto sep = kv.find('=');
+            if (sep != std::string::npos) filters[urlDecode(kv.substr(0, sep))] = urlDecode(kv.substr(sep + 1));
+        }
     }
-    return {401, "application/json", "{\"error\":\"Invalid token\"}", {}};
+    Json::Value configJson = device_get_config(filters);
+    resp.status = 200; resp.statusText = getStatusText(200);
+    resp.body = Json::writeString(Json::StreamWriterBuilder(), configJson);
+    return resp;
 }
-
-HttpResponse handle_put_config(const HttpRequest& req) {
-    auto it = req.headers.find("Authorization");
-    if (it == req.headers.end()) {
-        return {401, "application/json", "{\"error\":\"Missing token\"}", {}};
+HttpResponse handle_config_put(const HttpRequest& req) {
+    HttpResponse resp;
+    resp.contentType = "application/json";
+    if (!checkAuthToken(req)) {
+        resp.status = 401; resp.statusText = getStatusText(401);
+        resp.body = "{\"error\":\"Unauthorized\"}";
+        return resp;
     }
-    auto params = json_to_map(req.body);
-    DeviceConfig cfg;
-    cfg.decoder_channels = params.count("decoder_channels") ? params["decoder_channels"] : device_config.decoder_channels;
-    cfg.loop_decode = params.count("loop_decode") ? params["loop_decode"] : device_config.loop_decode;
-    cfg.scene = params.count("scene") ? params["scene"] : device_config.scene;
-    if (sdk_update_config(it->second, cfg)) {
-        return {200, "application/json", "{\"result\":\"Config updated\"}", {}};
+    Json::Value changes;
+    Json::CharReaderBuilder builder;
+    std::string errs;
+    if (!Json::parseFromStream(builder, std::istringstream(req.body), &changes, &errs)) {
+        resp.status = 400; resp.statusText = getStatusText(400);
+        resp.body = "{\"error\":\"Invalid JSON\"}";
+        return resp;
     }
-    return {401, "application/json", "{\"error\":\"Invalid token\"}", {}};
+    if (device_set_config(changes)) {
+        resp.status = 200; resp.statusText = getStatusText(200);
+        resp.body = "{\"status\":\"config updated\"}";
+    } else {
+        resp.status = 500; resp.statusText = getStatusText(500);
+        resp.body = "{\"error\":\"Config update failed\"}";
+    }
+    return resp;
 }
-
 HttpResponse handle_decode(const HttpRequest& req) {
-    auto it = req.headers.find("Authorization");
-    if (it == req.headers.end()) {
-        return {401, "application/json", "{\"error\":\"Missing token\"}", {}};
+    HttpResponse resp;
+    resp.contentType = "application/json";
+    if (!checkAuthToken(req)) {
+        resp.status = 401; resp.statusText = getStatusText(401);
+        resp.body = "{\"error\":\"Unauthorized\"}";
+        return resp;
     }
-    auto params = json_to_map(req.body);
-    std::string action = params.count("action") ? params["action"] : "";
-    std::string channel = params.count("channel") ? params["channel"] : "1";
-    std::string mode = params.count("mode") ? params["mode"] : "active";
-    if (action != "start" && action != "stop") {
-        return {400, "application/json", "{\"error\":\"Invalid action\"}", {}};
+    Json::Value payload;
+    Json::CharReaderBuilder builder;
+    std::string errs;
+    if (!Json::parseFromStream(builder, std::istringstream(req.body), &payload, &errs)) {
+        resp.status = 400; resp.statusText = getStatusText(400);
+        resp.body = "{\"error\":\"Invalid JSON\"}";
+        return resp;
     }
-    if (sdk_control_decode(it->second, action, channel, mode)) {
-        return {200, "application/json", "{\"result\":\"" + action + "ed\"}", {}};
-    }
-    return {401, "application/json", "{\"error\":\"Invalid token or operation\"}", {}};
-}
-
-HttpResponse handle_reboot(const HttpRequest& req) {
-    auto it = req.headers.find("Authorization");
-    if (it == req.headers.end()) {
-        return {401, "application/json", "{\"error\":\"Missing token\"}", {}};
-    }
-    if (sdk_reboot(it->second)) {
-        return {200, "application/json", "{\"result\":\"Device rebooted\"}", {}};
-    }
-    return {401, "application/json", "{\"error\":\"Invalid token or operation\"}", {}};
-}
-
-HttpResponse handle_playback(const HttpRequest& req) {
-    auto it = req.headers.find("Authorization");
-    if (it == req.headers.end()) {
-        return {401, "application/json", "{\"error\":\"Missing token\"}", {}};
-    }
-    auto params = json_to_map(req.body);
-    std::string action = params.count("action") ? params["action"] : "";
-    std::string channel = params.count("channel") ? params["channel"] : "1";
-    std::string speed = params.count("speed") ? params["speed"] : "1x";
+    std::string action = payload.get("action", "").asString();
     if (action.empty()) {
-        return {400, "application/json", "{\"error\":\"Missing action param\"}", {}};
+        resp.status = 400; resp.statusText = getStatusText(400);
+        resp.body = "{\"error\":\"Missing 'action' field\"}";
+        return resp;
     }
-    if (sdk_playback(it->second, action, channel, speed)) {
-        return {200, "application/json", "{\"result\":\"Playback " + action + "\"}", {}};
+    if (device_decode_control(action, payload)) {
+        resp.status = 200; resp.statusText = getStatusText(200);
+        resp.body = "{\"status\":\"decode " + action + "\"}";
+    } else {
+        resp.status = 400; resp.statusText = getStatusText(400);
+        resp.body = "{\"error\":\"Invalid decode action\"}";
     }
-    return {401, "application/json", "{\"error\":\"Invalid token or operation\"}", {}};
+    return resp;
+}
+HttpResponse handle_playback(const HttpRequest& req) {
+    HttpResponse resp;
+    resp.contentType = "application/json";
+    if (!checkAuthToken(req)) {
+        resp.status = 401; resp.statusText = getStatusText(401);
+        resp.body = "{\"error\":\"Unauthorized\"}";
+        return resp;
+    }
+    Json::Value payload;
+    Json::CharReaderBuilder builder;
+    std::string errs;
+    if (!Json::parseFromStream(builder, std::istringstream(req.body), &payload, &errs)) {
+        resp.status = 400; resp.statusText = getStatusText(400);
+        resp.body = "{\"error\":\"Invalid JSON\"}";
+        return resp;
+    }
+    if (device_playback_control(payload)) {
+        resp.status = 200; resp.statusText = getStatusText(200);
+        resp.body = "{\"status\":\"playback updated\"}";
+    } else {
+        resp.status = 500; resp.statusText = getStatusText(500);
+        resp.body = "{\"error\":\"Playback control failed\"}";
+    }
+    return resp;
+}
+HttpResponse handle_reboot(const HttpRequest& req) {
+    HttpResponse resp;
+    resp.contentType = "application/json";
+    if (!checkAuthToken(req)) {
+        resp.status = 401; resp.statusText = getStatusText(401);
+        resp.body = "{\"error\":\"Unauthorized\"}";
+        return resp;
+    }
+    if (device_reboot()) {
+        resp.status = 200; resp.statusText = getStatusText(200);
+        resp.body = "{\"status\":\"device rebooted\"}";
+    } else {
+        resp.status = 500; resp.statusText = getStatusText(500);
+        resp.body = "{\"error\":\"Device reboot failed\"}";
+    }
+    return resp;
 }
 
-// =========== Request Router =========================
-
-HttpResponse route_request(const HttpRequest& req) {
-    if (req.method == "POST" && req.path == "/login") return handle_login(req);
-    if (req.method == "POST" && req.path == "/logout") return handle_logout(req);
-    if (req.method == "GET" && req.path == "/status") return handle_status(req);
-    if (req.method == "POST" && req.path == "/decode") return handle_decode(req);
-    if (req.method == "PUT" && req.path == "/config") return handle_put_config(req);
-    if (req.method == "GET" && req.path == "/config") return handle_get_config(req);
-    if (req.method == "POST" && req.path == "/reboot") return handle_reboot(req);
-    if (req.method == "POST" && req.path == "/playback") return handle_playback(req);
-    return {404, "application/json", "{\"error\":\"Not found\"}", {}};
+// --- HTTP Router ---
+HttpResponse route(const HttpRequest& req) {
+    if (req.path == "/login" && req.method == "POST") {
+        return handle_login(req);
+    }
+    if ((req.path == "/logout") && req.method == "POST") {
+        return handle_logout(req);
+    }
+    if ((req.path == "/status") && req.method == "GET") {
+        return handle_status(req);
+    }
+    if ((req.path == "/config") && req.method == "GET") {
+        return handle_config_get(req);
+    }
+    if ((req.path == "/config") && req.method == "PUT") {
+        return handle_config_put(req);
+    }
+    if ((req.path == "/decode") && req.method == "POST") {
+        return handle_decode(req);
+    }
+    if ((req.path == "/playback") && req.method == "POST") {
+        return handle_playback(req);
+    }
+    if ((req.path == "/reboot") && req.method == "POST") {
+        return handle_reboot(req);
+    }
+    // 404
+    HttpResponse resp;
+    resp.status = 404; resp.statusText = getStatusText(404);
+    resp.contentType = "application/json";
+    resp.body = "{\"error\":\"Endpoint not found\"}";
+    return resp;
 }
 
-// =========== HTTP Server Main ======================
-
-int create_server_socket(const std::string& host, int port) {
+// --- HTTP Server ---
+void http_server() {
 #ifdef _WIN32
     WSADATA wsaData;
     WSAStartup(MAKEWORD(2,2), &wsaData);
 #endif
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
-        throw std::runtime_error("socket failed");
+        std::cerr << "Socket creation failed.\n";
+        exit(1);
     }
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
-    sockaddr_in address;
-    memset(&address, 0, sizeof(address));
-    address.sin_family = AF_INET;
-    if (host == "0.0.0.0") {
-        address.sin_addr.s_addr = INADDR_ANY;
-    } else {
-        address.sin_addr.s_addr = inet_addr(host.c_str());
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(config.http_port);
+    addr.sin_addr.s_addr = inet_addr(config.http_host.c_str());
+    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        std::cerr << "Bind failed.\n";
+        exit(1);
     }
-    address.sin_port = htons(port);
-
-    if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
-        throw std::runtime_error("bind failed");
-    }
-    if (listen(server_fd, 10) < 0) {
-        throw std::runtime_error("listen failed");
-    }
-    return server_fd;
-}
-
-void handle_client(int client_fd) {
-    char buffer[8192];
-    int read_bytes = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
-    if (read_bytes <= 0) {
-#ifdef _WIN32
-        closesocket(client_fd);
-#else
-        close(client_fd);
-#endif
-        return;
-    }
-    buffer[read_bytes] = 0;
-    std::string request_str(buffer);
-    auto req = parse_http_request(request_str);
-    auto resp = route_request(req);
-    std::string resp_str = http_response_to_string(resp);
-    send(client_fd, resp_str.c_str(), resp_str.size(), 0);
-#ifdef _WIN32
-    closesocket(client_fd);
-#else
-    close(client_fd);
-#endif
-}
-
-int main() {
-    // ==== Environment Variables for configuration ====
-    const char* device_ip = getenv("DEVICE_IP");
-    const char* http_host = getenv("HTTP_SERVER_HOST");
-    const char* http_port = getenv("HTTP_SERVER_PORT");
-    std::string host = http_host ? http_host : "0.0.0.0";
-    int port = http_port ? std::atoi(http_port) : 8080;
-
-    int server_fd = create_server_socket(host, port);
-    std::cout << "HTTP server running on " << host << ":" << port << std::endl;
-
-    while (1) {
-        sockaddr_in client_addr;
-        socklen_t addrlen = sizeof(client_addr);
-        int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &addrlen);
+    listen(server_fd, 10);
+    std::cout << "HTTP server listening on " << config.http_host << ":" << config.http_port << "\n";
+    while (true) {
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
         if (client_fd < 0) continue;
-        std::thread(handle_client, client_fd).detach();
+        std::thread([client_fd]() {
+            char buffer[8192];
+            int len = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+            if (len <= 0) {
+#ifdef _WIN32
+                closesocket(client_fd);
+#else
+                close(client_fd);
+#endif
+                return;
+            }
+            buffer[len] = 0;
+            HttpRequest req = parseHttpRequest(buffer);
+            HttpResponse resp = route(req);
+            std::string out = makeHttpResponse(resp);
+            send(client_fd, out.c_str(), out.size(), 0);
+#ifdef _WIN32
+            closesocket(client_fd);
+#else
+            close(client_fd);
+#endif
+        }).detach();
     }
 #ifdef _WIN32
     WSACleanup();
 #endif
+}
+
+// --- Main ---
+int main() {
+    http_server();
     return 0;
 }
