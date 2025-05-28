@@ -1,332 +1,371 @@
-```cpp
-#include <iostream>
-#include <string>
 #include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
 #include <map>
 #include <mutex>
 #include <thread>
-#include <vector>
 #include <fstream>
 #include <sstream>
 #include <ctime>
-#include <cstring>
-#include <nlohmann/json.hpp>
-#include <httplib.h>
+#include <algorithm>
+#include <iostream>
+#include <cstdio>
+#include <json/json.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#pragma comment(lib,"ws2_32.lib")
+#else
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#endif
 
-// For demonstration, HCNetSDK is not included. In real implementation, include HCNetSDK.h and link with the SDK.
-using json = nlohmann::json;
-
-// Configuration via environment variables
-struct Config {
-    std::string device_ip;
-    int device_port;
-    std::string device_user;
-    std::string device_password;
-    int http_port;
-    std::string http_host;
-
-    static Config from_env() {
-        Config cfg;
-        cfg.device_ip = getenv("DEVICE_IP") ? getenv("DEVICE_IP") : "192.168.1.100";
-        cfg.device_port = getenv("DEVICE_PORT") ? std::stoi(getenv("DEVICE_PORT")) : 8000;
-        cfg.device_user = getenv("DEVICE_USER") ? getenv("DEVICE_USER") : "admin";
-        cfg.device_password = getenv("DEVICE_PASSWORD") ? getenv("DEVICE_PASSWORD") : "12345";
-        cfg.http_host = getenv("HTTP_HOST") ? getenv("HTTP_HOST") : "0.0.0.0";
-        cfg.http_port = getenv("HTTP_PORT") ? std::stoi(getenv("HTTP_PORT")) : 8080;
-        return cfg;
-    }
-};
-
-// ---- Device SDK Abstraction (Simulated) ----
-class DeviceSession {
-public:
-    std::string token;
-    bool logged_in = false;
-    std::mutex mtx;
-    std::map<std::string, json> configs;
-    json status;
-    DeviceSession() {
-        // Simulate some configs and status
-        configs["channel"] = json::parse(R"({"channels":[{"id":1,"enabled":true},{"id":2,"enabled":false}]})");
-        configs["display"] = json::parse(R"({"resolution":"1920x1080","layout":"2x2"})");
-        status = json::parse(R"({"error_code":0,"alarm_state":"none","network":{"ip":"192.168.1.100","mac":"AA:BB:CC:DD:EE:FF"},"health":"ok"})");
-    }
-
-    bool login(const std::string& user, const std::string& pwd) {
-        std::lock_guard<std::mutex> lock(mtx);
-        if(user=="admin" && pwd=="12345") {
-            logged_in = true;
-            token = std::to_string(std::time(nullptr));
+// Mocked Device SDK API for demonstration (replace with real SDK in production)
+namespace DeviceSDK {
+    struct Session {
+        std::string token;
+        bool loggedIn;
+        Session(): loggedIn(false) {}
+    };
+    static Session deviceSession;
+    static std::mutex sdkMutex;
+    bool login(const std::string& user, const std::string& pass, std::string& token) {
+        std::lock_guard<std::mutex> lock(sdkMutex);
+        if (user=="admin" && pass=="12345") {
+            token = "SESSION_" + std::to_string(std::time(nullptr));
+            deviceSession.token = token;
+            deviceSession.loggedIn = true;
             return true;
         }
         return false;
     }
-    void logout() {
-        std::lock_guard<std::mutex> lock(mtx);
-        logged_in = false;
-        token.clear();
-    }
-    bool is_logged_in(const std::string& t) {
-        std::lock_guard<std::mutex> lock(mtx);
-        return logged_in && t == token;
-    }
-    json get_config(const std::string& type) {
-        std::lock_guard<std::mutex> lock(mtx);
-        if(configs.count(type)) return configs[type];
-        return json::object();
-    }
-    void set_config(const std::string& type, const json& val) {
-        std::lock_guard<std::mutex> lock(mtx);
-        configs[type] = val;
-    }
-    json get_status() {
-        std::lock_guard<std::mutex> lock(mtx);
-        return status;
-    }
-    void set_status(const json& val) {
-        std::lock_guard<std::mutex> lock(mtx);
-        status = val;
-    }
-    // Simulate decode, upgrade, reboot, etc.
-    bool decode(const std::string& action, const std::string& mode) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        return action=="start" || action=="stop";
-    }
-    bool upgrade(const json& params) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        status["upgrade"] = "completed";
-        return true;
-    }
-    bool reboot(const std::string& action) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        status["health"] = "rebooted";
-        return true;
-    }
-};
-
-// ---- HTTP Server Implementation ----
-class DriverServer {
-    Config config;
-    DeviceSession device;
-    httplib::Server server;
-    std::mutex session_mtx;
-
-    // --- Helper Methods ---
-    std::string get_token(const httplib::Request& req) {
-        if (req.has_header("Authorization")) {
-            std::string auth = req.get_header_value("Authorization");
-            if (auth.substr(0, 7) == "Bearer ") return auth.substr(7);
+    bool logout(const std::string& token) {
+        std::lock_guard<std::mutex> lock(sdkMutex);
+        if (deviceSession.token == token) {
+            deviceSession.loggedIn = false;
+            deviceSession.token = "";
+            return true;
         }
-        if (req.has_param("token")) return req.get_param_value("token");
-        return "";
+        return false;
     }
-    bool check_auth(const httplib::Request& req, httplib::Response& res) {
-        std::string token = get_token(req);
-        if (!device.is_logged_in(token)) {
-            res.status = 401;
-            res.set_header("Content-Type", "application/json");
-            res.body = R"({"error":"Unauthorized","code":401})";
-            return false;
-        }
+    bool getStatus(Json::Value& status) {
+        std::lock_guard<std::mutex> lock(sdkMutex);
+        status["device"] = "DS_64XXHD_S";
+        status["error_code"] = 0;
+        status["alarm"] = false;
+        status["network"] = "192.168.1.100";
+        status["health"] = "OK";
         return true;
     }
-    // --- HTTP Handlers ---
-    void handle_login(const httplib::Request& req, httplib::Response& res) {
-        try {
-            json j = json::parse(req.body);
-            std::string user = j.value("username", "");
-            std::string pwd = j.value("password", "");
-            if(device.login(user, pwd)) {
-                json resp = {{"token", device.token}};
-                res.status = 200;
-                res.set_header("Content-Type", "application/json");
-                res.body = resp.dump();
+    bool getConfig(const std::string& type, Json::Value& config) {
+        std::lock_guard<std::mutex> lock(sdkMutex);
+        config["type"] = type;
+        if (type == "display") config["display_mode"] = "split_4";
+        else if (type == "channel") config["channels"] = 16;
+        else config["info"] = "default";
+        return true;
+    }
+    bool setConfig(const std::string& type, const Json::Value& cfg) {
+        std::lock_guard<std::mutex> lock(sdkMutex);
+        return true;
+    }
+    bool decodeControl(const std::string& action, const std::string& mode) {
+        std::lock_guard<std::mutex> lock(sdkMutex);
+        return action == "start" || action == "stop";
+    }
+    bool reboot(const std::string& op) {
+        std::lock_guard<std::mutex> lock(sdkMutex);
+        return op == "reboot" || op == "shutdown";
+    }
+    bool upgrade(const Json::Value& params) {
+        std::lock_guard<std::mutex> lock(sdkMutex);
+        return params.isMember("firmware");
+    }
+}
+
+// Simple HTTP Server Implementation
+class HttpServer {
+public:
+    HttpServer(const std::string& host, int port)
+        : host_(host), port_(port), running_(false) {}
+    void start() {
+        running_ = true;
+        serverThread_ = std::thread([this]() { this->run(); });
+    }
+    void stop() {
+        running_ = false;
+#ifdef _WIN32
+        closesocket(serverSock_);
+        WSACleanup();
+#else
+        close(serverSock_);
+#endif
+        if (serverThread_.joinable()) serverThread_.join();
+    }
+    ~HttpServer() { stop(); }
+private:
+    std::string host_;
+    int port_;
+    volatile bool running_;
+    int serverSock_;
+    std::thread serverThread_;
+
+    static void sendResponse(int clientSock, int code, const std::string& contentType, const std::string& body) {
+        std::ostringstream oss;
+        oss << "HTTP/1.1 " << code << " "
+            << (code==200?"OK":(code==201?"Created":(code==400?"Bad Request":(code==401?"Unauthorized":(code==404?"Not Found":"Error")))))
+            << "\r\nContent-Type: " << contentType << "\r\nContent-Length: " << body.size()
+            << "\r\nAccess-Control-Allow-Origin: *\r\n\r\n" << body;
+#ifdef _WIN32
+        send(clientSock, oss.str().c_str(), (int)oss.str().size(), 0);
+        closesocket(clientSock);
+#else
+        send(clientSock, oss.str().c_str(), oss.str().size(), 0);
+        close(clientSock);
+#endif
+    }
+    static std::string urlDecode(const std::string& src) {
+        std::string ret;
+        char ch;
+        int i, ii;
+        for (i = 0; i < src.length(); ++i) {
+            if (int(src[i]) == 37) {
+                sscanf(src.substr(i + 1, 2).c_str(), "%x", &ii);
+                ch = static_cast<char>(ii);
+                ret += ch;
+                i = i + 2;
             } else {
-                res.status = 401;
-                res.set_header("Content-Type", "application/json");
-                res.body = R"({"error":"Invalid credentials"})";
+                ret += src[i];
             }
-        } catch (...) {
-            res.status = 400;
-            res.set_header("Content-Type", "application/json");
-            res.body = R"({"error":"Invalid request body"})";
         }
+        return ret;
     }
-    void handle_logout(const httplib::Request& req, httplib::Response& res) {
-        if(!check_auth(req,res)) return;
-        device.logout();
-        res.status = 200;
-        res.set_header("Content-Type", "application/json");
-        res.body = R"({"result":"Logged out"})";
+    static std::map<std::string, std::string> parseQuery(const std::string& query) {
+        std::map<std::string, std::string> params;
+        std::istringstream ss(query);
+        std::string item;
+        while (std::getline(ss, item, '&')) {
+            auto eq = item.find('=');
+            if (eq != std::string::npos) {
+                params[item.substr(0, eq)] = urlDecode(item.substr(eq+1));
+            }
+        }
+        return params;
     }
-    void handle_get_config(const httplib::Request& req, httplib::Response& res) {
-        if(!check_auth(req,res)) return;
-        std::string type = req.has_param("type") ? req.get_param_value("type") : "channel";
-        json cfg = device.get_config(type);
-        if(cfg.empty()) {
-            res.status = 404;
-            res.set_header("Content-Type", "application/json");
-            res.body = R"({"error":"Config type not found"})";
+    static bool parseRequest(int clientSock, std::string& method, std::string& path, std::string& query,
+                             std::map<std::string, std::string>& headers, std::string& body) {
+        char buffer[4096];
+        int received = 0;
+        std::string request;
+        while ((received = recv(clientSock, buffer, sizeof(buffer), 0)) > 0) {
+            request.append(buffer, received);
+            if (request.find("\r\n\r\n") != std::string::npos) break;
+        }
+        if (request.empty()) return false;
+        // Parse request line
+        auto firstLineEnd = request.find("\r\n");
+        if (firstLineEnd == std::string::npos) return false;
+        auto firstLine = request.substr(0, firstLineEnd);
+        std::istringstream fls(firstLine);
+        fls >> method;
+        std::string fullPath;
+        fls >> fullPath;
+        auto qm = fullPath.find('?');
+        if (qm != std::string::npos) {
+            path = fullPath.substr(0, qm);
+            query = fullPath.substr(qm+1);
         } else {
-            res.status = 200;
-            res.set_header("Content-Type", "application/json");
-            res.body = cfg.dump();
+            path = fullPath;
+            query = "";
         }
+        // Parse headers
+        size_t pos = firstLineEnd+2;
+        while (true) {
+            auto lineEnd = request.find("\r\n", pos);
+            if (lineEnd == std::string::npos || lineEnd == pos) break;
+            auto line = request.substr(pos, lineEnd-pos);
+            auto colon = line.find(':');
+            if (colon != std::string::npos) {
+                auto key = line.substr(0, colon);
+                auto value = line.substr(colon+1);
+                while (!value.empty() && value.front()==' ') value.erase(0,1);
+                headers[key] = value;
+            }
+            pos = lineEnd+2;
+        }
+        // Parse body
+        auto bodyPos = request.find("\r\n\r\n");
+        if (bodyPos != std::string::npos) {
+            body = request.substr(bodyPos+4);
+            // If Content-Length, read more if needed
+            auto it = headers.find("Content-Length");
+            if (it != headers.end()) {
+                int contentLen = std::stoi(it->second);
+                while ((int)body.size() < contentLen) {
+                    received = recv(clientSock, buffer, sizeof(buffer), 0);
+                    if (received <= 0) break;
+                    body.append(buffer, received);
+                }
+            }
+        }
+        return true;
     }
-    void handle_put_config(const httplib::Request& req, httplib::Response& res) {
-        if(!check_auth(req,res)) return;
-        std::string type = req.has_param("type") ? req.get_param_value("type") : "";
-        if(type.empty()) {
-            res.status = 400;
-            res.set_header("Content-Type", "application/json");
-            res.body = R"({"error":"Config type required"})";
+    void handleRequest(int clientSock) {
+        std::string method, path, query, body;
+        std::map<std::string, std::string> headers;
+        if (!parseRequest(clientSock, method, path, query, headers, body)) {
+            sendResponse(clientSock, 400, "application/json", "{\"error\":\"Bad Request\"}");
             return;
         }
-        try {
-            json j = json::parse(req.body);
-            device.set_config(type, j);
-            res.status = 200;
-            res.set_header("Content-Type", "application/json");
-            res.body = R"({"result":"Config updated"})";
-        } catch (...) {
-            res.status = 400;
-            res.set_header("Content-Type", "application/json");
-            res.body = R"({"error":"Invalid request body"})";
-        }
-    }
-    void handle_decode(const httplib::Request& req, httplib::Response& res) {
-        if(!check_auth(req,res)) return;
-        try {
-            json j = json::parse(req.body);
-            std::string action = j.value("action", "");
-            std::string mode = j.value("mode", "");
-            if(action.empty() || mode.empty()) {
-                res.status = 400;
-                res.set_header("Content-Type", "application/json");
-                res.body = R"({"error":"Missing action or mode"})";
+        std::map<std::string, std::string> qparams = parseQuery(query);
+        // Routing
+        if (path == "/login" && method == "POST") {
+            Json::Value req;
+            Json::Reader reader;
+            if (!reader.parse(body, req) || !req.isMember("username") || !req.isMember("password")) {
+                sendResponse(clientSock, 400, "application/json", "{\"error\":\"Missing credentials\"}");
                 return;
             }
-            bool ok = device.decode(action, mode);
-            if(ok) {
-                res.status = 200;
-                res.set_header("Content-Type", "application/json");
-                res.body = R"({"result":"Decode command accepted"})";
+            std::string token;
+            if (DeviceSDK::login(req["username"].asString(), req["password"].asString(), token)) {
+                Json::Value resp;
+                resp["session_token"] = token;
+                sendResponse(clientSock, 200, "application/json", Json::FastWriter().write(resp));
             } else {
-                res.status = 400;
-                res.set_header("Content-Type", "application/json");
-                res.body = R"({"error":"Invalid decode command"})";
+                sendResponse(clientSock, 401, "application/json", "{\"error\":\"Authentication failed\"}");
             }
-        } catch (...) {
-            res.status = 400;
-            res.set_header("Content-Type", "application/json");
-            res.body = R"({"error":"Invalid request body"})";
         }
-    }
-    void handle_reboot(const httplib::Request& req, httplib::Response& res) {
-        if(!check_auth(req,res)) return;
-        try {
-            std::string action = "reboot";
-            if(!req.body.empty()) {
-                json j = json::parse(req.body);
-                action = j.value("action", "reboot");
+        else if (path == "/logout" && method == "POST") {
+            Json::Value req;
+            Json::Reader reader;
+            if (!reader.parse(body, req) || !req.isMember("session_token")) {
+                sendResponse(clientSock, 400, "application/json", "{\"error\":\"Missing session token\"}");
+                return;
             }
-            if(action!="reboot" && action!="shutdown") action="reboot";
-            bool ok = device.reboot(action);
-            if(ok) {
-                res.status = 200;
-                res.set_header("Content-Type", "application/json");
-                res.body = R"({"result":"Device ")+action+R"("})";
+            if (DeviceSDK::logout(req["session_token"].asString())) {
+                sendResponse(clientSock, 200, "application/json", "{\"message\":\"Logged out\"}");
             } else {
-                res.status = 500;
-                res.set_header("Content-Type", "application/json");
-                res.body = R"({"error":"Failed to execute command"})";
+                sendResponse(clientSock, 401, "application/json", "{\"error\":\"Invalid session token\"}");
             }
-        } catch (...) {
-            res.status = 400;
-            res.set_header("Content-Type", "application/json");
-            res.body = R"({"error":"Invalid request body"})";
         }
-    }
-    void handle_upgrade(const httplib::Request& req, httplib::Response& res) {
-        if(!check_auth(req,res)) return;
-        try {
-            json j = json::parse(req.body);
-            bool ok = device.upgrade(j);
-            if(ok) {
-                res.status = 200;
-                res.set_header("Content-Type", "application/json");
-                res.body = R"({"result":"Upgrade started"})";
+        else if (path == "/status" && method == "GET") {
+            Json::Value status;
+            if (DeviceSDK::getStatus(status)) {
+                sendResponse(clientSock, 200, "application/json", Json::FastWriter().write(status));
             } else {
-                res.status = 500;
-                res.set_header("Content-Type", "application/json");
-                res.body = R"({"error":"Upgrade failed"})";
+                sendResponse(clientSock, 500, "application/json", "{\"error\":\"Unable to get status\"}");
             }
-        } catch (...) {
-            res.status = 400;
-            res.set_header("Content-Type", "application/json");
-            res.body = R"({"error":"Invalid request body"})";
         }
-    }
-    void handle_status(const httplib::Request& req, httplib::Response& res) {
-        if(!check_auth(req,res)) return;
-        json s = device.get_status();
-        res.status = 200;
-        res.set_header("Content-Type", "application/json");
-        res.body = s.dump();
-    }
-
-public:
-    DriverServer(const Config& cfg) : config(cfg) {
-        // RESTful mappings
-        server.Post("/login", [&](const httplib::Request& req, httplib::Response& res) { handle_login(req, res); });
-        server.Post("/logout", [&](const httplib::Request& req, httplib::Response& res) { handle_logout(req, res); });
-        server.Get("/config", [&](const httplib::Request& req, httplib::Response& res) { handle_get_config(req, res); });
-        server.Put("/config", [&](const httplib::Request& req, httplib::Response& res) { handle_put_config(req, res); });
-        server.Post("/decode", [&](const httplib::Request& req, httplib::Response& res) { handle_decode(req, res); });
-        server.Post("/reboot", [&](const httplib::Request& req, httplib::Response& res) { handle_reboot(req, res); });
-        server.Post("/upgrade", [&](const httplib::Request& req, httplib::Response& res) { handle_upgrade(req, res); });
-        server.Get("/status", [&](const httplib::Request& req, httplib::Response& res) { handle_status(req, res); });
-        // 404 fallback
-        server.set_not_found_handler([](const httplib::Request&, httplib::Response& res) {
-            res.status = 404;
-            res.set_header("Content-Type", "application/json");
-            res.body = R"({"error":"Not found"})";
-        });
+        else if (path == "/config" && method == "GET") {
+            std::string type = qparams.count("type")?qparams["type"]:"";
+            Json::Value config;
+            if (DeviceSDK::getConfig(type, config)) {
+                sendResponse(clientSock, 200, "application/json", Json::FastWriter().write(config));
+            } else {
+                sendResponse(clientSock, 500, "application/json", "{\"error\":\"Unable to get config\"}");
+            }
+        }
+        else if (path == "/config" && method == "PUT") {
+            std::string type = qparams.count("type")?qparams["type"]:"";
+            Json::Value req;
+            Json::Reader reader;
+            if (!reader.parse(body, req)) {
+                sendResponse(clientSock, 400, "application/json", "{\"error\":\"Invalid JSON payload\"}");
+                return;
+            }
+            if (DeviceSDK::setConfig(type, req)) {
+                sendResponse(clientSock, 200, "application/json", "{\"message\":\"Config updated\"}");
+            } else {
+                sendResponse(clientSock, 500, "application/json", "{\"error\":\"Unable to update config\"}");
+            }
+        }
+        else if (path == "/decode" && method == "POST") {
+            Json::Value req;
+            Json::Reader reader;
+            if (!reader.parse(body, req) || !req.isMember("action") || !req.isMember("mode")) {
+                sendResponse(clientSock, 400, "application/json", "{\"error\":\"Missing action or mode\"}");
+                return;
+            }
+            if (DeviceSDK::decodeControl(req["action"].asString(), req["mode"].asString())) {
+                sendResponse(clientSock, 200, "application/json", "{\"message\":\"Decoder command sent\"}");
+            } else {
+                sendResponse(clientSock, 500, "application/json", "{\"error\":\"Decoder control failed\"}");
+            }
+        }
+        else if (path == "/reboot" && method == "POST") {
+            Json::Value req;
+            Json::Reader reader;
+            if (!reader.parse(body, req) || !req.isMember("operation")) {
+                sendResponse(clientSock, 400, "application/json", "{\"error\":\"Missing operation\"}");
+                return;
+            }
+            if (DeviceSDK::reboot(req["operation"].asString())) {
+                sendResponse(clientSock, 200, "application/json", "{\"message\":\"Device reboot/shutdown initiated\"}");
+            } else {
+                sendResponse(clientSock, 500, "application/json", "{\"error\":\"Reboot/Shutdown failed\"}");
+            }
+        }
+        else if (path == "/upgrade" && method == "POST") {
+            Json::Value req;
+            Json::Reader reader;
+            if (!reader.parse(body, req) || !req.isMember("firmware")) {
+                sendResponse(clientSock, 400, "application/json", "{\"error\":\"Missing firmware reference\"}");
+                return;
+            }
+            if (DeviceSDK::upgrade(req)) {
+                sendResponse(clientSock, 200, "application/json", "{\"message\":\"Upgrade started\"}");
+            } else {
+                sendResponse(clientSock, 500, "application/json", "{\"error\":\"Upgrade failed\"}");
+            }
+        }
+        else {
+            sendResponse(clientSock, 404, "application/json", "{\"error\":\"Not found\"}");
+        }
     }
     void run() {
-        std::cout << "[Driver] Listening on " << config.http_host << ":" << config.http_port << std::endl;
-        server.listen(config.http_host.c_str(), config.http_port);
+#ifdef _WIN32
+        WSADATA wsa;
+        WSAStartup(MAKEWORD(2,2),&wsa);
+#endif
+        serverSock_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (serverSock_ < 0) return;
+        int opt = 1;
+        setsockopt(serverSock_, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
+        sockaddr_in addr;
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port_);
+        addr.sin_addr.s_addr = INADDR_ANY;
+        if (bind(serverSock_, (struct sockaddr*)&addr, sizeof(addr)) < 0) return;
+        listen(serverSock_, 8);
+        while (running_) {
+            sockaddr_in clientAddr;
+            socklen_t clientLen = sizeof(clientAddr);
+            int clientSock = accept(serverSock_, (struct sockaddr*)&clientAddr, &clientLen);
+            if (clientSock < 0) continue;
+            std::thread(&HttpServer::handleRequest, this, clientSock).detach();
+        }
+#ifdef _WIN32
+        closesocket(serverSock_);
+        WSACleanup();
+#else
+        close(serverSock_);
+#endif
     }
 };
 
+// Entry
 int main() {
-    Config cfg = Config::from_env();
-    DriverServer server(cfg);
-    server.run();
+    // Environment variables
+    const char* env_host = std::getenv("HTTP_SERVER_HOST");
+    const char* env_port = std::getenv("HTTP_SERVER_PORT");
+    std::string host = env_host ? env_host : "0.0.0.0";
+    int port = env_port ? std::atoi(env_port) : 8080;
+
+    HttpServer server(host, port);
+    server.start();
+
+    std::cout << "HTTP server running on " << host << ":" << port << std::endl;
+    while (1) std::this_thread::sleep_for(std::chrono::seconds(1000));
     return 0;
 }
-```
-*Dependencies:*
-- [cpp-httplib](https://github.com/yhirose/cpp-httplib) (header-only, for HTTP server)
-- [nlohmann/json](https://github.com/nlohmann/json) (header-only, for JSON parsing)
-
-*Compile example:*
-```
-g++ -std=c++17 -O2 -o driver main.cpp -lpthread
-```
-
-*Environment variables used:*
-- DEVICE_IP, DEVICE_PORT, DEVICE_USER, DEVICE_PASSWORD, HTTP_HOST, HTTP_PORT
-
-*Endpoints:*
-- `POST /login`      (body: {"username":"...","password":"..."})
-- `POST /logout`
-- `GET /config?type=...`
-- `PUT /config?type=...`  (body: config JSON)
-- `POST /decode`     (body: {"action":"start/stop","mode":"dynamic/passive"})
-- `POST /reboot`     (body: {"action":"reboot/shutdown"})
-- `POST /upgrade`    (body: upgrade JSON)
-- `GET /status`
-
-*Authorization:*
-- Use `Authorization: Bearer <token>` header or `token=...` query param after login.
