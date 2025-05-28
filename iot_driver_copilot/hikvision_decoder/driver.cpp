@@ -1,365 +1,338 @@
 #include <iostream>
-#include <sstream>
-#include <vector>
 #include <string>
 #include <cstdlib>
-#include <cstring>
+#include <sstream>
+#include <map>
+#include <vector>
 #include <thread>
 #include <mutex>
-#include <map>
-#include <fstream>
-#include <streambuf>
-#include <chrono>
-#include <ctime>
 #include <algorithm>
+#include <cstring>
 #include <netinet/in.h>
 #include <unistd.h>
-#include <sys/socket.h>
-#include <arpa/inet.h>
+#include <json/json.h>
 
-// Mockup for Hikvision SDK API (replace with actual SDK calls as needed)
-namespace hikvision_sdk {
-    struct DecoderStatus {
-        std::string device_status = "online";
-        std::string channel_status = "normal";
-        std::string display_config = "default";
-        std::string alarm_status = "none";
-        std::string playback_state = "stopped";
-        // ... add more as needed
-    };
+// ==== Environment variable helpers ====
+std::string getenv_or_default(const std::string& var, const std::string& def) {
+    const char* val = std::getenv(var.c_str());
+    return val ? std::string(val) : def;
+}
 
-    struct DecoderConfig {
-        std::string display_mode = "1x1";
-        std::string scene_mode = "normal";
-        std::string loop_decode = "enabled";
-        std::string window_mapping = "auto";
-        // ... add more as needed
-    };
+// ==== Device Model (Mocked for illustration) ====
+struct DeviceInfo {
+    std::string device_name = "Hikvision Decoder";
+    std::string device_model = "DS-6300D(-JX/-T), DS-6400HD(-JX/-T/-S), DS-6500D(-T), DS_64XXHD_S, DS64XXHD_T, DS63XXD_T, DS65XXD";
+    std::string manufacturer = "Hikvision";
+    std::string device_type = "Decoder";
+};
 
-    static DecoderStatus g_status;
-    static DecoderConfig g_config;
+struct ChannelStatus {
+    int channel_id;
+    std::string status;
+    std::string stream_url;
+    std::string last_command;
+};
 
-    void init(const std::string& ip, int port, const std::string& user, const std::string& pwd) {
-        // Mock init, no-op
+struct DeviceStatus {
+    std::string sdk_state;
+    std::string sdk_version;
+    int error_code;
+    std::string health;
+};
+
+struct DeviceConfig {
+    std::string display_mode;
+    int decode_channels;
+    std::string scene_mode;
+};
+
+class HikvisionDevice {
+public:
+    HikvisionDevice() {
+        // Mock some data
+        channels = {
+            {1, {"1", "idle", "rtsp://192.168.1.10:554/stream1", ""}},
+            {2, {"2", "decoding", "rtsp://192.168.1.10:554/stream2", "start"}}
+        };
+        status = {"active", "v5.3.0", 0, "OK"};
+        config = {"wall", 2, "default"};
     }
 
-    DecoderStatus getStatus() {
-        return g_status;
+    DeviceInfo get_info() {
+        return {};
     }
 
-    DecoderConfig getConfig() {
-        return g_config;
-    }
-
-    void setConfig(const DecoderConfig& cfg) {
-        g_config = cfg;
-    }
-
-    void control(const std::map<std::string, std::string>& ctrl) {
-        // mock control
-        for (const auto& kv : ctrl) {
-            if (kv.first == "reboot" && kv.second == "1") {
-                g_status.device_status = "rebooting";
-            } else if (kv.first == "shutdown" && kv.second == "1") {
-                g_status.device_status = "shutdown";
-            } // add more as necessary
+    DeviceStatus get_status(bool detail) {
+        if (detail) {
+            status.health = "All systems normal. Temp=45C, Fans=OK.";
+        } else {
+            status.health = "OK";
         }
+        return status;
     }
-}
 
-// Utility for getting env or default
-std::string getenv_or(const char* key, const char* defval) {
-    const char* v = std::getenv(key);
-    return v ? v : defval;
-}
-
-// Simple JSON helpers
-std::string quote(const std::string& s) {
-    std::ostringstream oss;
-    oss << '"';
-    for (auto c : s) {
-        if (c == '"') oss << "\\\"";
-        else if (c == '\\') oss << "\\\\";
-        else if (c == '\n') oss << "\\n";
-        else oss << c;
+    std::vector<ChannelStatus> get_channels(const std::string& channel_id = "") {
+        std::vector<ChannelStatus> res;
+        if (channel_id.empty()) {
+            for (const auto& kv : channels) res.push_back(kv.second);
+        } else {
+            if (channels.count(std::stoi(channel_id))) {
+                res.push_back(channels[std::stoi(channel_id)]);
+            }
+        }
+        return res;
     }
-    oss << '"';
-    return oss.str();
-}
-std::string json_kv(const std::string& k, const std::string& v) {
-    return quote(k) + ":" + quote(v);
-}
-std::string json_obj(const std::vector<std::string>& kvs) {
-    std::ostringstream oss;
-    oss << "{";
-    for (size_t i = 0; i < kvs.size(); ++i) {
-        if (i) oss << ",";
-        oss << kvs[i];
-    }
-    oss << "}";
-    return oss.str();
-}
 
-// HTTP utilities
+    bool decode_command(const std::string& action, const Json::Value& params, std::string& err_msg) {
+        if (action != "start" && action != "stop") {
+            err_msg = "Invalid action";
+            return false;
+        }
+        int ch = params.get("channel_id", 0).asInt();
+        if (!channels.count(ch)) {
+            err_msg = "Channel not found";
+            return false;
+        }
+        channels[ch].last_command = action;
+        channels[ch].status = (action == "start") ? "decoding" : "idle";
+        return true;
+    }
+
+    bool update_config(const Json::Value& j, std::string& err_msg) {
+        if (j.isMember("display_mode")) config.display_mode = j["display_mode"].asString();
+        if (j.isMember("decode_channels")) config.decode_channels = j["decode_channels"].asInt();
+        if (j.isMember("scene_mode")) config.scene_mode = j["scene_mode"].asString();
+        // Accept any structure for now
+        return true;
+    }
+
+private:
+    std::map<int, ChannelStatus> channels;
+    DeviceStatus status;
+    DeviceConfig config;
+};
+
+// ==== HTTP Utilities ====
 struct HttpRequest {
-    std::string method, path, http_version;
+    std::string method;
+    std::string uri;
     std::map<std::string, std::string> headers;
     std::string body;
+    std::map<std::string, std::string> query_params;
 };
 
 struct HttpResponse {
-    int status;
-    std::string status_text;
-    std::map<std::string, std::string> headers;
+    int status_code;
+    std::string content_type;
     std::string body;
-
-    std::string str() const {
-        std::ostringstream oss;
-        oss << "HTTP/1.1 " << status << " " << status_text << "\r\n";
-        for (const auto& h : headers) {
-            oss << h.first << ": " << h.second << "\r\n";
-        }
-        oss << "Content-Length: " << body.size() << "\r\n";
-        oss << "\r\n";
-        oss << body;
-        return oss.str();
-    }
+    std::map<std::string, std::string> headers;
 };
 
-std::string to_lower(const std::string& s) {
-    std::string r = s;
-    std::transform(r.begin(), r.end(), r.begin(), ::tolower);
-    return r;
+void send_response(int client, const HttpResponse& res) {
+    std::ostringstream oss;
+    oss << "HTTP/1.1 " << res.status_code << " ";
+    switch (res.status_code) {
+        case 200: oss << "OK"; break;
+        case 201: oss << "Created"; break;
+        case 204: oss << "No Content"; break;
+        case 400: oss << "Bad Request"; break;
+        case 404: oss << "Not Found"; break;
+        case 405: oss << "Method Not Allowed"; break;
+        case 500: oss << "Internal Server Error"; break;
+        default: oss << "Error";
+    }
+    oss << "\r\n";
+    oss << "Content-Type: " << res.content_type << "\r\n";
+    for (const auto& kv : res.headers) {
+        oss << kv.first << ": " << kv.second << "\r\n";
+    }
+    oss << "Content-Length: " << res.body.size() << "\r\n";
+    oss << "\r\n";
+    oss << res.body;
+    std::string msg = oss.str();
+    send(client, msg.c_str(), msg.size(), 0);
 }
 
-bool starts_with(const std::string& s, const std::string& prefix) {
-    return s.size() >= prefix.size() && std::equal(prefix.begin(), prefix.end(), s.begin());
-}
-
-HttpRequest parse_http_request(const std::string& raw) {
-    std::istringstream ss(raw);
-    std::string line;
+// Parse HTTP request (very simple, only for this context)
+HttpRequest parse_request(const std::string& raw) {
     HttpRequest req;
-    // First line
-    if (!std::getline(ss, line)) return req;
-    if (!line.empty() && line.back() == '\r') line.pop_back();
+    std::istringstream iss(raw);
+    std::string line;
+    std::getline(iss, line);
     std::istringstream lss(line);
-    lss >> req.method >> req.path >> req.http_version;
+    lss >> req.method >> req.uri;
+    // Query params
+    size_t qpos = req.uri.find('?');
+    if (qpos != std::string::npos) {
+        std::string path = req.uri.substr(0, qpos);
+        std::string qstr = req.uri.substr(qpos + 1);
+        req.uri = path;
+        std::istringstream qss(qstr);
+        std::string kv;
+        while (std::getline(qss, kv, '&')) {
+            size_t eq = kv.find('=');
+            if (eq != std::string::npos)
+                req.query_params[kv.substr(0, eq)] = kv.substr(eq + 1);
+        }
+    }
     // Headers
-    while (std::getline(ss, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line.empty()) break;
-        size_t pos = line.find(':');
-        if (pos != std::string::npos) {
-            std::string key = line.substr(0, pos);
-            std::string val = line.substr(pos+1);
-            while (!val.empty() && val[0] == ' ') val.erase(0, 1);
-            req.headers[to_lower(key)] = val;
+    while (std::getline(iss, line) && line != "\r") {
+        if (line.empty() || line == "\r") break;
+        size_t c = line.find(':');
+        if (c != std::string::npos) {
+            std::string key = line.substr(0, c);
+            std::string val = line.substr(c+1);
+            val.erase(0, val.find_first_not_of(" \t\r\n"));
+            val.erase(val.find_last_not_of(" \t\r\n") + 1);
+            key.erase(key.find_last_not_of(" \t\r\n") + 1);
+            req.headers[key] = val;
         }
     }
     // Body
-    std::ostringstream bod;
-    bod << ss.rdbuf();
-    req.body = bod.str();
+    std::string body;
+    while (std::getline(iss, line)) body += line + "\n";
+    if (!body.empty() && body.back() == '\n') body.pop_back();
+    req.body = body;
     return req;
 }
 
-// Parse decoder config JSON (simple flat, not nested, for demo)
-hikvision_sdk::DecoderConfig parse_config_json(const std::string& body) {
-    hikvision_sdk::DecoderConfig cfg;
-    // Very simple parser: expects keys like "display_mode", etc.
-    if (body.find("display_mode") != std::string::npos) {
-        size_t p = body.find("display_mode");
-        size_t q = body.find(':', p);
-        size_t r = body.find('"', q+1);
-        size_t s = body.find('"', r+1);
-        if (r != std::string::npos && s != std::string::npos)
-            cfg.display_mode = body.substr(r+1, s-r-1);
-    }
-    if (body.find("scene_mode") != std::string::npos) {
-        size_t p = body.find("scene_mode");
-        size_t q = body.find(':', p);
-        size_t r = body.find('"', q+1);
-        size_t s = body.find('"', r+1);
-        if (r != std::string::npos && s != std::string::npos)
-            cfg.scene_mode = body.substr(r+1, s-r-1);
-    }
-    if (body.find("loop_decode") != std::string::npos) {
-        size_t p = body.find("loop_decode");
-        size_t q = body.find(':', p);
-        size_t r = body.find('"', q+1);
-        size_t s = body.find('"', r+1);
-        if (r != std::string::npos && s != std::string::npos)
-            cfg.loop_decode = body.substr(r+1, s-r-1);
-    }
-    if (body.find("window_mapping") != std::string::npos) {
-        size_t p = body.find("window_mapping");
-        size_t q = body.find(':', p);
-        size_t r = body.find('"', q+1);
-        size_t s = body.find('"', r+1);
-        if (r != std::string::npos && s != std::string::npos)
-            cfg.window_mapping = body.substr(r+1, s-r-1);
-    }
-    // Add more fields as needed
-    return cfg;
+// ==== API Handlers ====
+HttpResponse handle_device(const HttpRequest& req, HikvisionDevice& dev) {
+    if (req.method != "GET") return {405, "application/json", "{\"error\":\"Method Not Allowed\"}", {}};
+    DeviceInfo info = dev.get_info();
+    Json::Value j;
+    j["device_name"] = info.device_name;
+    j["device_model"] = info.device_model;
+    j["manufacturer"] = info.manufacturer;
+    j["device_type"] = info.device_type;
+    Json::StreamWriterBuilder w;
+    return {200, "application/json", Json::writeString(w, j), {}};
 }
 
-// Parse control JSON (flat, for demo)
-std::map<std::string, std::string> parse_ctrl_json(const std::string& body) {
-    std::map<std::string, std::string> ctrl;
-    // Very simple parser: expects keys like "reboot": "1"
-    size_t pos = 0;
-    while (pos < body.size()) {
-        size_t key_s = body.find('"', pos);
-        if (key_s == std::string::npos) break;
-        size_t key_e = body.find('"', key_s+1);
-        if (key_e == std::string::npos) break;
-        std::string key = body.substr(key_s+1, key_e-key_s-1);
-        size_t val_s = body.find(':', key_e)+1;
-        while (val_s < body.size() && (body[val_s]==' '||body[val_s]=='"')) ++val_s;
-        size_t val_e = body.find_first_of(",}", val_s);
-        std::string val = body.substr(val_s, val_e-val_s);
-        while (!val.empty() && val.back()=='"') val.pop_back();
-        ctrl[key] = val;
-        pos = val_e+1;
+HttpResponse handle_status(const HttpRequest& req, HikvisionDevice& dev) {
+    if (req.method != "GET") return {405, "application/json", "{\"error\":\"Method Not Allowed\"}", {}};
+    bool detail = (req.query_params.count("detail") && req.query_params.at("detail") == "1");
+    DeviceStatus s = dev.get_status(detail);
+    Json::Value j;
+    j["sdk_state"] = s.sdk_state;
+    j["sdk_version"] = s.sdk_version;
+    j["error_code"] = s.error_code;
+    j["health"] = s.health;
+    Json::StreamWriterBuilder w;
+    return {200, "application/json", Json::writeString(w, j), {}};
+}
+
+HttpResponse handle_channels(const HttpRequest& req, HikvisionDevice& dev) {
+    if (req.method != "GET") return {405, "application/json", "{\"error\":\"Method Not Allowed\"}", {}};
+    std::string ch_id = "";
+    if (req.query_params.count("channel_id")) ch_id = req.query_params.at("channel_id");
+    std::vector<ChannelStatus> channels = dev.get_channels(ch_id);
+    Json::Value j;
+    for (auto& ch : channels) {
+        Json::Value cj;
+        cj["channel_id"] = ch.channel_id;
+        cj["status"] = ch.status;
+        cj["stream_url"] = ch.stream_url;
+        cj["last_command"] = ch.last_command;
+        j.append(cj);
     }
-    return ctrl;
+    Json::StreamWriterBuilder w;
+    return {200, "application/json", Json::writeString(w, j), {}};
 }
 
-// HTTP Response helpers
-HttpResponse resp_json(int status, const std::string& text, const std::string& json) {
-    HttpResponse r;
-    r.status = status;
-    r.status_text = text;
-    r.headers["Content-Type"] = "application/json";
-    r.body = json;
-    return r;
-}
-HttpResponse resp_plain(int status, const std::string& text, const std::string& msg) {
-    HttpResponse r;
-    r.status = status;
-    r.status_text = text;
-    r.headers["Content-Type"] = "text/plain";
-    r.body = msg;
-    return r;
-}
-
-// Handler: GET /decoder/status
-HttpResponse handle_get_decoder_status() {
-    auto st = hikvision_sdk::getStatus();
-    std::vector<std::string> kvs{
-        json_kv("device_status", st.device_status),
-        json_kv("channel_status", st.channel_status),
-        json_kv("display_config", st.display_config),
-        json_kv("alarm_status", st.alarm_status),
-        json_kv("playback_state", st.playback_state)
-    };
-    return resp_json(200, "OK", json_obj(kvs));
-}
-
-// Handler: GET /decoder/config
-HttpResponse handle_get_decoder_config() {
-    auto cfg = hikvision_sdk::getConfig();
-    std::vector<std::string> kvs{
-        json_kv("display_mode", cfg.display_mode),
-        json_kv("scene_mode", cfg.scene_mode),
-        json_kv("loop_decode", cfg.loop_decode),
-        json_kv("window_mapping", cfg.window_mapping)
-    };
-    return resp_json(200, "OK", json_obj(kvs));
-}
-
-// Handler: PUT /decoder/config
-HttpResponse handle_put_decoder_config(const std::string& body) {
-    hikvision_sdk::DecoderConfig cfg = parse_config_json(body);
-    hikvision_sdk::setConfig(cfg);
-    return resp_json(200, "OK", "{\"result\":\"Config updated\"}");
-}
-
-// Handler: POST /decoder/ctrl
-HttpResponse handle_post_decoder_ctrl(const std::string& body) {
-    auto ctrl = parse_ctrl_json(body);
-    hikvision_sdk::control(ctrl);
-    return resp_json(200, "OK", "{\"result\":\"Command executed\"}");
-}
-
-// Main HTTP server logic
-void handle_http_client(int client_sock) {
-    char buffer[8192];
-    ssize_t recvd = recv(client_sock, buffer, sizeof(buffer)-1, 0);
-    if (recvd <= 0) { close(client_sock); return; }
-    buffer[recvd] = 0;
-    std::string raw_req(buffer);
-    HttpRequest req = parse_http_request(raw_req);
-
-    HttpResponse resp;
-
-    if (req.method == "GET" && req.path == "/decoder/status") {
-        resp = handle_get_decoder_status();
+HttpResponse handle_decode_cmd(const HttpRequest& req, HikvisionDevice& dev) {
+    if (req.method != "POST") return {405, "application/json", "{\"error\":\"Method Not Allowed\"}", {}};
+    Json::CharReaderBuilder rb;
+    Json::Value j;
+    std::string errs;
+    std::istringstream ss(req.body);
+    if (!Json::parseFromStream(rb, ss, &j, &errs)) {
+        return {400, "application/json", "{\"error\":\"Invalid JSON\"}", {}};
     }
-    else if (req.method == "GET" && req.path == "/decoder/config") {
-        resp = handle_get_decoder_config();
+    if (!j.isMember("action")) return {400, "application/json", "{\"error\":\"Missing action\"}", {}};
+    std::string err_msg;
+    if (!dev.decode_command(j["action"].asString(), j, err_msg)) {
+        Json::Value je;
+        je["error"] = err_msg;
+        Json::StreamWriterBuilder w;
+        return {400, "application/json", Json::writeString(w, je), {}};
     }
-    else if (req.method == "PUT" && req.path == "/decoder/config") {
-        resp = handle_put_decoder_config(req.body);
-    }
-    else if (req.method == "POST" && req.path == "/decoder/ctrl") {
-        resp = handle_post_decoder_ctrl(req.body);
-    }
-    else {
-        resp = resp_plain(404, "Not Found", "Endpoint not found");
-    }
-
-    std::string out = resp.str();
-    send(client_sock, out.c_str(), out.size(), 0);
-    close(client_sock);
+    return {200, "application/json", "{\"result\":\"OK\"}", {}};
 }
 
-void http_server_main(const std::string& host, int port) {
+HttpResponse handle_config_cmd(const HttpRequest& req, HikvisionDevice& dev) {
+    if (req.method != "POST") return {405, "application/json", "{\"error\":\"Method Not Allowed\"}", {}};
+    Json::CharReaderBuilder rb;
+    Json::Value j;
+    std::string errs;
+    std::istringstream ss(req.body);
+    if (!Json::parseFromStream(rb, ss, &j, &errs)) {
+        return {400, "application/json", "{\"error\":\"Invalid JSON\"}", {}};
+    }
+    std::string err_msg;
+    if (!dev.update_config(j, err_msg)) {
+        Json::Value je;
+        je["error"] = err_msg;
+        Json::StreamWriterBuilder w;
+        return {400, "application/json", Json::writeString(w, je), {}};
+    }
+    return {200, "application/json", "{\"result\":\"OK\"}", {}};
+}
+
+// ==== HTTP Server Loop ====
+void http_server_loop(const std::string& host, int port, HikvisionDevice& dev) {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) {
-        std::cerr << "Socket failed\n";
-        exit(1);
-    }
-
+    if (server_fd < 0) { perror("socket"); exit(1); }
     int opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    struct sockaddr_in addr;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
+    sockaddr_in addr;
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = inet_addr(host.c_str());
+    addr.sin_addr.s_addr = INADDR_ANY; // Accept all
     addr.sin_port = htons(port);
+    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind"); exit(1); }
+    if (listen(server_fd, 10) < 0) { perror("listen"); exit(1); }
+    std::cout << "HTTP server listening on port " << port << std::endl;
 
-    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        std::cerr << "Bind failed\n";
-        exit(1);
-    }
-
-    if (listen(server_fd, 8) < 0) {
-        std::cerr << "Listen failed\n";
-        exit(1);
-    }
-
-    std::cout << "HTTP server listening on " << host << ":" << port << std::endl;
-    while (1) {
-        int client_sock = accept(server_fd, nullptr, nullptr);
-        if (client_sock < 0) continue;
-        std::thread(handle_http_client, client_sock).detach();
+    while (true) {
+        sockaddr_in client_addr;
+        socklen_t ca_len = sizeof(client_addr);
+        int client = accept(server_fd, (struct sockaddr*)&client_addr, &ca_len);
+        if (client < 0) continue;
+        std::thread([client, &dev]() {
+            char buf[8192];
+            int len = recv(client, buf, sizeof(buf) - 1, 0);
+            if (len <= 0) { close(client); return; }
+            buf[len] = '\0';
+            std::string raw(buf);
+            HttpRequest req = parse_request(raw);
+            HttpResponse res;
+            if (req.uri == "/device") {
+                res = handle_device(req, dev);
+            } else if (req.uri == "/status") {
+                res = handle_status(req, dev);
+            } else if (req.uri == "/channels") {
+                res = handle_channels(req, dev);
+            } else if (req.uri == "/cmd/decode") {
+                res = handle_decode_cmd(req, dev);
+            } else if (req.uri == "/cmd/config") {
+                res = handle_config_cmd(req, dev);
+            } else {
+                res = {404, "application/json", "{\"error\":\"Not Found\"}", {}};
+            }
+            send_response(client, res);
+            close(client);
+        }).detach();
     }
 }
 
+// ==== Main Entrypoint ====
 int main() {
-    // Env configuration
-    std::string device_ip   = getenv_or("DEVICE_IP", "192.168.1.64");
-    int device_port         = std::stoi(getenv_or("DEVICE_PORT", "8000"));
-    std::string device_user = getenv_or("DEVICE_USER", "admin");
-    std::string device_pwd  = getenv_or("DEVICE_PASSWORD", "12345");
-    std::string server_host = getenv_or("HTTP_SERVER_HOST", "0.0.0.0");
-    int server_port         = std::stoi(getenv_or("HTTP_SERVER_PORT", "8080"));
+    std::string server_host = getenv_or_default("HTTP_SERVER_HOST", "0.0.0.0");
+    int server_port = std::stoi(getenv_or_default("HTTP_SERVER_PORT", "8080"));
+    // Device info can be extended with env if needed
 
-    hikvision_sdk::init(device_ip, device_port, device_user, device_pwd);
+    HikvisionDevice device;
 
-    http_server_main(server_host, server_port);
-
+    http_server_loop(server_host, server_port, device);
     return 0;
 }
