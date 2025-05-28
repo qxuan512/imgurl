@@ -1,320 +1,495 @@
-#include <cstdlib>
-#include <cstring>
+#include <iostream>
 #include <string>
-#include <unordered_map>
+#include <cstdlib>
+#include <map>
 #include <mutex>
 #include <thread>
-#include <atomic>
 #include <fstream>
-#include <iostream>
 #include <sstream>
 #include <vector>
-#include <memory>
-#include <chrono>
+#include <ctime>
+#include <condition_variable>
+#include <json/json.h> // Requires jsoncpp library (header-only parts)
+#include <netinet/in.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
 
-#include "civetweb.h"
+// Dummy HCNetSDK simulation (replace this with actual SDK integration for real device)
+namespace HCNetSDKSim {
+    struct Session {
+        std::string username;
+        std::string token;
+        bool valid;
+    };
+    static std::mutex session_mutex;
+    static Session session = {"", "", false};
+    static Json::Value current_config;
+    static Json::Value device_status;
+    static std::string last_error = "";
 
-// Placeholder for HCNetSDK C++ API
-// #include "HCNetSDK.h" // Uncomment and link against actual SDK
-
-// ------------------ Environment Variable Helpers ------------------
-std::string getEnvOrDefault(const char* env, const std::string& def) {
-    const char* val = std::getenv(env);
-    return val ? std::string(val) : def;
+    bool login(const std::string& user, const std::string& pass, std::string& token) {
+        std::lock_guard<std::mutex> lock(session_mutex);
+        if (user == "admin" && pass == "12345") {
+            session.username = user;
+            session.token = "SESSION_" + std::to_string(std::time(nullptr));
+            session.valid = true;
+            token = session.token;
+            return true;
+        }
+        last_error = "Invalid credentials";
+        return false;
+    }
+    bool logout(const std::string& token) {
+        std::lock_guard<std::mutex> lock(session_mutex);
+        if (!session.valid || session.token != token) {
+            last_error = "Invalid session";
+            return false;
+        }
+        session = {"", "", false};
+        return true;
+    }
+    bool check_session(const std::string& token) {
+        std::lock_guard<std::mutex> lock(session_mutex);
+        return session.valid && session.token == token;
+    }
+    Json::Value get_config(const std::string& type) {
+        // Dummy configs
+        if (type == "display") {
+            Json::Value j;
+            j["display_mode"] = "wall";
+            j["wall_id"] = 1;
+            return j;
+        } else if (type == "channel") {
+            Json::Value j;
+            j["channels"] = Json::arrayValue;
+            for (int i = 0; i < 4; ++i) {
+                Json::Value c;
+                c["id"] = i;
+                c["enabled"] = true;
+                j["channels"].append(c);
+            }
+            return j;
+        }
+        Json::Value j;
+        j["info"] = "Unknown config type";
+        return j;
+    }
+    bool set_config(const std::string& type, const Json::Value& cfg) {
+        // Accept all in dummy
+        current_config[type] = cfg;
+        return true;
+    }
+    Json::Value get_status() {
+        Json::Value j;
+        j["device"] = "Hikvision Decoder";
+        j["uptime"] = static_cast<Json::UInt64>(std::time(nullptr));
+        j["channels_online"] = 4;
+        j["alarm"] = false;
+        j["upgrade_progress"] = 0;
+        j["error_codes"] = Json::arrayValue;
+        return j;
+    }
+    bool decode_control(const Json::Value& req, Json::Value& resp) {
+        if (!req.isMember("action") || !req.isMember("mode")) {
+            resp["error"] = "Missing action or mode";
+            return false;
+        }
+        resp["result"] = "Decode " + req["action"].asString() + " in mode " + req["mode"].asString();
+        return true;
+    }
+    bool reboot(const Json::Value& req, Json::Value& resp) {
+        resp["result"] = "Reboot command accepted";
+        return true;
+    }
+    bool upgrade(const Json::Value& req, Json::Value& resp) {
+        resp["result"] = "Upgrade command accepted";
+        return true;
+    }
+    const std::string& get_last_error() {
+        return last_error;
+    }
 }
-int getEnvIntOrDefault(const char* env, int def) {
-    const char* val = std::getenv(env);
-    return val ? std::atoi(val) : def;
+
+// HTTP utility
+std::string http_status_message(int status) {
+    switch (status) {
+        case 200: return "OK";
+        case 201: return "Created";
+        case 204: return "No Content";
+        case 400: return "Bad Request";
+        case 401: return "Unauthorized";
+        case 403: return "Forbidden";
+        case 404: return "Not Found";
+        case 405: return "Method Not Allowed";
+        case 500: return "Internal Server Error";
+        default:  return "Unknown";
+    }
 }
 
-// ------------------ Device Session Management ------------------
-struct DeviceSession {
+void send_http_response(int client, int status_code, const std::string& content_type, const std::string& body, const std::map<std::string, std::string>& headers = {}) {
+    std::ostringstream oss;
+    oss << "HTTP/1.1 " << status_code << " " << http_status_message(status_code) << "\r\n";
+    oss << "Content-Type: " << content_type << "\r\n";
+    oss << "Content-Length: " << body.length() << "\r\n";
+    for (const auto& h : headers) {
+        oss << h.first << ": " << h.second << "\r\n";
+    }
+    oss << "Connection: close\r\n\r\n";
+    oss << body;
+    std::string resp = oss.str();
+    send(client, resp.c_str(), resp.length(), 0);
+}
+
+std::string url_decode(const std::string& s) {
+    std::string out;
+    char ch;
+    int i, ii;
+    for (i = 0; i < s.length(); i++) {
+        if (s[i] == '%') {
+            sscanf(s.substr(i + 1, 2).c_str(), "%x", &ii);
+            ch = static_cast<char>(ii);
+            out += ch;
+            i = i + 2;
+        } else if (s[i] == '+') {
+            out += ' ';
+        } else {
+            out += s[i];
+        }
+    }
+    return out;
+}
+
+std::map<std::string, std::string> parse_query(const std::string& query) {
+    std::map<std::string, std::string> m;
+    std::istringstream iss(query);
+    std::string pair;
+    while (std::getline(iss, pair, '&')) {
+        size_t eq = pair.find('=');
+        if (eq != std::string::npos) {
+            std::string key = url_decode(pair.substr(0, eq));
+            std::string val = url_decode(pair.substr(eq + 1));
+            m[key] = val;
+        }
+    }
+    return m;
+}
+
+struct HttpRequest {
+    std::string method;
+    std::string path;
+    std::string query;
+    std::map<std::string, std::string> headers;
+    std::string body;
     std::string session_token;
-    std::string username;
-    std::string password;
-    std::atomic<bool> is_logged_in;
-    std::mutex session_mutex;
-    // int user_id; // SDK login handle
 };
 
-DeviceSession g_session;
-
-// ------------------ JSON Helpers ------------------
-std::string jsonError(const std::string& msg) {
-    return "{\"success\":false,\"error\":\"" + msg + "\"}";
-}
-std::string jsonSuccess(const std::string& msg = "") {
-    if (msg.empty()) return "{\"success\":true}";
-    return "{\"success\":true,\"msg\":\"" + msg + "\"}";
-}
-
-// Very basic JSON parser for getting values, for demo purposes
-std::string jsonExtract(const std::string& body, const std::string& key) {
-    auto pos = body.find("\"" + key + "\"");
-    if (pos == std::string::npos) return "";
-    pos = body.find(':', pos);
-    if (pos == std::string::npos) return "";
-    pos++;
-    while (pos < body.size() && (body[pos] == ' ' || body[pos] == '\"')) pos++;
-    size_t end = pos;
-    while (end < body.size() && body[end] != ',' && body[end] != '}' && body[end] != '\"') end++;
-    return body.substr(pos, end - pos);
-}
-
-// ------------------ Token Generation ------------------
-std::string generateSessionToken() {
-    static std::atomic<unsigned long> cnt{0};
-    std::ostringstream oss;
-    oss << std::chrono::steady_clock::now().time_since_epoch().count() << "-" << (cnt++);
-    return oss.str();
-}
-
-// ------------------ Device SDK Placeholders ------------------
-
-// All these should actually use real calls to HCNetSDK
-bool device_login(const std::string& ip, int port, const std::string& user, const std::string& pwd, std::string& token) {
-    // int user_id = NET_DVR_Login_V40(...);
-    // if (user_id < 0) return false;
-    token = generateSessionToken();
-    // g_session.user_id = user_id;
-    return true;
-}
-void device_logout() {
-    // if (g_session.user_id >= 0) NET_DVR_Logout(g_session.user_id);
-}
-std::string device_get_status() {
-    // Query device via SDK and return JSON
-    return "{\"status\":\"ok\",\"channels\":4,\"alarms\":[],\"error_codes\":[]}";
-}
-std::string device_get_config(const std::string& type) {
-    // SDK call, for now dummy response
-    return "{\"type\":\"" + type + "\",\"config\":{}}";
-}
-bool device_set_config(const std::string& type, const std::string& configJson) {
-    // Use SDK to set config
-    return true;
-}
-bool device_decode_control(const std::string& action, const std::string& mode, const std::string& details) {
-    // SDK decode control
-    return true;
-}
-bool device_reboot(const std::string& params) {
-    // SDK reboot
-    return true;
-}
-bool device_upgrade(const std::string& params) {
-    // SDK upgrade
-    return true;
-}
-
-// ------------------ Auth Helpers ------------------
-bool checkAuth(struct mg_connection* conn) {
-    char auth_token[128];
-    if (mg_get_cookie(conn, "session_token", auth_token, sizeof(auth_token)) > 0) {
-        std::lock_guard<std::mutex> lk(g_session.session_mutex);
-        if (g_session.is_logged_in && g_session.session_token == std::string(auth_token)) return true;
+bool parse_http_request(const std::string& request, HttpRequest& req) {
+    std::istringstream iss(request);
+    std::string line;
+    if (!std::getline(iss, line)) return false;
+    std::istringstream l1(line);
+    l1 >> req.method;
+    std::string fullpath;
+    l1 >> fullpath;
+    size_t qpos = fullpath.find('?');
+    if (qpos != std::string::npos) {
+        req.path = fullpath.substr(0, qpos);
+        req.query = fullpath.substr(qpos + 1);
+    } else {
+        req.path = fullpath;
+        req.query = "";
     }
-    // Also check "Authorization" header (Bearer token)
-    const char* hdr = mg_get_header(conn, "Authorization");
-    if (hdr && strstr(hdr, "Bearer ") == hdr) {
-        std::lock_guard<std::mutex> lk(g_session.session_mutex);
-        if (g_session.is_logged_in && g_session.session_token == std::string(hdr + 7)) return true;
+    while (std::getline(iss, line) && line != "\r") {
+        if (line.empty()) continue;
+        size_t colon = line.find(':');
+        if (colon != std::string::npos) {
+            std::string key = line.substr(0, colon);
+            std::string val = line.substr(colon + 1);
+            while (!val.empty() && (val[0] == ' ' || val[0] == '\t')) val.erase(0, 1);
+            if (!val.empty() && val.back() == '\r') val.pop_back();
+            req.headers[key] = val;
+        }
     }
-    return false;
+    if (req.headers.count("Cookie")) {
+        std::string c = req.headers["Cookie"];
+        size_t pos = c.find("session_token=");
+        if (pos != std::string::npos) {
+            size_t end = c.find(';', pos);
+            req.session_token = c.substr(pos + 14, end == std::string::npos ? std::string::npos : end - (pos + 14));
+        }
+    }
+    if (req.headers.count("Authorization")) {
+        std::string a = req.headers["Authorization"];
+        if (a.find("Bearer ") == 0)
+            req.session_token = a.substr(7);
+    }
+    // Read body if present
+    if (req.headers.count("Content-Length")) {
+        int cl = std::stoi(req.headers["Content-Length"]);
+        req.body.resize(cl);
+        iss.read(&req.body[0], cl);
+    }
+    return true;
 }
 
-// ------------------ HTTP Handlers ------------------
-int handle_login(struct mg_connection* conn, void* cbdata) {
-    char buf[2048];
-    int len = mg_read(conn, buf, sizeof(buf)-1);
-    buf[len] = 0;
-
-    std::string body(buf, len);
-    std::string username = jsonExtract(body, "username");
-    std::string password = jsonExtract(body, "password");
-
-    if (username.empty() || password.empty()) {
-        mg_printf(conn, "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\r\n%s", jsonError("Missing credentials").c_str());
-        return 200;
+// Endpoint Handlers
+void handle_login(const HttpRequest& req, int client) {
+    Json::Value resp;
+    Json::Value jreq;
+    Json::Reader reader;
+    if (!reader.parse(req.body, jreq) || !jreq.isMember("username") || !jreq.isMember("password")) {
+        resp["error"] = "Invalid JSON or missing credentials";
+        send_http_response(client, 400, "application/json", resp.toStyledString());
+        return;
     }
-    std::string device_ip = getEnvOrDefault("DEVICE_IP", "192.168.1.100");
-    int device_port = getEnvIntOrDefault("DEVICE_PORT", 8000);
-
+    std::string user = jreq["username"].asString();
+    std::string pass = jreq["password"].asString();
     std::string token;
-    if (!device_login(device_ip, device_port, username, password, token)) {
-        mg_printf(conn, "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\n\r\n%s", jsonError("Device login failed").c_str());
-        return 200;
+    if (HCNetSDKSim::login(user, pass, token)) {
+        resp["session_token"] = token;
+        send_http_response(client, 200, "application/json", resp.toStyledString(), {{"Set-Cookie", "session_token=" + token + "; Path=/"}});
+    } else {
+        resp["error"] = HCNetSDKSim::get_last_error();
+        send_http_response(client, 401, "application/json", resp.toStyledString());
     }
-    {
-        std::lock_guard<std::mutex> lk(g_session.session_mutex);
-        g_session.session_token = token;
-        g_session.username = username;
-        g_session.password = password;
-        g_session.is_logged_in = true;
-    }
-    mg_printf(conn, "HTTP/1.1 200 OK\r\nSet-Cookie: session_token=%s; HttpOnly\r\nContent-Type: application/json\r\n\r\n", token.c_str());
-    mg_printf(conn, "{\"success\":true,\"session_token\":\"%s\"}", token.c_str());
-    return 200;
 }
 
-int handle_logout(struct mg_connection* conn, void* cbdata) {
-    if (!checkAuth(conn)) {
-        mg_printf(conn, "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n\r\n%s", jsonError("Not authenticated").c_str());
-        return 200;
+void handle_logout(const HttpRequest& req, int client) {
+    Json::Value resp;
+    std::string token = req.session_token;
+    if (!HCNetSDKSim::check_session(token)) {
+        resp["error"] = "Invalid or missing session token";
+        send_http_response(client, 401, "application/json", resp.toStyledString());
+        return;
     }
-    {
-        std::lock_guard<std::mutex> lk(g_session.session_mutex);
-        g_session.is_logged_in = false;
-        g_session.session_token = "";
+    if (HCNetSDKSim::logout(token)) {
+        resp["result"] = "Logged out";
+        send_http_response(client, 200, "application/json", resp.toStyledString(), {{"Set-Cookie", "session_token=; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/"}} );
+    } else {
+        resp["error"] = HCNetSDKSim::get_last_error();
+        send_http_response(client, 401, "application/json", resp.toStyledString());
     }
-    device_logout();
-    mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n%s", jsonSuccess("Logged out").c_str());
-    return 200;
 }
 
-int handle_status(struct mg_connection* conn, void* cbdata) {
-    if (!checkAuth(conn)) {
-        mg_printf(conn, "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n\r\n%s", jsonError("Not authenticated").c_str());
-        return 200;
+void handle_get_config(const HttpRequest& req, int client) {
+    if (!HCNetSDKSim::check_session(req.session_token)) {
+        Json::Value resp;
+        resp["error"] = "Unauthorized";
+        send_http_response(client, 401, "application/json", resp.toStyledString());
+        return;
     }
-    std::string status = device_get_status();
-    mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n%s", status.c_str());
-    return 200;
+    std::map<std::string, std::string> q = parse_query(req.query);
+    std::string type = q.count("type") ? q["type"] : "";
+    Json::Value cfg = HCNetSDKSim::get_config(type);
+    send_http_response(client, 200, "application/json", cfg.toStyledString());
 }
 
-int handle_get_config(struct mg_connection* conn, void* cbdata) {
-    if (!checkAuth(conn)) {
-        mg_printf(conn, "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n\r\n%s", jsonError("Not authenticated").c_str());
-        return 200;
+void handle_put_config(const HttpRequest& req, int client) {
+    if (!HCNetSDKSim::check_session(req.session_token)) {
+        Json::Value resp;
+        resp["error"] = "Unauthorized";
+        send_http_response(client, 401, "application/json", resp.toStyledString());
+        return;
     }
-    char type[64] = {0};
-    mg_get_var(conn->query_string, strlen(conn->query_string), "type", type, sizeof(type));
-    std::string cfg = device_get_config(type[0] ? type : "all");
-    mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n%s", cfg.c_str());
-    return 200;
+    std::map<std::string, std::string> q = parse_query(req.query);
+    std::string type = q.count("type") ? q["type"] : "";
+    Json::Value jreq;
+    Json::Reader reader;
+    if (!reader.parse(req.body, jreq)) {
+        Json::Value resp;
+        resp["error"] = "Invalid JSON";
+        send_http_response(client, 400, "application/json", resp.toStyledString());
+        return;
+    }
+    if (HCNetSDKSim::set_config(type, jreq)) {
+        Json::Value resp;
+        resp["result"] = "Configuration updated";
+        send_http_response(client, 200, "application/json", resp.toStyledString());
+    } else {
+        Json::Value resp;
+        resp["error"] = "Failed to update config";
+        send_http_response(client, 500, "application/json", resp.toStyledString());
+    }
 }
 
-int handle_put_config(struct mg_connection* conn, void* cbdata) {
-    if (!checkAuth(conn)) {
-        mg_printf(conn, "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n\r\n%s", jsonError("Not authenticated").c_str());
-        return 200;
+void handle_status(const HttpRequest& req, int client) {
+    if (!HCNetSDKSim::check_session(req.session_token)) {
+        Json::Value resp;
+        resp["error"] = "Unauthorized";
+        send_http_response(client, 401, "application/json", resp.toStyledString());
+        return;
     }
-    char type[64] = {0};
-    mg_get_var(conn->query_string, strlen(conn->query_string), "type", type, sizeof(type));
-    char buf[4096];
-    int len = mg_read(conn, buf, sizeof(buf)-1);
-    buf[len] = 0;
-    if (!device_set_config(type[0] ? type : "all", std::string(buf, len))) {
-        mg_printf(conn, "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n%s", jsonError("Failed to set config").c_str());
-        return 200;
-    }
-    mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n%s", jsonSuccess().c_str());
-    return 200;
+    Json::Value stat = HCNetSDKSim::get_status();
+    send_http_response(client, 200, "application/json", stat.toStyledString());
 }
 
-int handle_command_decode(struct mg_connection* conn, void* cbdata) {
-    if (!checkAuth(conn)) {
-        mg_printf(conn, "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n\r\n%s", jsonError("Not authenticated").c_str());
-        return 200;
+void handle_decode(const HttpRequest& req, int client) {
+    if (!HCNetSDKSim::check_session(req.session_token)) {
+        Json::Value resp;
+        resp["error"] = "Unauthorized";
+        send_http_response(client, 401, "application/json", resp.toStyledString());
+        return;
     }
-    char buf[4096];
-    int len = mg_read(conn, buf, sizeof(buf)-1);
-    buf[len] = 0;
-    std::string body(buf, len);
-    std::string action = jsonExtract(body, "action");
-    std::string mode = jsonExtract(body, "mode");
-    if (action.empty() || mode.empty()) {
-        mg_printf(conn, "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\r\n%s", jsonError("Missing action or mode").c_str());
-        return 200;
+    Json::Value jreq;
+    Json::Reader reader;
+    if (!reader.parse(req.body, jreq)) {
+        Json::Value resp;
+        resp["error"] = "Invalid JSON";
+        send_http_response(client, 400, "application/json", resp.toStyledString());
+        return;
     }
-    if (!device_decode_control(action, mode, body)) {
-        mg_printf(conn, "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n%s", jsonError("Decode control failed").c_str());
-        return 200;
+    Json::Value resp;
+    if (HCNetSDKSim::decode_control(jreq, resp)) {
+        send_http_response(client, 200, "application/json", resp.toStyledString());
+    } else {
+        send_http_response(client, 400, "application/json", resp.toStyledString());
     }
-    mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n%s", jsonSuccess().c_str());
-    return 200;
 }
 
-// POST /decode -- alias for /command/decode
-int handle_decode(struct mg_connection* conn, void* cbdata) {
-    return handle_command_decode(conn, cbdata);
-}
-
-// POST /command/reboot
-int handle_command_reboot(struct mg_connection* conn, void* cbdata) {
-    if (!checkAuth(conn)) {
-        mg_printf(conn, "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n\r\n%s", jsonError("Not authenticated").c_str());
-        return 200;
+void handle_reboot(const HttpRequest& req, int client) {
+    if (!HCNetSDKSim::check_session(req.session_token)) {
+        Json::Value resp;
+        resp["error"] = "Unauthorized";
+        send_http_response(client, 401, "application/json", resp.toStyledString());
+        return;
     }
-    char buf[1024];
-    int len = mg_read(conn, buf, sizeof(buf)-1);
-    buf[len] = 0;
-    if (!device_reboot(std::string(buf, len))) {
-        mg_printf(conn, "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n%s", jsonError("Reboot failed").c_str());
-        return 200;
+    Json::Value jreq;
+    Json::Reader reader;
+    if (!req.body.empty() && !reader.parse(req.body, jreq)) {
+        Json::Value resp;
+        resp["error"] = "Invalid JSON";
+        send_http_response(client, 400, "application/json", resp.toStyledString());
+        return;
     }
-    mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n%s", jsonSuccess().c_str());
-    return 200;
-}
-
-// POST /reboot
-int handle_reboot(struct mg_connection* conn, void* cbdata) {
-    return handle_command_reboot(conn, cbdata);
-}
-
-// POST /command/upgrade
-int handle_command_upgrade(struct mg_connection* conn, void* cbdata) {
-    if (!checkAuth(conn)) {
-        mg_printf(conn, "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n\r\n%s", jsonError("Not authenticated").c_str());
-        return 200;
+    Json::Value resp;
+    if (HCNetSDKSim::reboot(jreq, resp)) {
+        send_http_response(client, 200, "application/json", resp.toStyledString());
+    } else {
+        send_http_response(client, 500, "application/json", resp.toStyledString());
     }
-    char buf[4096];
-    int len = mg_read(conn, buf, sizeof(buf)-1);
-    buf[len] = 0;
-    if (!device_upgrade(std::string(buf, len))) {
-        mg_printf(conn, "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n%s", jsonError("Upgrade failed").c_str());
-        return 200;
+}
+
+void handle_upgrade(const HttpRequest& req, int client) {
+    if (!HCNetSDKSim::check_session(req.session_token)) {
+        Json::Value resp;
+        resp["error"] = "Unauthorized";
+        send_http_response(client, 401, "application/json", resp.toStyledString());
+        return;
     }
-    mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n%s", jsonSuccess().c_str());
-    return 200;
+    Json::Value jreq;
+    Json::Reader reader;
+    if (!reader.parse(req.body, jreq)) {
+        Json::Value resp;
+        resp["error"] = "Invalid JSON";
+        send_http_response(client, 400, "application/json", resp.toStyledString());
+        return;
+    }
+    Json::Value resp;
+    if (HCNetSDKSim::upgrade(jreq, resp)) {
+        send_http_response(client, 200, "application/json", resp.toStyledString());
+    } else {
+        send_http_response(client, 500, "application/json", resp.toStyledString());
+    }
 }
 
-// POST /upgrade
-int handle_upgrade(struct mg_connection* conn, void* cbdata) {
-    return handle_command_upgrade(conn, cbdata);
+struct Route {
+    std::string method;
+    std::string path;
+    void (*handler)(const HttpRequest&, int);
+};
+
+#define ROUTE_ENTRY(M, P, H) {M, P, H}
+
+// Routing
+const std::vector<Route> routes = {
+    ROUTE_ENTRY("POST", "/login", handle_login),
+    ROUTE_ENTRY("POST", "/logout", handle_logout),
+    ROUTE_ENTRY("GET", "/config", handle_get_config),
+    ROUTE_ENTRY("PUT", "/config", handle_put_config),
+    ROUTE_ENTRY("POST", "/decode", handle_decode),
+    ROUTE_ENTRY("POST", "/command/decode", handle_decode), // Alias
+    ROUTE_ENTRY("GET", "/status", handle_status),
+    ROUTE_ENTRY("POST", "/reboot", handle_reboot),
+    ROUTE_ENTRY("POST", "/command/reboot", handle_reboot), // Alias
+    ROUTE_ENTRY("POST", "/upgrade", handle_upgrade),
+    ROUTE_ENTRY("POST", "/command/upgrade", handle_upgrade) // Alias
+};
+
+void handle_404(int client) {
+    Json::Value resp;
+    resp["error"] = "Not Found";
+    send_http_response(client, 404, "application/json", resp.toStyledString());
 }
 
-// ------------------ Main ------------------
-int main(int argc, char* argv[]) {
-    const char* options[] = {
-        "listening_ports", getEnvOrDefault("HTTP_PORT", "8080").c_str(),
-        "num_threads", "8",
-        "enable_auth_domain_check", "no",
-        nullptr
-    };
-    struct mg_callbacks callbacks;
-    memset(&callbacks, 0, sizeof(callbacks));
-    struct mg_context* ctx = mg_start(&callbacks, nullptr, options);
+// Main HTTP server loop
+void http_server_loop(const std::string& host, int port) {
+    int server_fd, new_socket;
+    struct sockaddr_in address;
+    int opt = 1;
+    int addrlen = sizeof(address);
 
-    // Session status
-    g_session.is_logged_in = false;
+    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+        std::cerr << "socket failed\n";
+        exit(EXIT_FAILURE);
+    }
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
+        std::cerr << "setsockopt\n";
+        exit(EXIT_FAILURE);
+    }
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = (host == "0.0.0.0") ? INADDR_ANY : inet_addr(host.c_str());
+    address.sin_port = htons(port);
 
-    mg_set_request_handler(ctx, "/login", handle_login, nullptr);
-    mg_set_request_handler(ctx, "/logout", handle_logout, nullptr);
-    mg_set_request_handler(ctx, "/status", handle_status, nullptr);
-    mg_set_request_handler(ctx, "/config", handle_get_config, nullptr); // GET
-    mg_set_request_handler(ctx, "/config", handle_put_config, nullptr); // PUT
-    mg_set_request_handler(ctx, "/command/decode", handle_command_decode, nullptr);
-    mg_set_request_handler(ctx, "/decode", handle_decode, nullptr);
-    mg_set_request_handler(ctx, "/command/reboot", handle_command_reboot, nullptr);
-    mg_set_request_handler(ctx, "/reboot", handle_reboot, nullptr);
-    mg_set_request_handler(ctx, "/command/upgrade", handle_command_upgrade, nullptr);
-    mg_set_request_handler(ctx, "/upgrade", handle_upgrade, nullptr);
+    if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
+        std::cerr << "bind failed\n";
+        exit(EXIT_FAILURE);
+    }
+    if (listen(server_fd, 16) < 0) {
+        std::cerr << "listen\n";
+        exit(EXIT_FAILURE);
+    }
+    std::cout << "HTTP server listening on " << host << ":" << port << std::endl;
+    while (1) {
+        if ((new_socket = accept(server_fd, (struct sockaddr*)&address, (socklen_t*)&addrlen)) < 0) {
+            std::cerr << "accept\n";
+            continue;
+        }
+        std::thread([new_socket]() {
+            char buffer[8192] = {0};
+            int valread = recv(new_socket, buffer, sizeof(buffer) - 1, 0);
+            if (valread > 0) {
+                std::string reqstr(buffer, valread);
+                HttpRequest req;
+                if (!parse_http_request(reqstr, req)) {
+                    send_http_response(new_socket, 400, "application/json", "{\"error\": \"Malformed Request\"}");
+                    close(new_socket);
+                    return;
+                }
+                bool matched = false;
+                for (const auto& r : routes) {
+                    if (req.method == r.method && req.path == r.path) {
+                        r.handler(req, new_socket);
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched) {
+                    handle_404(new_socket);
+                }
+            }
+            close(new_socket);
+        }).detach();
+    }
+}
 
-    printf("Hikvision Decoder HTTP Driver listening on port %s\n", getEnvOrDefault("HTTP_PORT", "8080").c_str());
-    printf("Press Ctrl+C to stop.\n");
-    // Block forever
-    while (true) std::this_thread::sleep_for(std::chrono::seconds(60));
-    mg_stop(ctx);
+// Entry point
+int main() {
+    std::string device_ip = getenv("DEVICE_IP") ? getenv("DEVICE_IP") : "127.0.0.1";
+    std::string server_host = getenv("SERVER_HOST") ? getenv("SERVER_HOST") : "0.0.0.0";
+    int server_port = getenv("SERVER_PORT") ? atoi(getenv("SERVER_PORT")) : 8080;
+
+    // (device_ip not used in simulation; would be used in real HCNetSDK integration)
+    http_server_loop(server_host, server_port);
     return 0;
 }
