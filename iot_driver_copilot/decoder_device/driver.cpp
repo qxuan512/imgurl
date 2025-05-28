@@ -1,571 +1,480 @@
 #include <iostream>
 #include <fstream>
 #include <sstream>
-#include <string>
-#include <vector>
-#include <map>
-#include <mutex>
 #include <thread>
+#include <mutex>
 #include <atomic>
 #include <csignal>
 #include <cstdlib>
-#include <ctime>
+#include <cstring>
+#include <map>
 #include <chrono>
 #include <condition_variable>
+#include <vector>
+#include <memory>
 
-#include <json/json.h>
 #include <yaml-cpp/yaml.h>
-#include <paho.mqtt.cpp/async_client.h>
-#include <cpprest/http_listener.h>
-#include <cpprest/json.h>
-#include <cpprest/uri.h>
+#include <nlohmann/json.hpp>
 
-// Kubernetes client includes (pseudo, to be replaced with actual C++ Kubernetes client or REST calls)
-#include "k8s_client.hpp" // Assume this provides Kubernetes interaction
+#include <mqtt/async_client.h>
 
-using namespace std;
-using namespace web;
-using namespace http;
-using namespace http::experimental::listener;
+#include <kubernetes/client.h> // Placeholder: use your actual Kubernetes API client lib
 
-// ----------- Logging -----------
+#include <crow.h> // For minimal HTTP server
+
+using json = nlohmann::json;
+using namespace std::chrono_literals;
+
+// ----- Logging -----
 enum class LogLevel { DEBUG, INFO, WARNING, ERROR };
-LogLevel log_level = LogLevel::INFO;
-mutex log_mutex;
 
-void set_log_level(const string& lvl) {
-    if (lvl == "DEBUG") log_level = LogLevel::DEBUG;
-    else if (lvl == "INFO") log_level = LogLevel::INFO;
-    else if (lvl == "WARNING") log_level = LogLevel::WARNING;
-    else if (lvl == "ERROR") log_level = LogLevel::ERROR;
+static LogLevel g_log_level = LogLevel::INFO;
+
+#define LOG_DEBUG(msg)   if (g_log_level <= LogLevel::DEBUG)   std::cout << "[DEBUG] " << msg << std::endl
+#define LOG_INFO(msg)    if (g_log_level <= LogLevel::INFO)    std::cout << "[INFO] " << msg << std::endl
+#define LOG_WARNING(msg) if (g_log_level <= LogLevel::WARNING) std::cout << "[WARNING] " << msg << std::endl
+#define LOG_ERROR(msg)   if (g_log_level <= LogLevel::ERROR)   std::cerr << "[ERROR] " << msg << std::endl
+
+// ----- Utility -----
+std::string getenv_or_default(const char* var, const std::string& def) {
+    const char* val = std::getenv(var);
+    return val ? std::string(val) : def;
 }
 
-#define LOG(level, msg) \
-    do { \
-        lock_guard<mutex> lock(log_mutex); \
-        if (log_level <= level) { \
-            string lvlstr; \
-            switch (level) { \
-                case LogLevel::DEBUG: lvlstr = "DEBUG"; break; \
-                case LogLevel::INFO: lvlstr = "INFO"; break; \
-                case LogLevel::WARNING: lvlstr = "WARNING"; break; \
-                case LogLevel::ERROR: lvlstr = "ERROR"; break; \
-            } \
-            cerr << "[" << lvlstr << "] " << __FUNCTION__ << ": " << msg << endl; \
-        } \
-    } while (0)
-
-// ----------- Utility -----------
-string getenv_or(const string& key, const string& default_val) {
-    const char* val = getenv(key.c_str());
-    return val ? string(val) : default_val;
+int getenv_or_default_int(const char* var, int def) {
+    const char* val = std::getenv(var);
+    if (!val) return def;
+    try { return std::stoi(val); }
+    catch (...) { return def; }
 }
 
-// ----------- ShifuClient -----------
+LogLevel parse_log_level(const std::string& lvl) {
+    if (lvl == "DEBUG") return LogLevel::DEBUG;
+    if (lvl == "INFO") return LogLevel::INFO;
+    if (lvl == "WARNING") return LogLevel::WARNING;
+    if (lvl == "ERROR") return LogLevel::ERROR;
+    return LogLevel::INFO;
+}
+
+// ----- ShifuClient -----
 class ShifuClient {
 public:
-    ShifuClient() : initialized(false) {
-        edge_device_name = getenv_or("EDGEDEVICE_NAME", "deviceshifu-networkvideodecoder");
-        edge_device_namespace = getenv_or("EDGEDEVICE_NAMESPACE", "devices");
-        config_mount_path = getenv_or("CONFIG_MOUNT_PATH", "/etc/edgedevice/config");
-        init_k8s_client();
+    ShifuClient(const std::string& device_name, const std::string& namespace_, const std::string& config_mount_path)
+        : device_name_(device_name), namespace_(namespace_), config_mount_path_(config_mount_path) {
+        _init_k8s_client();
     }
 
-    void init_k8s_client() {
+    void _init_k8s_client() {
         try {
-            // This is a pseudo-implementation, use your preferred C++ K8s client or REST
-            k8s_client = make_unique<K8sClient>(edge_device_namespace);
-            initialized = true;
-        } catch (const exception& e) {
-            LOG(LogLevel::ERROR, "Failed to initialize K8s client: " << e.what());
+            // Try in-cluster config, fall back to local config
+            if (!k8s_client_.load_incluster_config()) {
+                LOG_INFO("Falling back to local kubeconfig");
+                k8s_client_.load_kube_config();
+            }
+            initialized_ = true;
+        } catch (const std::exception& e) {
+            LOG_ERROR("Failed to initialize k8s client: " << e.what());
+            initialized_ = false;
         }
     }
 
-    Json::Value get_edge_device() {
-        if (!initialized) { init_k8s_client(); }
+    json get_edge_device() {
+        if (!initialized_) return json();
         try {
-            return k8s_client->get_edge_device(edge_device_name);
-        } catch (const exception& e) {
-            LOG(LogLevel::ERROR, "Failed to get EdgeDevice resource: " << e.what());
-            return Json::Value();
+            return k8s_client_.get_namespaced_custom_object("deviceshifu.edge.cerebra.dev", 
+                                                           "v1alpha1", namespace_, "edgedevices", device_name_);
+        } catch (const std::exception& e) {
+            LOG_ERROR("Failed to get EdgeDevice CR: " << e.what());
+            return json();
         }
     }
 
-    string get_device_address() {
-        Json::Value ed = get_edge_device();
-        if (ed.isMember("spec") && ed["spec"].isMember("address")) {
-            return ed["spec"]["address"].asString();
+    std::string get_device_address() {
+        try {
+            auto ed = get_edge_device();
+            if (ed.contains("spec") && ed["spec"].contains("address")) {
+                return ed["spec"]["address"].get<std::string>();
+            }
+        } catch (const std::exception& e) {
+            LOG_ERROR("Failed to parse device address: " << e.what());
         }
         return "";
     }
 
-    void update_device_status(const string& status, const string& reason = "") {
+    void update_device_status(const std::string& status) {
         try {
-            k8s_client->update_edge_device_status(edge_device_name, status, reason);
-        } catch (const exception& e) {
-            LOG(LogLevel::ERROR, "Failed to update device status: " << e.what());
+            json status_obj = { {"status", { {"deviceHealth", status} }} };
+            k8s_client_.patch_namespaced_custom_object_status("deviceshifu.edge.cerebra.dev", 
+                "v1alpha1", namespace_, "edgedevices", device_name_, status_obj);
+            LOG_INFO("Updated device status to: " << status);
+        } catch (const std::exception& e) {
+            LOG_ERROR("Failed to update device status: " << e.what());
         }
     }
 
-    string read_mounted_config_file(const string& filename) {
-        string path = config_mount_path + "/" + filename;
-        ifstream ifs(path);
-        if (!ifs) {
-            LOG(LogLevel::ERROR, "Failed to open config file: " << path);
+    std::string read_mounted_config_file(const std::string& filename) {
+        std::string path = config_mount_path_ + "/" + filename;
+        std::ifstream f(path);
+        if (!f) {
+            LOG_ERROR("Cannot open config file: " << path);
             return "";
         }
-        stringstream buffer;
-        buffer << ifs.rdbuf();
+        std::stringstream buffer;
+        buffer << f.rdbuf();
         return buffer.str();
     }
 
     YAML::Node get_instruction_config() {
-        string s = read_mounted_config_file("instructions");
-        if (s.empty()) return YAML::Node();
         try {
-            return YAML::Load(s);
-        } catch (const exception& e) {
-            LOG(LogLevel::ERROR, "Failed to parse YAML instructions: " << e.what());
-            return YAML::Node();
-        }
-    }
-
-    YAML::Node get_driver_properties() {
-        string s = read_mounted_config_file("driverProperties");
-        if (s.empty()) return YAML::Node();
-        try {
-            return YAML::Load(s);
-        } catch (const exception& e) {
-            LOG(LogLevel::ERROR, "Failed to parse YAML driverProperties: " << e.what());
+            std::string content = read_mounted_config_file("instructions");
+            if (content.empty()) return YAML::Node();
+            YAML::Node config = YAML::Load(content);
+            return config;
+        } catch (const std::exception& e) {
+            LOG_ERROR("Failed to parse instructions config: " << e.what());
             return YAML::Node();
         }
     }
 
 private:
-    string edge_device_name;
-    string edge_device_namespace;
-    string config_mount_path;
-    unique_ptr<K8sClient> k8s_client;
-    bool initialized;
+    std::string device_name_;
+    std::string namespace_;
+    std::string config_mount_path_;
+    K8SClient k8s_client_;
+    bool initialized_ = false;
 };
 
-// ----------- DecoderDevice Abstraction (SDK stub) -----------
-class DecoderDevice {
-public:
-    DecoderDevice(const string& device_address) : address(device_address) {
-        // Initialize SDK connection, login, etc.
-        // Pseudo: this should be replaced with actual device SDK logic.
-    }
 
-    bool connect() {
-        // Connect to device (login)
-        return true;
-    }
-
-    void disconnect() {
-        // Disconnect from device (logout)
-    }
-
-    // Gather telemetry/status data, convert to JSON
-    Json::Value get_status() {
-        Json::Value status;
-        status["device"] = "Decoder Device";
-        status["online"] = true;
-        status["timestamp"] = static_cast<Json::UInt64>(time(nullptr));
-        // Add more fields here from the actual device
-        return status;
-    }
-
-    // Handle control commands, returns a JSON response
-    Json::Value handle_command(const Json::Value& cmd) {
-        Json::Value resp;
-        // Implement command handling here, stub for now
-        resp["result"] = "ok";
-        resp["command"] = cmd;
-        return resp;
-    }
-
-private:
-    string address;
-};
-
-// ----------- Driver Implementation -----------
+// ----- Device Driver Class -----
 class DeviceShifuMQTTDriver {
 public:
-    DeviceShifuMQTTDriver() :
-        shutdown_flag(false),
-        shifu_client(),
-        mqtt_broker(getenv_or("MQTT_BROKER", "localhost")),
-        mqtt_port(stoi(getenv_or("MQTT_BROKER_PORT", "1883"))),
-        mqtt_username(getenv_or("MQTT_BROKER_USERNAME", "")),
-        mqtt_password(getenv_or("MQTT_BROKER_PASSWORD", "")),
-        mqtt_topic_prefix(getenv_or("MQTT_TOPIC_PREFIX", "shifu")),
-        http_host(getenv_or("HTTP_HOST", "0.0.0.0")),
-        http_port(getenv_or("HTTP_PORT", "8080")),
-        device_name(getenv_or("EDGEDEVICE_NAME", "deviceshifu-networkvideodecoder")),
-        device_namespace(getenv_or("EDGEDEVICE_NAMESPACE", "devices")),
-        client_id(device_name + "-" + to_string(time(nullptr))),
-        latest_data_mutex(),
-        status_thread(nullptr),
-        http_server_thread(nullptr)
+    DeviceShifuMQTTDriver()
+        : shutdown_flag_(false), 
+          device_name_(getenv_or_default("EDGEDEVICE_NAME", "deviceshifu-networkvideodecoder")),
+          namespace_(getenv_or_default("EDGEDEVICE_NAMESPACE", "devices")),
+          config_mount_path_(getenv_or_default("CONFIG_MOUNT_PATH", "/etc/edgedevice/config")),
+          mqtt_broker_(getenv_or_default("MQTT_BROKER", "")),
+          mqtt_broker_port_(getenv_or_default_int("MQTT_BROKER_PORT", 1883)),
+          mqtt_user_(getenv_or_default("MQTT_BROKER_USERNAME", "")),
+          mqtt_pass_(getenv_or_default("MQTT_BROKER_PASSWORD", "")),
+          mqtt_prefix_(getenv_or_default("MQTT_TOPIC_PREFIX", "shifu")),
+          http_host_(getenv_or_default("HTTP_HOST", "0.0.0.0")),
+          http_port_(getenv_or_default_int("HTTP_PORT", 8080)),
+          log_level_(parse_log_level(getenv_or_default("LOG_LEVEL", "INFO"))),
+          shifu_client_(device_name_, namespace_, config_mount_path_),
+          mqtt_client_(nullptr),
+          connection_ok_(false)
     {
-        set_log_level(getenv_or("LOG_LEVEL", "INFO"));
-        LOG(LogLevel::INFO, "Starting DeviceShifuMQTTDriver");
-
-        // Parse instruction config
-        parse_instruction_config();
-
-        // Device connection
-        string device_addr = shifu_client.get_device_address();
-        decoder_device = make_unique<DecoderDevice>(device_addr);
-
-        // MQTT client
-        string mqtt_addr = "tcp://" + mqtt_broker + ":" + to_string(mqtt_port);
-        mqtt_client = make_unique<mqtt::async_client>(mqtt_addr, client_id);
-
-        // HTTP server setup
-        http_listener_url = "http://" + http_host + ":" + http_port;
-        http_listener = nullptr;
-
-        // Thread management
-        shutdown_cv = make_unique<condition_variable>();
-    }
-
-    ~DeviceShifuMQTTDriver() {
-        shutdown();
+        g_log_level = log_level_;
     }
 
     void run() {
-        signal(SIGINT, signal_handler_wrapper);
-        signal(SIGTERM, signal_handler_wrapper);
-
-        // Connect device
-        if (!decoder_device->connect()) {
-            LOG(LogLevel::ERROR, "Failed to connect to Decoder Device");
-            shifu_client.update_device_status("Offline", "Device connection failed");
-        } else {
-            shifu_client.update_device_status("Online", "");
-            LOG(LogLevel::INFO, "Connected to Decoder Device");
+        LOG_INFO("Starting DeviceShifuMQTTDriver for device: " << device_name_);
+        if (!parse_instruction_config()) {
+            LOG_ERROR("Instruction config missing or invalid. Exiting.");
+            return;
         }
-
-        // Connect MQTT
-        if (!connect_mqtt()) {
-            LOG(LogLevel::ERROR, "Failed to connect to MQTT broker");
-            shifu_client.update_device_status("Offline", "MQTT connection failed");
-        } else {
-            LOG(LogLevel::INFO, "Connected to MQTT broker");
-        }
-
-        // Start publisher threads
+        setup_signal_handlers();
+        connect_mqtt();
+        start_http_server();
         start_scheduled_publishers();
 
-        // Start HTTP server
-        http_server_thread = new thread(&DeviceShifuMQTTDriver::run_http_server, this);
+        // Main loop: monitor MQTT connection
+        while (!shutdown_flag_) {
+            if (!mqtt_client_ || !connection_ok_) {
+                LOG_WARNING("MQTT not connected, attempting reconnect...");
+                connect_mqtt();
+            }
+            std::this_thread::sleep_for(2s);
+        }
 
-        // Connection monitor
-        status_thread = new thread(&DeviceShifuMQTTDriver::connection_monitor, this);
-
-        // Main loop: wait for shutdown
-        unique_lock<mutex> lk(shutdown_mutex);
-        shutdown_cv->wait(lk, [this]() { return shutdown_flag.load(); });
-
-        LOG(LogLevel::INFO, "Main loop exiting");
+        shutdown();
     }
 
     void shutdown() {
-        bool expected = false;
-        if (!shutdown_flag.compare_exchange_strong(expected, true)) return;
+        LOG_INFO("Shutting down DeviceShifuMQTTDriver...");
+        shutdown_flag_ = true;
 
-        LOG(LogLevel::INFO, "Shutting down...");
+        try {
+            if (mqtt_client_) {
+                mqtt_client_->disconnect()->wait();
+                mqtt_client_.reset();
+            }
+        } catch (const std::exception& e) {
+            LOG_ERROR("Error disconnecting MQTT: " << e.what());
+        }
 
         // Stop HTTP server
-        if (http_listener) {
-            http_listener->close().wait();
-            delete http_listener;
-            http_listener = nullptr;
-        }
-        if (http_server_thread) {
-            http_server_thread->join();
-            delete http_server_thread;
-            http_server_thread = nullptr;
+        if (http_thread_.joinable()) {
+            crow::stop();
+            http_thread_.join();
         }
 
         // Stop publisher threads
-        for (auto& t : publisher_threads) {
-            if (t.joinable()) t.join();
-        }
-        publisher_threads.clear();
-
-        // Stop status thread
-        if (status_thread) {
-            status_thread->join();
-            delete status_thread;
-            status_thread = nullptr;
+        for (auto& th : publisher_threads_) {
+            if (th.joinable()) th.join();
         }
 
-        // Disconnect MQTT
-        try {
-            if (mqtt_client && mqtt_client->is_connected()) {
-                mqtt_client->disconnect()->wait();
-            }
-        } catch (const exception& e) {
-            LOG(LogLevel::ERROR, "Error disconnecting MQTT: " << e.what());
-        }
-
-        // Disconnect device
-        decoder_device->disconnect();
-
-        LOG(LogLevel::INFO, "Shutdown complete");
+        shifu_client_.update_device_status("Offline");
+        LOG_INFO("DeviceShifuMQTTDriver shutdown complete.");
     }
-
-    static void signal_handler_wrapper(int signal) {
-        instance()->signal_handler(signal);
-    }
-
-    void signal_handler(int signal) {
-        LOG(LogLevel::INFO, "Signal received: " << signal);
-        shutdown();
-        // Wake up main thread if needed
-        shutdown_cv->notify_all();
-    }
-
-    static DeviceShifuMQTTDriver* instance_ptr;
-    static DeviceShifuMQTTDriver* instance() { return instance_ptr; }
 
 private:
-    // Members
-    atomic<bool> shutdown_flag;
-    ShifuClient shifu_client;
-    unique_ptr<DecoderDevice> decoder_device;
+    std::atomic<bool> shutdown_flag_;
+    std::string device_name_;
+    std::string namespace_;
+    std::string config_mount_path_;
+    std::string mqtt_broker_;
+    int mqtt_broker_port_;
+    std::string mqtt_user_;
+    std::string mqtt_pass_;
+    std::string mqtt_prefix_;
+    std::string http_host_;
+    int http_port_;
+    LogLevel log_level_;
 
-    string mqtt_broker;
-    int mqtt_port;
-    string mqtt_username;
-    string mqtt_password;
-    string mqtt_topic_prefix;
-    string http_host;
-    string http_port;
-    string device_name;
-    string device_namespace;
-    string client_id;
+    ShifuClient shifu_client_;
 
-    map<string, size_t> topic_publish_intervals;
-    map<string, string> topic_mode;
-    map<string, int> topic_qos;
-    map<string, thread> publisher_threads;
+    std::unique_ptr<mqtt::async_client> mqtt_client_;
+    std::atomic<bool> connection_ok_;
+    std::mutex data_mutex_;
+    std::map<std::string, json> latest_data_;
 
-    unique_ptr<mqtt::async_client> mqtt_client;
-    unique_ptr<mqtt::connect_options> mqtt_conn_opts;
-    mutex latest_data_mutex;
-    map<string, Json::Value> latest_data;
+    YAML::Node instruction_config_;
+    std::vector<std::thread> publisher_threads_;
 
-    string http_listener_url;
-    http_listener* http_listener;
-    thread* http_server_thread;
-    thread* status_thread;
-    unique_ptr<condition_variable> shutdown_cv;
-    mutex shutdown_mutex;
+    std::thread http_thread_;
 
-    // --- Configuration Parsing ---
-    void parse_instruction_config() {
-        YAML::Node instructions = shifu_client.get_instruction_config();
-        if (!instructions || !instructions.IsMap()) {
-            LOG(LogLevel::ERROR, "No valid instructions found");
-            return;
-        }
-        for (auto it = instructions.begin(); it != instructions.end(); ++it) {
-            string instr_name = it->first.as<string>();
-            YAML::Node instr = it->second;
-            string mode = instr["protocolProperty"]["mode"].as<string>("publisher");
-            size_t interval = instr["protocolProperty"]["publishIntervalMs"].as<size_t>(1000);
-            int qos = instr["protocolProperty"]["qos"].as<int>(1);
-            topic_publish_intervals[instr_name] = interval;
-            topic_mode[instr_name] = mode;
-            topic_qos[instr_name] = qos;
-        }
+    void setup_signal_handlers() {
+        std::signal(SIGINT, DeviceShifuMQTTDriver::signal_handler);
+        std::signal(SIGTERM, DeviceShifuMQTTDriver::signal_handler);
     }
 
-    // --- MQTT ---
-    bool connect_mqtt() {
-        try {
-            mqtt::connect_options conn_opts;
-            conn_opts.set_keep_alive_interval(20);
-            conn_opts.set_clean_session(true);
-            if (!mqtt_username.empty()) {
-                conn_opts.set_user_name(mqtt_username);
-                conn_opts.set_password(mqtt_password);
-            }
-            mqtt_conn_opts = make_unique<mqtt::connect_options>(conn_opts);
+    static void signal_handler(int signum) {
+        LOG_WARNING("Received signal " << signum << ", shutting down...");
+        instance()->shutdown_flag_ = true;
+    }
 
-            mqtt_client->set_connected_handler([this](const string&) {
-                LOG(LogLevel::INFO, "MQTT connected");
-                subscribe_topics();
-                publish_status("Online");
-            });
-            mqtt_client->set_connection_lost_handler([this](const string&) {
-                LOG(LogLevel::WARNING, "MQTT connection lost");
-                publish_status("Offline");
-            });
-            mqtt_client->set_message_callback([this](mqtt::const_message_ptr msg) {
-                handle_mqtt_message(msg);
-            });
+    static DeviceShifuMQTTDriver* instance(DeviceShifuMQTTDriver* inst = nullptr) {
+        static DeviceShifuMQTTDriver* singleton = nullptr;
+        if (inst) singleton = inst;
+        return singleton;
+    }
 
-            mqtt_client->connect(*mqtt_conn_opts)->wait();
-            return true;
-        } catch (const exception& e) {
-            LOG(LogLevel::ERROR, "MQTT connection failed: " << e.what());
+    bool parse_instruction_config() {
+        instruction_config_ = shifu_client_.get_instruction_config();
+        if (!instruction_config_ || !instruction_config_["instructions"]) {
+            LOG_ERROR("No instructions found in config.");
             return false;
         }
+        return true;
     }
 
-    void subscribe_topics() {
-        // Subscribe to device commands
-        string topic = mqtt_topic_prefix + "/" + device_name + "/device/commands/control";
-        int qos = 1;
+    void connect_mqtt() {
+        if (mqtt_broker_.empty()) {
+            LOG_ERROR("MQTT_BROKER not specified.");
+            return;
+        }
+        std::string client_id = device_name_ + "-" + std::to_string(std::time(nullptr));
+        std::string address = "tcp://" + mqtt_broker_ + ":" + std::to_string(mqtt_broker_port_);
+        mqtt_client_ = std::make_unique<mqtt::async_client>(address, client_id);
+
+        auto connOpts = mqtt::connect_options_builder()
+            .clean_session()
+            .automatic_reconnect(true)
+            .finalize();
+
+        if (!mqtt_user_.empty())
+            connOpts.set_user_name(mqtt_user_);
+        if (!mqtt_pass_.empty())
+            connOpts.set_password(mqtt_pass_);
+
+        auto self = this;
+        class callback : public virtual mqtt::callback, public virtual mqtt::iaction_listener {
+            DeviceShifuMQTTDriver* driver_;
+        public:
+            callback(DeviceShifuMQTTDriver* driver) : driver_(driver) {}
+            void connected(const std::string&) override {
+                driver_->connection_ok_ = true;
+                driver_->on_connected();
+            }
+            void connection_lost(const std::string& cause) override {
+                driver_->connection_ok_ = false;
+                LOG_WARNING("MQTT connection lost: " << cause);
+            }
+            void message_arrived(mqtt::const_message_ptr msg) override {
+                driver_->handle_mqtt_message(msg);
+            }
+            void delivery_complete(mqtt::delivery_token_ptr) override {}
+            void on_failure(const mqtt::token&) override {
+                driver_->connection_ok_ = false;
+                LOG_ERROR("MQTT connection failed.");
+            }
+            void on_success(const mqtt::token&) override {}
+        };
+        mqtt_client_->set_callback(callback(this));
+
         try {
-            mqtt_client->subscribe(topic, qos)->wait();
-            LOG(LogLevel::INFO, "Subscribed to: " << topic);
-        } catch (const exception& e) {
-            LOG(LogLevel::ERROR, "Failed to subscribe: " << e.what());
+            mqtt_client_->connect(connOpts)->wait();
+            connection_ok_ = true;
+            LOG_INFO("Connected to MQTT broker at " << address);
+            shifu_client_.update_device_status("Online");
+        } catch (const std::exception& e) {
+            connection_ok_ = false;
+            LOG_ERROR("MQTT connect failed: " << e.what());
         }
     }
 
-    void publish_status(const string& status) {
-        Json::Value payload;
-        payload["status"] = status;
-        payload["timestamp"] = static_cast<Json::UInt64>(time(nullptr));
-        string topic = mqtt_topic_prefix + "/" + device_name + "/status";
-        publish_mqtt(topic, payload, 1, true);
-    }
-
-    void publish_mqtt(const string& topic, const Json::Value& payload, int qos, bool retained = false) {
-        Json::StreamWriterBuilder wbuilder;
-        string js = Json::writeString(wbuilder, payload);
-
-        auto msg = mqtt::make_message(topic, js);
-        msg->set_qos(qos);
-        msg->set_retained(retained);
-
+    void on_connected() {
+        // Subscribe to control commands
+        std::string ctrl_topic = mqtt_prefix_ + "/" + device_name_ + "/control/#";
         try {
-            mqtt_client->publish(msg)->wait();
-            LOG(LogLevel::DEBUG, "Published to " << topic << ": " << js);
-        } catch (const exception& e) {
-            LOG(LogLevel::ERROR, "MQTT publish failed: " << e.what());
+            mqtt_client_->subscribe(ctrl_topic, 1)->wait();
+            LOG_INFO("Subscribed to: " << ctrl_topic);
+        } catch (const std::exception& e) {
+            LOG_ERROR("Failed to subscribe control topic: " << e.what());
+        }
+        // Subscribe to device telemetry (if necessary)
+        for (const auto& instr : instruction_config_["instructions"]) {
+            if (instr.second["protocol"].as<std::string>() == "MQTT" &&
+                instr.second["mode"].as<std::string>() == "subscriber") {
+                std::string topic = mqtt_prefix_ + "/" + device_name_ + "/" + instr.first.as<std::string>();
+                int qos = instr.second["qos"] ? instr.second["qos"].as<int>() : 1;
+                try {
+                    mqtt_client_->subscribe(topic, qos)->wait();
+                    LOG_INFO("Subscribed to: " << topic);
+                } catch (const std::exception& e) {
+                    LOG_ERROR("Failed to subscribe topic: " << e.what());
+                }
+            }
         }
     }
 
     void handle_mqtt_message(mqtt::const_message_ptr msg) {
         try {
-            string topic = msg->get_topic();
-            string payload = msg->to_string();
-            LOG(LogLevel::INFO, "MQTT message received: " << topic << " | " << payload);
+            LOG_DEBUG("MQTT message arrived: " << msg->get_topic() << " payload: " << msg->to_string());
+            // Route to appropriate handler
+            std::string topic = msg->get_topic();
+            std::string payload = msg->to_string();
 
-            // Only handle control
-            if (topic.find("/device/commands/control") != string::npos) {
-                Json::Value jpayload;
-                Json::CharReaderBuilder rbuilder;
-                string errs;
-                istringstream ss(payload);
-                if (!Json::parseFromStream(rbuilder, ss, &jpayload, &errs)) {
-                    LOG(LogLevel::ERROR, "Failed to parse command JSON: " << errs);
-                    return;
+            // Handle control commands
+            if (topic.find("/control/") != std::string::npos) {
+                json cmd = json::parse(payload, nullptr, false);
+                if (!cmd.is_discarded()) {
+                    // Example: handle control command
+                    // TODO: Send command to device via SDK, react accordingly
+                    LOG_INFO("Received control command: " << cmd.dump());
+                    // For demo, echo status
+                    publish_status("Received command: " + cmd.dump());
                 }
-                Json::Value resp = decoder_device->handle_command(jpayload);
-                string resp_topic = mqtt_topic_prefix + "/" + device_name + "/device/commands/control/response";
-                publish_mqtt(resp_topic, resp, 1, false);
             }
-        } catch (const exception& e) {
-            LOG(LogLevel::ERROR, "Error handling MQTT message: " << e.what());
+            // Handle telemetry subscriptions
+            else if (topic.find("/telemetry/") != std::string::npos) {
+                std::lock_guard<std::mutex> lk(data_mutex_);
+                latest_data_[topic] = json::parse(payload, nullptr, false);
+            }
+        } catch (const std::exception& e) {
+            LOG_ERROR("Exception in handle_mqtt_message: " << e.what());
         }
     }
 
-    // --- Telemetry Publisher ---
-    void start_scheduled_publishers() {
-        for (const auto& kv : topic_publish_intervals) {
-            string topic = kv.first;
-            size_t interval = kv.second;
-            if (topic_mode[topic] == "publisher") {
-                publisher_threads[topic] = thread(&DeviceShifuMQTTDriver::publish_topic_periodically, this, topic, interval, topic_qos[topic]);
-            }
-        }
-    }
-
-    void publish_topic_periodically(string topic, size_t interval_ms, int qos) {
-        string mqtt_topic = mqtt_topic_prefix + "/" + device_name + "/" + topic;
-        while (!shutdown_flag.load()) {
-            Json::Value data = decoder_device->get_status();
-            {
-                lock_guard<mutex> lock(latest_data_mutex);
-                latest_data[topic] = data;
-            }
-            publish_mqtt(mqtt_topic, data, qos, false);
-
-            for (size_t i = 0; i < interval_ms / 100; ++i) {
-                if (shutdown_flag.load()) break;
-                this_thread::sleep_for(chrono::milliseconds(100));
-            }
-        }
-    }
-
-    // --- HTTP Server ---
-    void run_http_server() {
-        try {
-            http_listener = new http_listener(http_listener_url);
-            http_listener->support(methods::GET, [this](http_request request) {
-                string path = request.relative_uri().path();
-                if (path == "/health") {
-                    json::value resp;
-                    resp["status"] = json::value::string("ok");
-                    request.reply(status_codes::OK, resp);
-                } else if (path == "/status") {
-                    lock_guard<mutex> lock(latest_data_mutex);
-                    json::value resp;
-                    for (const auto& kv : latest_data) {
-                        Json::StreamWriterBuilder wbuilder;
-                        string js = Json::writeString(wbuilder, kv.second);
-                        resp[kv.first] = json::value::string(js);
-                    }
-                    request.reply(status_codes::OK, resp);
-                } else {
-                    request.reply(status_codes::NotFound, "Not found");
-                }
+    void start_http_server() {
+        auto self = this;
+        http_thread_ = std::thread([this, self](){
+            crow::SimpleApp app;
+            CROW_ROUTE(app, "/health")([self](){
+                return crow::response(200, R"({"status":"ok"})");
             });
-            http_listener->open().wait();
-            LOG(LogLevel::INFO, "HTTP server running at " << http_listener_url);
-            while (!shutdown_flag.load()) {
-                this_thread::sleep_for(chrono::milliseconds(250));
-            }
-            http_listener->close().wait();
-        } catch (const exception& e) {
-            LOG(LogLevel::ERROR, "HTTP server error: " << e.what());
+            CROW_ROUTE(app, "/status")([self](){
+                json j;
+                j["device_name"] = self->device_name_;
+                j["connected"] = self->connection_ok_;
+                {
+                    std::lock_guard<std::mutex> lk(self->data_mutex_);
+                    j["latest_data"] = self->latest_data_;
+                }
+                return crow::response(200, j.dump());
+            });
+            app.bindaddr(http_host_).port(http_port_).run();
+        });
+    }
+
+    void publish_status(const std::string& msg) {
+        json j;
+        j["status"] = msg;
+        publish_mqtt(mqtt_prefix_ + "/" + device_name_ + "/status", j, 1);
+    }
+
+    void publish_mqtt(const std::string& topic, const json& payload, int qos = 1) {
+        if (!connection_ok_ || !mqtt_client_) return;
+        try {
+            auto msg = mqtt::make_message(topic, payload.dump());
+            msg->set_qos(qos);
+            mqtt_client_->publish(msg);
+            LOG_DEBUG("Published to " << topic << ": " << payload.dump());
+        } catch (const std::exception& e) {
+            LOG_ERROR("MQTT publish error: " << e.what());
         }
     }
 
-    // --- Connection Monitor ---
-    void connection_monitor() {
-        while (!shutdown_flag.load()) {
-            bool dev_ok = decoder_device->connect();
-            bool mqtt_ok = mqtt_client->is_connected();
-            if (!dev_ok) {
-                shifu_client.update_device_status("Offline", "Device connection lost");
+    void start_scheduled_publishers() {
+        for (const auto& inst : instruction_config_["instructions"]) {
+            std::string name = inst.first.as<std::string>();
+            const YAML::Node& props = inst.second;
+            std::string mode = props["mode"] ? props["mode"].as<std::string>() : "";
+            int interval = props["publishIntervalMS"] ? props["publishIntervalMS"].as<int>() : 0;
+            std::string protocol = props["protocol"] ? props["protocol"].as<std::string>() : "";
+            if (mode == "publisher" && protocol == "MQTT" && interval > 0) {
+                publisher_threads_.emplace_back(&DeviceShifuMQTTDriver::publish_topic_periodically, this, name, interval, props);
+                publisher_threads_.back().detach();
             }
-            if (!mqtt_ok) {
-                shifu_client.update_device_status("Offline", "MQTT disconnected");
-                // Try reconnect
-                connect_mqtt();
-            }
-            this_thread::sleep_for(chrono::seconds(5));
         }
+    }
+
+    void publish_topic_periodically(std::string instruction, int interval_ms, YAML::Node props) {
+        std::string topic = mqtt_prefix_ + "/" + device_name_ + "/" + instruction;
+        int qos = props["qos"] ? props["qos"].as<int>() : 1;
+        while (!shutdown_flag_) {
+            try {
+                json data = get_device_data_for_instruction(instruction, props);
+                {
+                    std::lock_guard<std::mutex> lk(data_mutex_);
+                    latest_data_[topic] = data;
+                }
+                publish_mqtt(topic, data, qos);
+            } catch (const std::exception& e) {
+                LOG_ERROR("Error in periodic publisher for " << instruction << ": " << e.what());
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+        }
+    }
+
+    json get_device_data_for_instruction(const std::string& instruction, const YAML::Node& props) {
+        // TODO: Integrate with actual device SDK (HCNetSDK) or RTSP to retrieve real data.
+        // For now, return dummy data for demo.
+        json data;
+        if (instruction == "status" || instruction.find("telemetry") != std::string::npos) {
+            data["device_status"] = "online";
+            data["channels"] = { { "id", 1 }, { "status", "active" } };
+            data["alarm"] = false;
+            data["upgrade_progress"] = 100;
+            data["timestamp"] = std::time(nullptr);
+        } else if (instruction == "commands" || instruction.find("control") != std::string::npos) {
+            data["result"] = "success";
+            data["timestamp"] = std::time(nullptr);
+        } else {
+            data["data"] = "unknown";
+            data["timestamp"] = std::time(nullptr);
+        }
+        return data;
     }
 };
 
-// Global instance pointer for signal handling
-DeviceShifuMQTTDriver* DeviceShifuMQTTDriver::instance_ptr = nullptr;
 
-// ----------- Main Entrypoint -----------
-int main(int argc, char* argv[]) {
-    DeviceShifuMQTTDriver driver;
-    DeviceShifuMQTTDriver::instance_ptr = &driver;
-    driver.run();
+// ---- Main Entrypoint ----
+int main() {
+    auto driver = std::make_unique<DeviceShifuMQTTDriver>();
+    DeviceShifuMQTTDriver::instance(driver.get());
+    driver->run();
     return 0;
 }
