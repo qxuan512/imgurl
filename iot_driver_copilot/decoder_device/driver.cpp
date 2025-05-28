@@ -1,383 +1,571 @@
 #include <iostream>
-#include <cstdlib>
-#include <cstring>
-#include <string>
+#include <fstream>
 #include <sstream>
-#include <thread>
+#include <string>
 #include <vector>
 #include <map>
 #include <mutex>
-#include <algorithm>
-#include <chrono>
-#include <fstream>
-#include <streambuf>
+#include <thread>
+#include <atomic>
 #include <csignal>
+#include <cstdlib>
+#include <ctime>
+#include <chrono>
 #include <condition_variable>
-#include <cstdio>
-#include <memory>
-#include <cctype>
+
 #include <json/json.h>
+#include <yaml-cpp/yaml.h>
+#include <paho.mqtt.cpp/async_client.h>
+#include <cpprest/http_listener.h>
+#include <cpprest/json.h>
+#include <cpprest/uri.h>
 
-// --- Minimal HTTP server dependencies ---
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
+// Kubernetes client includes (pseudo, to be replaced with actual C++ Kubernetes client or REST calls)
+#include "k8s_client.hpp" // Assume this provides Kubernetes interaction
 
-// --- Device SDK Placeholder (HCNetSDK) ---
-class DeviceSDK {
+using namespace std;
+using namespace web;
+using namespace http;
+using namespace http::experimental::listener;
+
+// ----------- Logging -----------
+enum class LogLevel { DEBUG, INFO, WARNING, ERROR };
+LogLevel log_level = LogLevel::INFO;
+mutex log_mutex;
+
+void set_log_level(const string& lvl) {
+    if (lvl == "DEBUG") log_level = LogLevel::DEBUG;
+    else if (lvl == "INFO") log_level = LogLevel::INFO;
+    else if (lvl == "WARNING") log_level = LogLevel::WARNING;
+    else if (lvl == "ERROR") log_level = LogLevel::ERROR;
+}
+
+#define LOG(level, msg) \
+    do { \
+        lock_guard<mutex> lock(log_mutex); \
+        if (log_level <= level) { \
+            string lvlstr; \
+            switch (level) { \
+                case LogLevel::DEBUG: lvlstr = "DEBUG"; break; \
+                case LogLevel::INFO: lvlstr = "INFO"; break; \
+                case LogLevel::WARNING: lvlstr = "WARNING"; break; \
+                case LogLevel::ERROR: lvlstr = "ERROR"; break; \
+            } \
+            cerr << "[" << lvlstr << "] " << __FUNCTION__ << ": " << msg << endl; \
+        } \
+    } while (0)
+
+// ----------- Utility -----------
+string getenv_or(const string& key, const string& default_val) {
+    const char* val = getenv(key.c_str());
+    return val ? string(val) : default_val;
+}
+
+// ----------- ShifuClient -----------
+class ShifuClient {
 public:
-    DeviceSDK(const std::string& ip, int port, const std::string& user, const std::string& pass)
-        : device_ip(ip), device_port(port), username(user), password(pass) {}
-
-    // Dummy implementations -- replace with real SDK calls
-    Json::Value getStatus(const std::string& filter) {
-        Json::Value status;
-        if (filter.empty() || filter == "decoder") {
-            status["decoder_channel_state"] = "OK";
-        }
-        if (filter.empty() || filter == "alarm") {
-            status["alarm_status"] = "No alarms";
-        }
-        if (filter.empty() || filter == "playback") {
-            status["playback_progress"] = 37;
-        }
-        if (filter.empty() || filter == "network") {
-            status["network_config"] = "eth0:192.168.1.20";
-        }
-        status["device_model"] = "DS-6300D";
-        status["manufacturer"] = "Hikvision";
-        return status;
+    ShifuClient() : initialized(false) {
+        edge_device_name = getenv_or("EDGEDEVICE_NAME", "deviceshifu-networkvideodecoder");
+        edge_device_namespace = getenv_or("EDGEDEVICE_NAMESPACE", "devices");
+        config_mount_path = getenv_or("CONFIG_MOUNT_PATH", "/etc/edgedevice/config");
+        init_k8s_client();
     }
 
-    bool updateDisplay(const Json::Value& config, std::string& err) {
-        // Validate and "apply" config
-        if (!config.isObject()) {
-            err = "Invalid configuration object";
-            return false;
+    void init_k8s_client() {
+        try {
+            // This is a pseudo-implementation, use your preferred C++ K8s client or REST
+            k8s_client = make_unique<K8sClient>(edge_device_namespace);
+            initialized = true;
+        } catch (const exception& e) {
+            LOG(LogLevel::ERROR, "Failed to initialize K8s client: " << e.what());
         }
-        // Simulate update
-        return true;
     }
 
-    bool playbackControl(const Json::Value& command, std::string& err) {
-        // Dummy validate
-        if (!command.isMember("action")) {
-            err = "Missing 'action' in payload";
-            return false;
+    Json::Value get_edge_device() {
+        if (!initialized) { init_k8s_client(); }
+        try {
+            return k8s_client->get_edge_device(edge_device_name);
+        } catch (const exception& e) {
+            LOG(LogLevel::ERROR, "Failed to get EdgeDevice resource: " << e.what());
+            return Json::Value();
         }
-        // Simulate playback control
-        return true;
     }
 
-    bool reboot(const Json::Value& params, std::string& err) {
-        // Simulate reboot
-        return true;
+    string get_device_address() {
+        Json::Value ed = get_edge_device();
+        if (ed.isMember("spec") && ed["spec"].isMember("address")) {
+            return ed["spec"]["address"].asString();
+        }
+        return "";
+    }
+
+    void update_device_status(const string& status, const string& reason = "") {
+        try {
+            k8s_client->update_edge_device_status(edge_device_name, status, reason);
+        } catch (const exception& e) {
+            LOG(LogLevel::ERROR, "Failed to update device status: " << e.what());
+        }
+    }
+
+    string read_mounted_config_file(const string& filename) {
+        string path = config_mount_path + "/" + filename;
+        ifstream ifs(path);
+        if (!ifs) {
+            LOG(LogLevel::ERROR, "Failed to open config file: " << path);
+            return "";
+        }
+        stringstream buffer;
+        buffer << ifs.rdbuf();
+        return buffer.str();
+    }
+
+    YAML::Node get_instruction_config() {
+        string s = read_mounted_config_file("instructions");
+        if (s.empty()) return YAML::Node();
+        try {
+            return YAML::Load(s);
+        } catch (const exception& e) {
+            LOG(LogLevel::ERROR, "Failed to parse YAML instructions: " << e.what());
+            return YAML::Node();
+        }
+    }
+
+    YAML::Node get_driver_properties() {
+        string s = read_mounted_config_file("driverProperties");
+        if (s.empty()) return YAML::Node();
+        try {
+            return YAML::Load(s);
+        } catch (const exception& e) {
+            LOG(LogLevel::ERROR, "Failed to parse YAML driverProperties: " << e.what());
+            return YAML::Node();
+        }
     }
 
 private:
-    std::string device_ip;
-    int device_port;
-    std::string username;
-    std::string password;
+    string edge_device_name;
+    string edge_device_namespace;
+    string config_mount_path;
+    unique_ptr<K8sClient> k8s_client;
+    bool initialized;
 };
 
-// --- Utility ---
-std::string getenv_def(const char* key, const char* def) {
-    const char* val = std::getenv(key);
-    return val ? val : def;
-}
+// ----------- DecoderDevice Abstraction (SDK stub) -----------
+class DecoderDevice {
+public:
+    DecoderDevice(const string& device_address) : address(device_address) {
+        // Initialize SDK connection, login, etc.
+        // Pseudo: this should be replaced with actual device SDK logic.
+    }
 
-int getenv_int(const char* key, int def) {
-    const char* val = std::getenv(key);
-    if (!val) return def;
-    return std::atoi(val);
-}
+    bool connect() {
+        // Connect to device (login)
+        return true;
+    }
 
-void send_response(int client_fd, int status, const std::string& status_text, const std::string& content_type, const std::string& body) {
-    std::ostringstream oss;
-    oss << "HTTP/1.1 " << status << " " << status_text << "\r\n";
-    oss << "Content-Type: " << content_type << "\r\n";
-    oss << "Content-Length: " << body.size() << "\r\n";
-    oss << "Access-Control-Allow-Origin: *\r\n";
-    oss << "Connection: close\r\n\r\n";
-    oss << body;
-    std::string resp = oss.str();
-    send(client_fd, resp.data(), resp.size(), 0);
-}
+    void disconnect() {
+        // Disconnect from device (logout)
+    }
 
-void send_json(int client_fd, int status, const std::string& status_text, const Json::Value& obj) {
-    Json::StreamWriterBuilder wbuilder;
-    std::string output = Json::writeString(wbuilder, obj);
-    send_response(client_fd, status, status_text, "application/json", output);
-}
+    // Gather telemetry/status data, convert to JSON
+    Json::Value get_status() {
+        Json::Value status;
+        status["device"] = "Decoder Device";
+        status["online"] = true;
+        status["timestamp"] = static_cast<Json::UInt64>(time(nullptr));
+        // Add more fields here from the actual device
+        return status;
+    }
 
-void send_404(int client_fd) {
-    Json::Value j;
-    j["error"] = "Not found";
-    send_json(client_fd, 404, "Not Found", j);
-}
+    // Handle control commands, returns a JSON response
+    Json::Value handle_command(const Json::Value& cmd) {
+        Json::Value resp;
+        // Implement command handling here, stub for now
+        resp["result"] = "ok";
+        resp["command"] = cmd;
+        return resp;
+    }
 
-void send_400(int client_fd, const std::string& err) {
-    Json::Value j;
-    j["error"] = err;
-    send_json(client_fd, 400, "Bad Request", j);
-}
-
-void send_405(int client_fd) {
-    Json::Value j;
-    j["error"] = "Method not allowed";
-    send_json(client_fd, 405, "Method Not Allowed", j);
-}
-
-// --- HTTP Parsing ---
-struct HttpRequest {
-    std::string method;
-    std::string path;
-    std::map<std::string, std::string> query;
-    std::map<std::string, std::string> headers;
-    std::string body;
+private:
+    string address;
 };
 
-std::string url_decode(const std::string& s) {
-    std::string out;
-    char a, b;
-    for (size_t i = 0; i < s.length(); ++i) {
-        if ((s[i] == '%') && ((a = s[i+1]) && (b = s[i+2])) &&
-            (isxdigit(a) && isxdigit(b))) {
-            a = (a >= 'a') ? (a - 'a' + 10) : (a >= 'A') ? (a - 'A' + 10) : (a - '0');
-            b = (b >= 'a') ? (b - 'a' + 10) : (b >= 'A') ? (b - 'A' + 10) : (b - '0');
-            out += static_cast<char>(16 * a + b);
-            i += 2;
-        } else if (s[i] == '+') {
-            out += ' ';
+// ----------- Driver Implementation -----------
+class DeviceShifuMQTTDriver {
+public:
+    DeviceShifuMQTTDriver() :
+        shutdown_flag(false),
+        shifu_client(),
+        mqtt_broker(getenv_or("MQTT_BROKER", "localhost")),
+        mqtt_port(stoi(getenv_or("MQTT_BROKER_PORT", "1883"))),
+        mqtt_username(getenv_or("MQTT_BROKER_USERNAME", "")),
+        mqtt_password(getenv_or("MQTT_BROKER_PASSWORD", "")),
+        mqtt_topic_prefix(getenv_or("MQTT_TOPIC_PREFIX", "shifu")),
+        http_host(getenv_or("HTTP_HOST", "0.0.0.0")),
+        http_port(getenv_or("HTTP_PORT", "8080")),
+        device_name(getenv_or("EDGEDEVICE_NAME", "deviceshifu-networkvideodecoder")),
+        device_namespace(getenv_or("EDGEDEVICE_NAMESPACE", "devices")),
+        client_id(device_name + "-" + to_string(time(nullptr))),
+        latest_data_mutex(),
+        status_thread(nullptr),
+        http_server_thread(nullptr)
+    {
+        set_log_level(getenv_or("LOG_LEVEL", "INFO"));
+        LOG(LogLevel::INFO, "Starting DeviceShifuMQTTDriver");
+
+        // Parse instruction config
+        parse_instruction_config();
+
+        // Device connection
+        string device_addr = shifu_client.get_device_address();
+        decoder_device = make_unique<DecoderDevice>(device_addr);
+
+        // MQTT client
+        string mqtt_addr = "tcp://" + mqtt_broker + ":" + to_string(mqtt_port);
+        mqtt_client = make_unique<mqtt::async_client>(mqtt_addr, client_id);
+
+        // HTTP server setup
+        http_listener_url = "http://" + http_host + ":" + http_port;
+        http_listener = nullptr;
+
+        // Thread management
+        shutdown_cv = make_unique<condition_variable>();
+    }
+
+    ~DeviceShifuMQTTDriver() {
+        shutdown();
+    }
+
+    void run() {
+        signal(SIGINT, signal_handler_wrapper);
+        signal(SIGTERM, signal_handler_wrapper);
+
+        // Connect device
+        if (!decoder_device->connect()) {
+            LOG(LogLevel::ERROR, "Failed to connect to Decoder Device");
+            shifu_client.update_device_status("Offline", "Device connection failed");
         } else {
-            out += s[i];
+            shifu_client.update_device_status("Online", "");
+            LOG(LogLevel::INFO, "Connected to Decoder Device");
         }
-    }
-    return out;
-}
 
-void parse_query(const std::string& qs, std::map<std::string, std::string>& qmap) {
-    size_t start = 0;
-    while (start < qs.size()) {
-        size_t eq = qs.find('=', start);
-        size_t amp = qs.find('&', start);
-        if (eq == std::string::npos) break;
-        std::string key = url_decode(qs.substr(start, eq - start));
-        std::string val = url_decode(qs.substr(eq + 1, 
-                                  (amp == std::string::npos ? qs.size() : amp) - eq - 1));
-        qmap[key] = val;
-        if (amp == std::string::npos) break;
-        start = amp + 1;
-    }
-}
-
-bool parse_http_request(const std::string& req, HttpRequest& out) {
-    std::istringstream iss(req);
-    std::string line;
-    if (!std::getline(iss, line)) return false;
-    std::istringstream first(line);
-    if (!(first >> out.method)) return false;
-    std::string pathq;
-    if (!(first >> pathq)) return false;
-    size_t qmark = pathq.find('?');
-    if (qmark == std::string::npos) {
-        out.path = pathq;
-    } else {
-        out.path = pathq.substr(0, qmark);
-        parse_query(pathq.substr(qmark+1), out.query);
-    }
-    // Headers
-    while (std::getline(iss, line) && line != "\r") {
-        size_t col = line.find(':');
-        if (col != std::string::npos) {
-            std::string key = line.substr(0, col);
-            std::string val = line.substr(col+1);
-            key.erase(std::remove_if(key.begin(), key.end(), ::isspace), key.end());
-            val.erase(0, val.find_first_not_of(" \t"));
-            val.erase(val.find_last_not_of("\r\n")+1);
-            std::transform(key.begin(), key.end(), key.begin(), ::tolower);
-            out.headers[key] = val;
+        // Connect MQTT
+        if (!connect_mqtt()) {
+            LOG(LogLevel::ERROR, "Failed to connect to MQTT broker");
+            shifu_client.update_device_status("Offline", "MQTT connection failed");
+        } else {
+            LOG(LogLevel::INFO, "Connected to MQTT broker");
         }
+
+        // Start publisher threads
+        start_scheduled_publishers();
+
+        // Start HTTP server
+        http_server_thread = new thread(&DeviceShifuMQTTDriver::run_http_server, this);
+
+        // Connection monitor
+        status_thread = new thread(&DeviceShifuMQTTDriver::connection_monitor, this);
+
+        // Main loop: wait for shutdown
+        unique_lock<mutex> lk(shutdown_mutex);
+        shutdown_cv->wait(lk, [this]() { return shutdown_flag.load(); });
+
+        LOG(LogLevel::INFO, "Main loop exiting");
     }
-    // Body
-    if (out.headers.count("content-length")) {
-        int cl = std::stoi(out.headers["content-length"]);
-        std::string bl;
-        while (std::getline(iss, line)) {
-            bl += line + "\n";
+
+    void shutdown() {
+        bool expected = false;
+        if (!shutdown_flag.compare_exchange_strong(expected, true)) return;
+
+        LOG(LogLevel::INFO, "Shutting down...");
+
+        // Stop HTTP server
+        if (http_listener) {
+            http_listener->close().wait();
+            delete http_listener;
+            http_listener = nullptr;
         }
-        if (bl.size() > cl) bl.resize(cl);
-        out.body = bl;
-    }
-    return true;
-}
+        if (http_server_thread) {
+            http_server_thread->join();
+            delete http_server_thread;
+            http_server_thread = nullptr;
+        }
 
-// --- Routing ---
-void handle_display_put(int client_fd, DeviceSDK& sdk, const HttpRequest& req) {
-    Json::CharReaderBuilder rbuilder;
-    Json::Value payload;
-    std::string errs;
-    std::istringstream s(req.body);
-    if (!Json::parseFromStream(rbuilder, s, &payload, &errs)) {
-        send_400(client_fd, "Invalid JSON payload");
-        return;
-    }
-    std::string err;
-    if (!sdk.updateDisplay(payload, err)) {
-        send_400(client_fd, err);
-        return;
-    }
-    Json::Value resp;
-    resp["success"] = true;
-    send_json(client_fd, 200, "OK", resp);
-}
+        // Stop publisher threads
+        for (auto& t : publisher_threads) {
+            if (t.joinable()) t.join();
+        }
+        publisher_threads.clear();
 
-void handle_status_get(int client_fd, DeviceSDK& sdk, const HttpRequest& req) {
-    std::string filter;
-    if (req.query.count("filter")) filter = req.query.at("filter");
-    Json::Value status = sdk.getStatus(filter);
-    send_json(client_fd, 200, "OK", status);
-}
+        // Stop status thread
+        if (status_thread) {
+            status_thread->join();
+            delete status_thread;
+            status_thread = nullptr;
+        }
 
-void handle_playback_post(int client_fd, DeviceSDK& sdk, const HttpRequest& req) {
-    Json::CharReaderBuilder rbuilder;
-    Json::Value payload;
-    std::string errs;
-    std::istringstream s(req.body);
-    if (!Json::parseFromStream(rbuilder, s, &payload, &errs)) {
-        send_400(client_fd, "Invalid JSON payload");
-        return;
-    }
-    std::string err;
-    if (!sdk.playbackControl(payload, err)) {
-        send_400(client_fd, err);
-        return;
-    }
-    Json::Value resp;
-    resp["success"] = true;
-    send_json(client_fd, 200, "OK", resp);
-}
+        // Disconnect MQTT
+        try {
+            if (mqtt_client && mqtt_client->is_connected()) {
+                mqtt_client->disconnect()->wait();
+            }
+        } catch (const exception& e) {
+            LOG(LogLevel::ERROR, "Error disconnecting MQTT: " << e.what());
+        }
 
-void handle_reboot_post(int client_fd, DeviceSDK& sdk, const HttpRequest& req) {
-    Json::CharReaderBuilder rbuilder;
-    Json::Value payload;
-    std::string errs;
-    if (!req.body.empty()) {
-        std::istringstream s(req.body);
-        if (!Json::parseFromStream(rbuilder, s, &payload, &errs)) {
-            send_400(client_fd, "Invalid JSON payload");
+        // Disconnect device
+        decoder_device->disconnect();
+
+        LOG(LogLevel::INFO, "Shutdown complete");
+    }
+
+    static void signal_handler_wrapper(int signal) {
+        instance()->signal_handler(signal);
+    }
+
+    void signal_handler(int signal) {
+        LOG(LogLevel::INFO, "Signal received: " << signal);
+        shutdown();
+        // Wake up main thread if needed
+        shutdown_cv->notify_all();
+    }
+
+    static DeviceShifuMQTTDriver* instance_ptr;
+    static DeviceShifuMQTTDriver* instance() { return instance_ptr; }
+
+private:
+    // Members
+    atomic<bool> shutdown_flag;
+    ShifuClient shifu_client;
+    unique_ptr<DecoderDevice> decoder_device;
+
+    string mqtt_broker;
+    int mqtt_port;
+    string mqtt_username;
+    string mqtt_password;
+    string mqtt_topic_prefix;
+    string http_host;
+    string http_port;
+    string device_name;
+    string device_namespace;
+    string client_id;
+
+    map<string, size_t> topic_publish_intervals;
+    map<string, string> topic_mode;
+    map<string, int> topic_qos;
+    map<string, thread> publisher_threads;
+
+    unique_ptr<mqtt::async_client> mqtt_client;
+    unique_ptr<mqtt::connect_options> mqtt_conn_opts;
+    mutex latest_data_mutex;
+    map<string, Json::Value> latest_data;
+
+    string http_listener_url;
+    http_listener* http_listener;
+    thread* http_server_thread;
+    thread* status_thread;
+    unique_ptr<condition_variable> shutdown_cv;
+    mutex shutdown_mutex;
+
+    // --- Configuration Parsing ---
+    void parse_instruction_config() {
+        YAML::Node instructions = shifu_client.get_instruction_config();
+        if (!instructions || !instructions.IsMap()) {
+            LOG(LogLevel::ERROR, "No valid instructions found");
             return;
         }
+        for (auto it = instructions.begin(); it != instructions.end(); ++it) {
+            string instr_name = it->first.as<string>();
+            YAML::Node instr = it->second;
+            string mode = instr["protocolProperty"]["mode"].as<string>("publisher");
+            size_t interval = instr["protocolProperty"]["publishIntervalMs"].as<size_t>(1000);
+            int qos = instr["protocolProperty"]["qos"].as<int>(1);
+            topic_publish_intervals[instr_name] = interval;
+            topic_mode[instr_name] = mode;
+            topic_qos[instr_name] = qos;
+        }
     }
-    std::string err;
-    if (!sdk.reboot(payload, err)) {
-        send_400(client_fd, err);
-        return;
+
+    // --- MQTT ---
+    bool connect_mqtt() {
+        try {
+            mqtt::connect_options conn_opts;
+            conn_opts.set_keep_alive_interval(20);
+            conn_opts.set_clean_session(true);
+            if (!mqtt_username.empty()) {
+                conn_opts.set_user_name(mqtt_username);
+                conn_opts.set_password(mqtt_password);
+            }
+            mqtt_conn_opts = make_unique<mqtt::connect_options>(conn_opts);
+
+            mqtt_client->set_connected_handler([this](const string&) {
+                LOG(LogLevel::INFO, "MQTT connected");
+                subscribe_topics();
+                publish_status("Online");
+            });
+            mqtt_client->set_connection_lost_handler([this](const string&) {
+                LOG(LogLevel::WARNING, "MQTT connection lost");
+                publish_status("Offline");
+            });
+            mqtt_client->set_message_callback([this](mqtt::const_message_ptr msg) {
+                handle_mqtt_message(msg);
+            });
+
+            mqtt_client->connect(*mqtt_conn_opts)->wait();
+            return true;
+        } catch (const exception& e) {
+            LOG(LogLevel::ERROR, "MQTT connection failed: " << e.what());
+            return false;
+        }
     }
-    Json::Value resp;
-    resp["success"] = true;
-    send_json(client_fd, 200, "OK", resp);
-}
 
-// --- Main HTTP Server Loop ---
-void http_worker(int client_fd, DeviceSDK& sdk) {
-    char buf[8192];
-    int recvd = recv(client_fd, buf, sizeof(buf)-1, 0);
-    if (recvd <= 0) {
-        close(client_fd);
-        return;
+    void subscribe_topics() {
+        // Subscribe to device commands
+        string topic = mqtt_topic_prefix + "/" + device_name + "/device/commands/control";
+        int qos = 1;
+        try {
+            mqtt_client->subscribe(topic, qos)->wait();
+            LOG(LogLevel::INFO, "Subscribed to: " << topic);
+        } catch (const exception& e) {
+            LOG(LogLevel::ERROR, "Failed to subscribe: " << e.what());
+        }
     }
-    buf[recvd] = 0;
-    std::string reqstr(buf);
-    HttpRequest req;
-    if (!parse_http_request(reqstr, req)) {
-        send_400(client_fd, "Malformed HTTP request");
-        close(client_fd);
-        return;
+
+    void publish_status(const string& status) {
+        Json::Value payload;
+        payload["status"] = status;
+        payload["timestamp"] = static_cast<Json::UInt64>(time(nullptr));
+        string topic = mqtt_topic_prefix + "/" + device_name + "/status";
+        publish_mqtt(topic, payload, 1, true);
     }
-    // Routing
-    if (req.method == "PUT" && req.path == "/display") {
-        handle_display_put(client_fd, sdk, req);
-    } else if (req.method == "GET" && req.path == "/status") {
-        handle_status_get(client_fd, sdk, req);
-    } else if (req.method == "POST" && req.path == "/commands/playback") {
-        handle_playback_post(client_fd, sdk, req);
-    } else if (req.method == "POST" && req.path == "/commands/reboot") {
-        handle_reboot_post(client_fd, sdk, req);
-    } else if ((req.method == "OPTIONS") && 
-                (req.path == "/display" || req.path == "/status" || req.path == "/commands/playback" || req.path == "/commands/reboot")) {
-        // CORS Preflight
-        std::string allow;
-        if (req.path == "/display") allow = "PUT,OPTIONS";
-        else if (req.path == "/status") allow = "GET,OPTIONS";
-        else if (req.path == "/commands/playback") allow = "POST,OPTIONS";
-        else if (req.path == "/commands/reboot") allow = "POST,OPTIONS";
-        std::ostringstream oss;
-        oss << "HTTP/1.1 204 No Content\r\n";
-        oss << "Access-Control-Allow-Origin: *\r\n";
-        oss << "Access-Control-Allow-Methods: " << allow << "\r\n";
-        oss << "Access-Control-Allow-Headers: Content-Type\r\n";
-        oss << "Content-Length: 0\r\n";
-        oss << "Connection: close\r\n\r\n";
-        send(client_fd, oss.str().data(), oss.str().size(), 0);
-    } else {
-        send_404(client_fd);
+
+    void publish_mqtt(const string& topic, const Json::Value& payload, int qos, bool retained = false) {
+        Json::StreamWriterBuilder wbuilder;
+        string js = Json::writeString(wbuilder, payload);
+
+        auto msg = mqtt::make_message(topic, js);
+        msg->set_qos(qos);
+        msg->set_retained(retained);
+
+        try {
+            mqtt_client->publish(msg)->wait();
+            LOG(LogLevel::DEBUG, "Published to " << topic << ": " << js);
+        } catch (const exception& e) {
+            LOG(LogLevel::ERROR, "MQTT publish failed: " << e.what());
+        }
     }
-    close(client_fd);
-}
 
-// --- Main ---
-volatile bool running = true;
+    void handle_mqtt_message(mqtt::const_message_ptr msg) {
+        try {
+            string topic = msg->get_topic();
+            string payload = msg->to_string();
+            LOG(LogLevel::INFO, "MQTT message received: " << topic << " | " << payload);
 
-void sigint_handler(int) {
-    running = false;
-}
+            // Only handle control
+            if (topic.find("/device/commands/control") != string::npos) {
+                Json::Value jpayload;
+                Json::CharReaderBuilder rbuilder;
+                string errs;
+                istringstream ss(payload);
+                if (!Json::parseFromStream(rbuilder, ss, &jpayload, &errs)) {
+                    LOG(LogLevel::ERROR, "Failed to parse command JSON: " << errs);
+                    return;
+                }
+                Json::Value resp = decoder_device->handle_command(jpayload);
+                string resp_topic = mqtt_topic_prefix + "/" + device_name + "/device/commands/control/response";
+                publish_mqtt(resp_topic, resp, 1, false);
+            }
+        } catch (const exception& e) {
+            LOG(LogLevel::ERROR, "Error handling MQTT message: " << e.what());
+        }
+    }
 
-int main() {
-    // --- Read config from environment ---
-    std::string device_ip = getenv_def("DEVICE_IP", "192.168.1.64");
-    int device_port = getenv_int("DEVICE_PORT", 8000); // SDK port, not HTTP
-    std::string device_user = getenv_def("DEVICE_USER", "admin");
-    std::string device_pass = getenv_def("DEVICE_PASS", "12345");
-    std::string http_host = getenv_def("HTTP_HOST", "0.0.0.0");
-    int http_port = getenv_int("HTTP_PORT", 8080);
+    // --- Telemetry Publisher ---
+    void start_scheduled_publishers() {
+        for (const auto& kv : topic_publish_intervals) {
+            string topic = kv.first;
+            size_t interval = kv.second;
+            if (topic_mode[topic] == "publisher") {
+                publisher_threads[topic] = thread(&DeviceShifuMQTTDriver::publish_topic_periodically, this, topic, interval, topic_qos[topic]);
+            }
+        }
+    }
 
-    // --- Device SDK connection (simulate login) ---
-    DeviceSDK sdk(device_ip, device_port, device_user, device_pass);
+    void publish_topic_periodically(string topic, size_t interval_ms, int qos) {
+        string mqtt_topic = mqtt_topic_prefix + "/" + device_name + "/" + topic;
+        while (!shutdown_flag.load()) {
+            Json::Value data = decoder_device->get_status();
+            {
+                lock_guard<mutex> lock(latest_data_mutex);
+                latest_data[topic] = data;
+            }
+            publish_mqtt(mqtt_topic, data, qos, false);
+
+            for (size_t i = 0; i < interval_ms / 100; ++i) {
+                if (shutdown_flag.load()) break;
+                this_thread::sleep_for(chrono::milliseconds(100));
+            }
+        }
+    }
 
     // --- HTTP Server ---
-    struct sockaddr_in addr;
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    int opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(http_port);
-    addr.sin_addr.s_addr = (http_host == "0.0.0.0") ? INADDR_ANY : inet_addr(http_host.c_str());
-    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("bind");
-        return 1;
-    }
-    if (listen(server_fd, 10) < 0) {
-        perror("listen");
-        return 1;
-    }
-    std::cout << "HTTP server listening on " << http_host << ":" << http_port << std::endl;
-
-    std::signal(SIGINT, sigint_handler);
-
-    while (running) {
-        struct sockaddr_in cli_addr;
-        socklen_t cli_len = sizeof(cli_addr);
-        int client_fd = accept(server_fd, (struct sockaddr*)&cli_addr, &cli_len);
-        if (client_fd < 0) {
-            if (!running) break;
-            continue;
+    void run_http_server() {
+        try {
+            http_listener = new http_listener(http_listener_url);
+            http_listener->support(methods::GET, [this](http_request request) {
+                string path = request.relative_uri().path();
+                if (path == "/health") {
+                    json::value resp;
+                    resp["status"] = json::value::string("ok");
+                    request.reply(status_codes::OK, resp);
+                } else if (path == "/status") {
+                    lock_guard<mutex> lock(latest_data_mutex);
+                    json::value resp;
+                    for (const auto& kv : latest_data) {
+                        Json::StreamWriterBuilder wbuilder;
+                        string js = Json::writeString(wbuilder, kv.second);
+                        resp[kv.first] = json::value::string(js);
+                    }
+                    request.reply(status_codes::OK, resp);
+                } else {
+                    request.reply(status_codes::NotFound, "Not found");
+                }
+            });
+            http_listener->open().wait();
+            LOG(LogLevel::INFO, "HTTP server running at " << http_listener_url);
+            while (!shutdown_flag.load()) {
+                this_thread::sleep_for(chrono::milliseconds(250));
+            }
+            http_listener->close().wait();
+        } catch (const exception& e) {
+            LOG(LogLevel::ERROR, "HTTP server error: " << e.what());
         }
-        std::thread t(http_worker, client_fd, std::ref(sdk));
-        t.detach();
     }
-    close(server_fd);
-    std::cout << "Shutting down.\n";
+
+    // --- Connection Monitor ---
+    void connection_monitor() {
+        while (!shutdown_flag.load()) {
+            bool dev_ok = decoder_device->connect();
+            bool mqtt_ok = mqtt_client->is_connected();
+            if (!dev_ok) {
+                shifu_client.update_device_status("Offline", "Device connection lost");
+            }
+            if (!mqtt_ok) {
+                shifu_client.update_device_status("Offline", "MQTT disconnected");
+                // Try reconnect
+                connect_mqtt();
+            }
+            this_thread::sleep_for(chrono::seconds(5));
+        }
+    }
+};
+
+// Global instance pointer for signal handling
+DeviceShifuMQTTDriver* DeviceShifuMQTTDriver::instance_ptr = nullptr;
+
+// ----------- Main Entrypoint -----------
+int main(int argc, char* argv[]) {
+    DeviceShifuMQTTDriver driver;
+    DeviceShifuMQTTDriver::instance_ptr = &driver;
+    driver.run();
     return 0;
 }
