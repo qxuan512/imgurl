@@ -1,390 +1,390 @@
+```cpp
 #include <iostream>
-#include <cstdlib>
 #include <string>
-#include <thread>
-#include <map>
 #include <vector>
+#include <map>
+#include <cstdlib>
+#include <thread>
 #include <sstream>
 #include <fstream>
-#include <cstring>
+#include <streambuf>
 #include <mutex>
+#include <regex>
 #include <algorithm>
-#include <functional>
-#include <ctime>
-#include <json/json.h> // Requires jsoncpp (header-only, no command execution)
-#ifdef _WIN32
-#include <winsock2.h>
-#pragma comment(lib, "ws2_32.lib")
-#define CLOSESOCK closesocket
-#else
-#include <unistd.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#define CLOSESOCK close
-#endif
 
-// -- Device SDK integration points (Stub/Mock Section) --
-// In a real driver, these would be actual calls to the Hikvision SDK (HCNetSDK).
-// Here, they are mocked for demonstration.
+#define CPPHTTPLIB_OPENSSL_SUPPORT
+#include "httplib.h"
+#include "tinyxml2.h"
 
-struct DecoderChannel {
+// ==================== Environment Variable Access ===========================
+std::string get_env(const std::string &key, const std::string &default_val = "") {
+    const char* val = std::getenv(key.c_str());
+    return val ? std::string(val) : default_val;
+}
+
+// ==================== Device SDK/Protocol Layer (Stubs) =====================
+// In a real implementation, these would interface with the device via HCNetSDK or similar APIs.
+
+struct ChannelConfig {
     int id;
     bool enabled;
     std::string name;
-    std::string status;
-};
-
-struct DeviceStatus {
-    std::string decoderState;
-    std::string alarmStatus;
-    std::string remotePlayStatus;
-    std::string firmwareUpgrade;
+    std::map<std::string, std::string> settings;
 };
 
 struct DisplayConfig {
     std::string layout;
-    std::string scene;
+    int scenes;
+    std::vector<std::string> windows;
 };
 
-std::vector<DecoderChannel> mockChannels = {
-    {1, true, "MainDecoder1", "Active"},
-    {2, false, "MainDecoder2", "Inactive"},
-    {3, true, "MainDecoder3", "Active"}
+struct DeviceStatus {
+    std::string decoder_state;
+    std::string alarm;
+    std::string remote_play;
+    std::string firmware_upgrade;
+    int loop_polling;
+    std::string operational_state;
 };
-DeviceStatus mockDeviceStatus = {"Running", "NoAlarms", "Stopped", "Idle"};
-DisplayConfig mockDisplayConfig = {"2x2", "Default"};
 
-// Mock 'SDK' functions
 std::mutex device_mutex;
-std::vector<DecoderChannel> device_get_channels() {
+std::vector<ChannelConfig> mock_channels = {
+    {1, true,  "Channel 1", {{"resolution","1080p"}}},
+    {2, false, "Channel 2", {{"resolution","720p"}}},
+    {3, true,  "Channel 3", {{"resolution","1080p"}}}
+};
+
+DisplayConfig mock_display = {"4x4", 2, {"window1", "window2"}};
+DeviceStatus mock_status = {"active", "none", "stopped", "idle", 1, "running"};
+
+std::vector<ChannelConfig> get_channels(const std::map<std::string, std::string>& filters) {
     std::lock_guard<std::mutex> lock(device_mutex);
-    return mockChannels;
+    std::vector<ChannelConfig> result;
+    for (const auto &ch : mock_channels) {
+        bool ok = true;
+        if (filters.count("id")) {
+            ok &= std::to_string(ch.id) == filters.at("id");
+        }
+        if (filters.count("enabled")) {
+            ok &= ((ch.enabled && filters.at("enabled") == "true") || (!ch.enabled && filters.at("enabled") == "false"));
+        }
+        if (ok) result.push_back(ch);
+    }
+    return result;
 }
-DecoderChannel* device_find_channel(int id) {
+
+bool update_channel(int id, bool enabled, const std::map<std::string, std::string>& settings) {
     std::lock_guard<std::mutex> lock(device_mutex);
-    for (auto& ch : mockChannels) if (ch.id == id) return &ch;
-    return nullptr;
-}
-void device_update_channel(int id, bool enabled, const std::string& name) {
-    std::lock_guard<std::mutex> lock(device_mutex);
-    for (auto& ch : mockChannels) {
+    for (auto& ch : mock_channels) {
         if (ch.id == id) {
             ch.enabled = enabled;
-            if (!name.empty()) ch.name = name;
+            for (const auto& kv : settings) ch.settings[kv.first] = kv.second;
+            return true;
         }
     }
+    return false;
 }
-DeviceStatus device_get_status() {
+
+bool update_channels_bulk(const std::vector<std::pair<int,bool>>& updates) {
     std::lock_guard<std::mutex> lock(device_mutex);
-    return mockDeviceStatus;
-}
-void device_set_display_config(const std::string& layout, const std::string& scene) {
-    std::lock_guard<std::mutex> lock(device_mutex);
-    if (!layout.empty()) mockDisplayConfig.layout = layout;
-    if (!scene.empty()) mockDisplayConfig.scene = scene;
-}
-void device_control_command(const std::string& type, const Json::Value& params) {
-    std::lock_guard<std::mutex> lock(device_mutex);
-    if (type == "reset")
-        mockDeviceStatus.decoderState = "Resetting";
-    else if (type == "start_decode")
-        mockDeviceStatus.decoderState = "Decoding";
-    else if (type == "stop_decode")
-        mockDeviceStatus.decoderState = "Stopped";
-    // ... Add more command emulation as required
-}
-
-// -- End Mock Section --
-
-// -- HTTP Server Utilities --
-
-const int BUFSIZE = 8192;
-
-struct HttpRequest {
-    std::string method;
-    std::string path;
-    std::map<std::string, std::string> headers;
-    std::string body;
-    std::map<std::string, std::string> query_params;
-    std::string path_param; // Used for /channels/{id}
-};
-
-struct HttpResponse {
-    int code;
-    std::string status;
-    std::string content_type;
-    std::string body;
-    std::vector<std::string> extra_headers;
-};
-
-void url_decode_inplace(std::string &s) {
-    size_t len = s.length();
-    std::string res;
-    for (size_t i = 0; i < len; ++i) {
-        if (s[i] == '%' && i + 2 < len) {
-            int val = 0;
-            sscanf(s.substr(i + 1, 2).c_str(), "%x", &val);
-            res += static_cast<char>(val);
-            i += 2;
-        } else if (s[i] == '+') {
-            res += ' ';
-        } else {
-            res += s[i];
+    for (auto& up : updates) {
+        bool found = false;
+        for (auto& ch : mock_channels) {
+            if (ch.id == up.first) {
+                ch.enabled = up.second;
+                found = true;
+                break;
+            }
         }
+        if (!found) return false;
     }
-    s.swap(res);
-}
-
-std::map<std::string, std::string> parse_query(const std::string& query) {
-    std::map<std::string, std::string> params;
-    std::stringstream ss(query);
-    std::string item;
-    while (std::getline(ss, item, '&')) {
-        size_t eq = item.find('=');
-        if (eq != std::string::npos) {
-            std::string k = item.substr(0, eq);
-            std::string v = item.substr(eq + 1);
-            url_decode_inplace(k); url_decode_inplace(v);
-            params[k] = v;
-        }
-    }
-    return params;
-}
-
-bool starts_with(const std::string& s, const std::string& prefix) {
-    return s.size() >= prefix.size() && std::equal(prefix.begin(), prefix.end(), s.begin());
-}
-
-// Parse HTTP request from raw buffer
-bool parse_http_request(const std::string& raw, HttpRequest& req) {
-    std::istringstream iss(raw);
-    std::string line;
-    if (!std::getline(iss, line)) return false;
-    size_t method_end = line.find(' ');
-    size_t path_end = line.find(' ', method_end + 1);
-    if (method_end == std::string::npos || path_end == std::string::npos) return false;
-    req.method = line.substr(0, method_end);
-    std::string url = line.substr(method_end + 1, path_end - method_end - 1);
-
-    size_t qmark = url.find('?');
-    if (qmark != std::string::npos) {
-        req.path = url.substr(0, qmark);
-        req.query_params = parse_query(url.substr(qmark + 1));
-    } else {
-        req.path = url;
-    }
-    std::transform(req.path.begin(), req.path.end(), req.path.begin(), ::tolower);
-
-    // Headers
-    while (std::getline(iss, line) && line != "\r") {
-        if (line.empty() || line == "\n" || line == "\r\n") break;
-        size_t col = line.find(':');
-        if (col != std::string::npos) {
-            std::string k = line.substr(0, col);
-            std::string v = line.substr(col + 1);
-            k.erase(std::remove_if(k.begin(), k.end(), ::isspace), k.end());
-            v.erase(0, v.find_first_not_of(" \t\r\n"));
-            v.erase(v.find_last_not_of(" \t\r\n") + 1);
-            std::transform(k.begin(), k.end(), k.begin(), ::tolower);
-            req.headers[k] = v;
-        }
-    }
-    // Body
-    std::string rest((std::istreambuf_iterator<char>(iss)), {});
-    req.body = rest;
-
-    // Extract path_param for /channels/{id}
-    if (starts_with(req.path, "/channels/")) {
-        req.path_param = req.path.substr(std::string("/channels/").length());
-        req.path = "/channels/{id}";
-    }
-
     return true;
 }
 
-void send_http_response(int client_fd, const HttpResponse& resp) {
+DisplayConfig get_display() {
+    std::lock_guard<std::mutex> lock(device_mutex);
+    return mock_display;
+}
+
+bool update_display(const DisplayConfig& config) {
+    std::lock_guard<std::mutex> lock(device_mutex);
+    mock_display = config;
+    return true;
+}
+
+DeviceStatus get_status() {
+    std::lock_guard<std::mutex> lock(device_mutex);
+    return mock_status;
+}
+
+bool send_control_command(const std::string& type, const std::map<std::string, std::string>& params) {
+    std::lock_guard<std::mutex> lock(device_mutex);
+    if (type == "reset") {
+        mock_status.operational_state = "rebooting";
+        return true;
+    }
+    // Simulate other controls...
+    return true;
+}
+
+bool decode_control(const std::string& action) {
+    std::lock_guard<std::mutex> lock(device_mutex);
+    if (action == "start") mock_status.decoder_state = "decoding";
+    else if (action == "stop") mock_status.decoder_state = "idle";
+    else return false;
+    return true;
+}
+
+bool reboot_device() {
+    std::lock_guard<std::mutex> lock(device_mutex);
+    mock_status.operational_state = "rebooting";
+    return true;
+}
+
+// =================== JSON Serialization/Parsing =============================
+// (Simple, minimal. For production use a robust library.)
+
+std::string json_escape(const std::string& s) {
+    std::string out;
+    for (char c : s) {
+        if (c == '\"') out += "\\\"";
+        else if (c == '\\') out += "\\\\";
+        else if (c == '\n') out += "\\n";
+        else if (c == '\r') out += "\\r";
+        else out += c;
+    }
+    return out;
+}
+
+std::string channel_to_json(const ChannelConfig& ch) {
     std::ostringstream oss;
-    oss << "HTTP/1.1 " << resp.code << " " << resp.status << "\r\n";
-    oss << "Content-Type: " << resp.content_type << "\r\n";
-    oss << "Content-Length: " << resp.body.size() << "\r\n";
-    for (const auto& h : resp.extra_headers)
-        oss << h << "\r\n";
-    oss << "Connection: close\r\n\r\n";
-    oss << resp.body;
-    std::string response = oss.str();
-    send(client_fd, response.c_str(), response.size(), 0);
+    oss << "{";
+    oss << "\"id\":" << ch.id << ",";
+    oss << "\"enabled\":" << (ch.enabled ? "true" : "false") << ",";
+    oss << "\"name\":\"" << json_escape(ch.name) << "\",";
+    oss << "\"settings\":{";
+    bool first=true;
+    for (const auto& kv : ch.settings) {
+        if (!first) oss << ",";
+        oss << "\"" << json_escape(kv.first) << "\":\"" << json_escape(kv.second) << "\"";
+        first=false;
+    }
+    oss << "}}";
+    return oss.str();
 }
 
-// -- API Handlers --
-
-HttpResponse handle_get_channels(const HttpRequest& req) {
-    auto channels = device_get_channels();
-    // Filtering and pagination (optional, basic demo)
-    int page = 1, page_size = channels.size();
-    if (req.query_params.count("page")) page = std::stoi(req.query_params.at("page"));
-    if (req.query_params.count("page_size")) page_size = std::stoi(req.query_params.at("page_size"));
-    int from = (page - 1) * page_size;
-    int to = std::min((int)channels.size(), from + page_size);
-
-    Json::Value root(Json::arrayValue);
-    for (int i = from; i < to; ++i) {
-        Json::Value ch;
-        ch["id"] = channels[i].id;
-        ch["enabled"] = channels[i].enabled;
-        ch["name"] = channels[i].name;
-        ch["status"] = channels[i].status;
-        root.append(ch);
+std::string channels_to_json(const std::vector<ChannelConfig>& chs) {
+    std::ostringstream oss;
+    oss << "[";
+    for (size_t i=0; i<chs.size(); ++i) {
+        if (i) oss << ",";
+        oss << channel_to_json(chs[i]);
     }
-    Json::StreamWriterBuilder builder;
-    std::string body = Json::writeString(builder, root);
-    return {200, "OK", "application/json", body, {}};
+    oss << "]";
+    return oss.str();
 }
 
-HttpResponse handle_get_status(const HttpRequest& req) {
-    DeviceStatus status = device_get_status();
-    Json::Value root;
-    root["decoderState"] = status.decoderState;
-    root["alarmStatus"] = status.alarmStatus;
-    root["remotePlayStatus"] = status.remotePlayStatus;
-    root["firmwareUpgrade"] = status.firmwareUpgrade;
-    Json::StreamWriterBuilder builder;
-    std::string body = Json::writeString(builder, root);
-    return {200, "OK", "application/json", body, {}};
+std::string display_to_json(const DisplayConfig& d) {
+    std::ostringstream oss;
+    oss << "{";
+    oss << "\"layout\":\"" << json_escape(d.layout) << "\",";
+    oss << "\"scenes\":" << d.scenes << ",";
+    oss << "\"windows\":[";
+    for (size_t i=0; i<d.windows.size(); ++i) {
+        if (i) oss << ",";
+        oss << "\"" << json_escape(d.windows[i]) << "\"";
+    }
+    oss << "]}";
+    return oss.str();
 }
 
-HttpResponse handle_put_display(const HttpRequest& req) {
-    Json::Value payload;
-    Json::CharReaderBuilder reader;
-    std::string errs;
-    std::istringstream iss(req.body);
-    if (!Json::parseFromStream(reader, iss, &payload, &errs)) {
-        return {400, "Bad Request", "application/json", "{\"error\":\"Invalid JSON payload.\"}", {}};
-    }
-    std::string layout = payload.get("layout", "").asString();
-    std::string scene = payload.get("scene", "").asString();
-    device_set_display_config(layout, scene);
-
-    Json::Value root;
-    root["result"] = "success";
-    Json::StreamWriterBuilder builder;
-    std::string body = Json::writeString(builder, root);
-    return {200, "OK", "application/json", body, {}};
+std::string status_to_json(const DeviceStatus& s) {
+    std::ostringstream oss;
+    oss << "{";
+    oss << "\"decoder_state\":\"" << json_escape(s.decoder_state) << "\",";
+    oss << "\"alarm\":\"" << json_escape(s.alarm) << "\",";
+    oss << "\"remote_play\":\"" << json_escape(s.remote_play) << "\",";
+    oss << "\"firmware_upgrade\":\"" << json_escape(s.firmware_upgrade) << "\",";
+    oss << "\"loop_polling\":" << s.loop_polling << ",";
+    oss << "\"operational_state\":\"" << json_escape(s.operational_state) << "\"";
+    oss << "}";
+    return oss.str();
 }
 
-HttpResponse handle_put_channel_id(const HttpRequest& req) {
-    int id = std::stoi(req.path_param);
-    Json::Value payload;
-    Json::CharReaderBuilder reader;
-    std::string errs;
-    std::istringstream iss(req.body);
-    if (!Json::parseFromStream(reader, iss, &payload, &errs)) {
-        return {400, "Bad Request", "application/json", "{\"error\":\"Invalid JSON payload.\"}", {}};
+// Very simple JSON parser for our expected input
+std::map<std::string, std::string> parse_json_body(const std::string& body) {
+    std::map<std::string, std::string> m;
+    std::regex rx("\"([^\"]+)\":\\s*(\"[^\"]+\"|\\d+|true|false|null)");
+    auto begin = std::sregex_iterator(body.begin(), body.end(), rx);
+    auto end = std::sregex_iterator();
+    for (auto i = begin; i != end; ++i) {
+        std::string k = (*i)[1].str();
+        std::string v = (*i)[2].str();
+        if (!v.empty() && v.front() == '"' && v.back() == '"') v = v.substr(1, v.size()-2);
+        m[k]=v;
     }
-    bool enabled = payload.get("enabled", false).asBool();
-    std::string name = payload.get("name", "").asString();
-    if (!device_find_channel(id)) {
-        return {404, "Not Found", "application/json", "{\"error\":\"Channel not found.\"}", {}};
-    }
-    device_update_channel(id, enabled, name);
-    Json::Value root; root["result"] = "success";
-    Json::StreamWriterBuilder builder;
-    std::string body = Json::writeString(builder, root);
-    return {200, "OK", "application/json", body, {}};
+    return m;
 }
 
-HttpResponse handle_post_control(const HttpRequest& req) {
-    Json::Value payload;
-    Json::CharReaderBuilder reader;
-    std::string errs;
-    std::istringstream iss(req.body);
-    if (!Json::parseFromStream(reader, iss, &payload, &errs)) {
-        return {400, "Bad Request", "application/json", "{\"error\":\"Invalid JSON payload.\"}", {}};
-    }
-    std::string type = payload.get("command", "").asString();
-    Json::Value params = payload.get("params", Json::Value(Json::objectValue));
-    if (type.empty())
-        return {400, "Bad Request", "application/json", "{\"error\":\"Missing command type.\"}", {}};
-    device_control_command(type, params);
+// ================ HTTP Server & Route Handlers ==============================
 
-    Json::Value root; root["result"] = "success";
-    Json::StreamWriterBuilder builder;
-    std::string body = Json::writeString(builder, root);
-    return {200, "OK", "application/json", body, {}};
+void run_http_server(const std::string& host, int port) {
+    httplib::Server svr;
+
+    // GET /channels
+    svr.Get(R"(/channels)", [](const httplib::Request& req, httplib::Response& res) {
+        std::map<std::string, std::string> filters;
+        if (req.has_param("id")) filters["id"] = req.get_param_value("id");
+        if (req.has_param("enabled")) filters["enabled"] = req.get_param_value("enabled");
+        auto channels = get_channels(filters);
+        res.set_content(channels_to_json(channels), "application/json");
+    });
+
+    // PUT /channels (bulk enable/disable)
+    svr.Put(R"(/channels)", [](const httplib::Request& req, httplib::Response& res) {
+        // Expect JSON: [{"id":1,"enabled":true},...]
+        try {
+            std::vector<std::pair<int,bool>> updates;
+            std::regex rx(R"(\{[^\}]*"id"\s*:\s*(\d+)[^\}]*"enabled"\s*:\s*(true|false)[^\}]*\})");
+            auto begin = std::sregex_iterator(req.body.begin(), req.body.end(), rx);
+            auto end = std::sregex_iterator();
+            for (auto i = begin; i != end; ++i) {
+                int id = std::stoi((*i)[1]);
+                bool enabled = ((*i)[2] == "true");
+                updates.push_back({id, enabled});
+            }
+            if (!updates.empty() && update_channels_bulk(updates)) {
+                res.set_content(R"({"status":"success"})", "application/json");
+            } else {
+                res.status = 400;
+                res.set_content(R"({"error":"Failed to update channels"})", "application/json");
+            }
+        } catch (...) {
+            res.status = 400;
+            res.set_content(R"({"error":"Invalid input"})", "application/json");
+        }
+    });
+
+    // PUT /channels/{id}
+    svr.Put(R"(/channels/(\d+))", [](const httplib::Request& req, httplib::Response& res) {
+        int id = std::stoi(req.matches[1]);
+        auto m = parse_json_body(req.body);
+        bool enabled = (m.count("enabled") && (m["enabled"] == "true"));
+        auto settings = m;
+        settings.erase("enabled");
+        if (update_channel(id, enabled, settings)) {
+            res.set_content(R"({"status":"success"})", "application/json");
+        } else {
+            res.status = 404;
+            res.set_content(R"({"error":"Channel not found"})", "application/json");
+        }
+    });
+
+    // POST /control
+    svr.Post(R"(/control)", [](const httplib::Request& req, httplib::Response& res) {
+        auto m = parse_json_body(req.body);
+        if (!m.count("type")) {
+            res.status = 400;
+            res.set_content(R"({"error":"Missing command type"})", "application/json");
+            return;
+        }
+        std::string type = m["type"];
+        m.erase("type");
+        if (send_control_command(type, m)) {
+            res.set_content(R"({"status":"success"})", "application/json");
+        } else {
+            res.status = 400;
+            res.set_content(R"({"error":"Command failed"})", "application/json");
+        }
+    });
+
+    // POST /commands/decode
+    svr.Post(R"(/commands/decode)", [](const httplib::Request& req, httplib::Response& res) {
+        auto m = parse_json_body(req.body);
+        if (!m.count("action")) {
+            res.status = 400;
+            res.set_content(R"({"error":"Missing action"})", "application/json");
+            return;
+        }
+        if (decode_control(m["action"])) {
+            res.set_content(R"({"status":"success"})", "application/json");
+        } else {
+            res.status = 400;
+            res.set_content(R"({"error":"Invalid action"})", "application/json");
+        }
+    });
+
+    // POST /commands/reboot
+    svr.Post(R"(/commands/reboot)", [](const httplib::Request& req, httplib::Response& res) {
+        if (reboot_device()) {
+            res.set_content(R"({"status":"rebooting"})", "application/json");
+        } else {
+            res.status = 500;
+            res.set_content(R"({"error":"Failed to reboot"})", "application/json");
+        }
+    });
+
+    // GET /status
+    svr.Get(R"(/status)", [](const httplib::Request& req, httplib::Response& res) {
+        auto status = get_status();
+        res.set_content(status_to_json(status), "application/json");
+    });
+
+    // GET /display
+    svr.Get(R"(/display)", [](const httplib::Request& req, httplib::Response& res) {
+        auto display = get_display();
+        res.set_content(display_to_json(display), "application/json");
+    });
+
+    // PUT /display
+    svr.Put(R"(/display)", [](const httplib::Request& req, httplib::Response& res) {
+        auto m = parse_json_body(req.body);
+        DisplayConfig conf = get_display();
+        if (m.count("layout")) conf.layout = m["layout"];
+        if (m.count("scenes")) conf.scenes = std::stoi(m["scenes"]);
+        // Windows as comma-separated string for demo
+        if (m.count("windows")) {
+            conf.windows.clear();
+            std::stringstream ss(m["windows"]);
+            std::string item;
+            while(std::getline(ss, item, ',')) conf.windows.push_back(item);
+        }
+        if (update_display(conf)) {
+            res.set_content(display_to_json(conf), "application/json");
+        } else {
+            res.status = 400;
+            res.set_content(R"({"error":"Failed to update display"})", "application/json");
+        }
+    });
+
+    std::cout << "HTTP server listening on " << host << ":" << port << std::endl;
+    svr.listen(host.c_str(), port);
 }
 
-// -- Main HTTP Router --
+// ==================== Main Entrypoint =======================================
 
-HttpResponse route_request(const HttpRequest& req) {
-    if (req.method == "GET" && req.path == "/channels")
-        return handle_get_channels(req);
-    if (req.method == "GET" && req.path == "/status")
-        return handle_get_status(req);
-    if (req.method == "PUT" && req.path == "/display")
-        return handle_put_display(req);
-    if (req.method == "PUT" && req.path == "/channels/{id}")
-        return handle_put_channel_id(req);
-    if (req.method == "POST" && req.path == "/control")
-        return handle_post_control(req);
-    return {404, "Not Found", "application/json", "{\"error\":\"Not found.\"}", {}};
-}
+int main(int argc, char* argv[]) {
+    std::string host = get_env("HTTP_HOST", "0.0.0.0");
+    int port = std::stoi(get_env("HTTP_PORT", "8080"));
 
-// -- HTTP Server Loop --
+    // Device connection info (used in real SDK logic)
+    std::string dev_ip = get_env("DEVICE_IP", "192.168.1.64");
+    std::string dev_user = get_env("DEVICE_USER", "admin");
+    std::string dev_pass = get_env("DEVICE_PASS", "12345");
 
-void handle_client(int client_fd) {
-    char buffer[BUFSIZE + 1];
-    int n = recv(client_fd, buffer, BUFSIZE, 0);
-    if (n <= 0) { CLOSESOCK(client_fd); return; }
-    buffer[n] = '\0';
-    std::string raw(buffer, n);
-    HttpRequest req;
-    if (!parse_http_request(raw, req)) {
-        HttpResponse resp = {400, "Bad Request", "application/json", "{\"error\":\"Malformed request.\"}", {}};
-        send_http_response(client_fd, resp);
-        CLOSESOCK(client_fd);
-        return;
-    }
-    HttpResponse resp = route_request(req);
-    send_http_response(client_fd, resp);
-    CLOSESOCK(client_fd);
-}
-
-int main() {
-    // --- Configuration from environment ---
-    std::string device_ip = getenv("DEVICE_IP") ? getenv("DEVICE_IP") : "127.0.0.1";
-    int device_port = getenv("DEVICE_PORT") ? std::stoi(getenv("DEVICE_PORT")) : 8000; // Not used in mock
-    std::string http_host = getenv("HTTP_HOST") ? getenv("HTTP_HOST") : "0.0.0.0";
-    int http_port = getenv("HTTP_PORT") ? std::stoi(getenv("HTTP_PORT")) : 8080;
-
-#ifdef _WIN32
-    WSADATA wsa_data;
-    WSAStartup(MAKEWORD(2,2), &wsa_data);
-#endif
-
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) { std::cerr << "Socket error\n"; return 1; }
-    int opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
-    sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = (http_host == "0.0.0.0") ? INADDR_ANY : inet_addr(http_host.c_str());
-    addr.sin_port = htons(http_port);
-    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        std::cerr << "Bind failed\n";
-        return 1;
-    }
-    listen(server_fd, 10);
-    std::cout << "HTTP server running on " << http_host << ":" << http_port << std::endl;
-
-    while (true) {
-        sockaddr_in client_addr; socklen_t client_len = sizeof(client_addr);
-        int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
-        if (client_fd < 0) continue;
-        std::thread th(handle_client, client_fd); th.detach();
-    }
-
-    CLOSESOCK(server_fd);
-#ifdef _WIN32
-    WSACleanup();
-#endif
+    run_http_server(host, port);
     return 0;
 }
+```
+**Dependencies:**  
+- [cpp-httplib](https://github.com/yhirose/cpp-httplib) (for HTTP server)  
+- [tinyxml2](https://github.com/leethomason/tinyxml2) (stubs included, not used in current code but referenced for XML handling if needed)  
+
+**Environment variables required:**  
+- `HTTP_HOST` (default: `0.0.0.0`)  
+- `HTTP_PORT` (default: `8080`)  
+- `DEVICE_IP`, `DEVICE_USER`, `DEVICE_PASS` for device connection
+
+**Build notes:**  
+- Link with pthread and OpenSSL if using HTTPS (`-lssl -lcrypto -lpthread`).
+- Add `cpp-httplib.h` and `tinyxml2.h/.cpp` to your project.
