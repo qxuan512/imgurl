@@ -4,32 +4,43 @@ import time
 import threading
 import yaml
 import json
-from typing import Any, Dict, Callable
-from kubernetes import client, config
-from kubernetes.client.rest import ApiException
-import paho.mqtt.client as mqtt
+from queue import Queue
+from typing import Any, Dict, Callable, Optional
 
-# --- Kubernetes CRD Handling ---
+import paho.mqtt.client as mqtt
+from kubernetes import client as k8s_client, config as k8s_config, utils as k8s_utils
+from kubernetes.client.rest import ApiException
+
+# ---------------------- Config & Constants ----------------------
+EDGEDEVICE_NAME = os.environ.get("EDGEDEVICE_NAME")
+EDGEDEVICE_NAMESPACE = os.environ.get("EDGEDEVICE_NAMESPACE")
+MQTT_BROKER_ADDRESS = os.environ.get("MQTT_BROKER_ADDRESS")
+
+if not EDGEDEVICE_NAME or not EDGEDEVICE_NAMESPACE or not MQTT_BROKER_ADDRESS:
+    sys.stderr.write("Required environment variables: EDGEDEVICE_NAME, EDGEDEVICE_NAMESPACE, MQTT_BROKER_ADDRESS\n")
+    sys.exit(1)
+
+CONFIG_PATH = "/etc/edgedevice/config/instructions"
 
 EDGEDEVICE_CRD_GROUP = "shifu.edgenesis.io"
 EDGEDEVICE_CRD_VERSION = "v1alpha1"
 EDGEDEVICE_CRD_PLURAL = "edgedevices"
-EDGEDEVICE_STATUS_PHASES = ["Pending", "Running", "Failed", "Unknown"]
 
-def load_incluster_kube_config():
-    config.load_incluster_config()
+PHASE_PENDING = "Pending"
+PHASE_RUNNING = "Running"
+PHASE_FAILED = "Failed"
+PHASE_UNKNOWN = "Unknown"
 
-def get_k8s_custom_api():
-    return client.CustomObjectsApi()
+# ---------------------- Kubernetes CRD Client ----------------------
 
-class EdgeDeviceStatusManager:
+class EdgeDeviceCRD:
     def __init__(self, name: str, namespace: str):
-        load_incluster_kube_config()
-        self.api = get_k8s_custom_api()
+        k8s_config.load_incluster_config()
+        self.api = k8s_client.CustomObjectsApi()
         self.name = name
         self.namespace = namespace
 
-    def get(self) -> Dict[str, Any]:
+    def get(self) -> Optional[Dict[str, Any]]:
         try:
             return self.api.get_namespaced_custom_object(
                 group=EDGEDEVICE_CRD_GROUP,
@@ -41,19 +52,10 @@ class EdgeDeviceStatusManager:
         except ApiException as e:
             return None
 
-    def get_address(self) -> str:
-        obj = self.get()
-        if obj and 'spec' in obj and 'address' in obj['spec']:
-            return obj['spec']['address']
-        return None
-
-    def update_phase(self, phase: str):
-        if phase not in EDGEDEVICE_STATUS_PHASES:
-            phase = "Unknown"
-        status = {'edgeDevicePhase': phase}
-        body = {'status': status}
+    def update_status_phase(self, phase: str):
         for _ in range(3):
             try:
+                body = {"status": {"edgeDevicePhase": phase}}
                 self.api.patch_namespaced_custom_object_status(
                     group=EDGEDEVICE_CRD_GROUP,
                     version=EDGEDEVICE_CRD_VERSION,
@@ -62,201 +64,268 @@ class EdgeDeviceStatusManager:
                     name=self.name,
                     body=body
                 )
-                return
+                return True
             except ApiException:
                 time.sleep(1)
-        # Give up silently if fails
+        return False
 
-# --- Instruction Config Loading ---
+    def get_device_address(self) -> Optional[str]:
+        obj = self.get()
+        if obj and "spec" in obj and "address" in obj["spec"]:
+            return obj["spec"]["address"]
+        return None
 
-def load_instruction_config(path: str) -> Dict[str, Any]:
-    if not os.path.exists(path):
+# ---------------------- ConfigMap Loader ----------------------
+
+def load_instructions_config(path: str) -> Dict[str, Any]:
+    try:
+        with open(path, "r") as f:
+            return yaml.safe_load(f)
+    except Exception:
         return {}
-    with open(path, "r") as f:
-        return yaml.safe_load(f) or {}
 
-# --- MQTT Client Management ---
+# ---------------------- MQTT Client Handler ----------------------
 
-class MQTTClientManager:
-    def __init__(self, broker_address: str):
+class MQTTClientHandler:
+    def __init__(self, broker_address: str, config: Dict[str, Any], phase_callback: Callable[[str], None]):
         self.broker_address = broker_address
-        self.mqtt_client = mqtt.Client()
+        self.config = config
+        self.phase_callback = phase_callback
+        self.client = None
         self.connected = threading.Event()
         self.subscriptions = {}
+        self.subscriber_threads = {}
+        self.incoming_queues = {}
         self.lock = threading.Lock()
-        # Callbacks
-        self.mqtt_client.on_connect = self._on_connect
-        self.mqtt_client.on_disconnect = self._on_disconnect
-        self.mqtt_client.on_message = self._on_message
-        self.message_callbacks = {}
+
+    def connect(self):
+        host, port = self._parse_broker(self.broker_address)
+        self.client = mqtt.Client()
+        self.client.on_connect = self._on_connect
+        self.client.on_disconnect = self._on_disconnect
+        self.client.on_message = self._on_message
+        try:
+            self.client.connect(host, port, 60)
+            threading.Thread(target=self.client.loop_forever, daemon=True).start()
+            if not self.connected.wait(timeout=10):
+                self.phase_callback(PHASE_FAILED)
+                return False
+            self.phase_callback(PHASE_RUNNING)
+            return True
+        except Exception:
+            self.phase_callback(PHASE_FAILED)
+            return False
+
+    def disconnect(self):
+        if self.client:
+            self.client.disconnect()
+            self.phase_callback(PHASE_PENDING)
+
+    def _parse_broker(self, address: str):
+        if ":" in address:
+            host, port = address.split(":", 1)
+            return host, int(port)
+        else:
+            return address, 1883
 
     def _on_connect(self, client, userdata, flags, rc):
         if rc == 0:
             self.connected.set()
         else:
-            self.connected.clear()
+            self.phase_callback(PHASE_FAILED)
 
     def _on_disconnect(self, client, userdata, rc):
         self.connected.clear()
+        if rc != 0:
+            self.phase_callback(PHASE_FAILED)
+        else:
+            self.phase_callback(PHASE_PENDING)
 
     def _on_message(self, client, userdata, msg):
         topic = msg.topic
-        payload = msg.payload.decode('utf-8')
         with self.lock:
-            callbacks = self.message_callbacks.get(topic, [])
-        for cb in callbacks:
-            try:
-                cb(topic, payload)
-            except Exception:
-                pass
+            if topic in self.incoming_queues:
+                self.incoming_queues[topic].put(msg.payload)
 
-    def connect(self, timeout=5) -> bool:
-        addr, port = self._parse_broker_addr()
-        try:
-            self.mqtt_client.connect(addr, port, keepalive=30)
-        except Exception:
-            return False
-        t = threading.Thread(target=self.mqtt_client.loop_start)
-        t.daemon = True
-        t.start()
-        return self.connected.wait(timeout)
-
-    def disconnect(self):
-        try:
-            self.mqtt_client.disconnect()
-        except Exception:
-            pass
-        self.connected.clear()
-
-    def _parse_broker_addr(self):
-        if ':' in self.broker_address:
-            addr, port = self.broker_address.rsplit(':', 1)
-            return addr, int(port)
-        return self.broker_address, 1883
-
-    def subscribe(self, topic: str, qos: int, callback: Callable[[str, str], None]):
+    def subscribe(self, topic: str, qos: int = 1):
         with self.lock:
-            if topic not in self.message_callbacks:
-                self.message_callbacks[topic] = []
-            self.message_callbacks[topic].append(callback)
-        self.mqtt_client.subscribe(topic, qos=qos)
+            if topic not in self.subscriptions:
+                self.client.subscribe(topic, qos=qos)
+                self.incoming_queues[topic] = Queue()
+                self.subscriptions[topic] = qos
 
     def unsubscribe(self, topic: str):
         with self.lock:
-            self.message_callbacks.pop(topic, None)
-        self.mqtt_client.unsubscribe(topic)
+            if topic in self.subscriptions:
+                self.client.unsubscribe(topic)
+                del self.subscriptions[topic]
+                del self.incoming_queues[topic]
 
-    def publish(self, topic: str, payload: str, qos: int = 1):
-        return self.mqtt_client.publish(topic, payload, qos=qos)
+    def publish(self, topic: str, payload: Any, qos: int = 1):
+        self.client.publish(topic, json.dumps(payload), qos=qos)
 
-# --- DeviceShifu API Implementation ---
+    def get_message(self, topic: str, timeout: float = 2.0) -> Optional[Any]:
+        queue = self.incoming_queues.get(topic)
+        if queue:
+            try:
+                payload = queue.get(timeout=timeout)
+                return json.loads(payload)
+            except Exception:
+                return None
+        return None
+
+# ---------------------- DeviceShifu API ----------------------
 
 class DeviceShifu:
-    def __init__(self):
-        # Env required
-        self.edge_device_name = os.environ.get("EDGEDEVICE_NAME")
-        self.edge_device_namespace = os.environ.get("EDGEDEVICE_NAMESPACE")
-        self.mqtt_broker_address = os.environ.get("MQTT_BROKER_ADDRESS")
-        if not self.edge_device_name or not self.edge_device_namespace or not self.mqtt_broker_address:
-            sys.exit(1)
+    def __init__(self, crd: EdgeDeviceCRD, mqtt_handler: MQTTClientHandler, config: Dict[str, Any]):
+        self.crd = crd
+        self.mqtt = mqtt_handler
+        self.config = config
+        self.api_map = self._build_api_map()
 
-        self.crd_manager = EdgeDeviceStatusManager(self.edge_device_name, self.edge_device_namespace)
-        self.device_address = self.crd_manager.get_address()
-        self.config_path = "/etc/edgedevice/config/instructions"
-        self.api_settings = load_instruction_config(self.config_path)
-        self.mqtt_manager = MQTTClientManager(self.mqtt_broker_address)
-        self.status_thread = threading.Thread(target=self._status_maintainer, daemon=True)
-        self.status_thread.start()
+    def _build_api_map(self) -> Dict[str, Dict[str, Any]]:
+        # Map API path to their properties from config
+        return self.config or {}
 
-    def _status_maintainer(self):
-        last_phase = None
-        while True:
-            phase = self._determine_phase()
-            if phase != last_phase:
-                self.crd_manager.update_phase(phase)
-                last_phase = phase
-            time.sleep(5)
+    # --- SUBSCRIBE APIs ---
+    def subscribe_imu(self, callback: Callable[[Dict], None]):
+        topic = "device/telemetry/imu"
+        qos = self._get_qos(topic)
+        self.mqtt.subscribe(topic, qos)
+        self._start_subscriber_thread(topic, callback)
 
-    def _determine_phase(self) -> str:
-        if not self.device_address:
-            return "Unknown"
-        if not self.mqtt_manager.connected.is_set():
-            # Try to connect
-            if self.mqtt_manager.connect(timeout=2):
-                return "Running"
-            else:
-                return "Pending"
-        return "Running"
+    def subscribe_odom(self, callback: Callable[[Dict], None]):
+        topic = "device/sensors/odom"
+        qos = self._get_qos(topic)
+        self.mqtt.subscribe(topic, qos)
+        self._start_subscriber_thread(topic, callback)
 
-    def _get_api_setting(self, api_name: str, key: str, default=None):
-        obj = self.api_settings.get(api_name, {})
-        plist = obj.get('protocolPropertyList', {})
-        return plist.get(key, default)
+    def subscribe_scan(self, callback: Callable[[Dict], None]):
+        topic = "device/sensors/scan"
+        qos = self._get_qos(topic)
+        self.mqtt.subscribe(topic, qos)
+        self._start_subscriber_thread(topic, callback)
 
-    # --- API Methods ---
+    def subscribe_camera(self, callback: Callable[[Dict], None]):
+        topic = "device/sensors/camera"
+        qos = self._get_qos(topic)
+        self.mqtt.subscribe(topic, qos)
+        self._start_subscriber_thread(topic, callback)
 
-    # SUBSCRIBE: device/telemetry/imu, device/sensors/odom, device/sensors/scan, device/sensors/camera, device/sensors/imu, device/sensors/power, device/telemetry/odom
-    # Each returns a generator of JSON messages
+    def subscribe_power(self, callback: Callable[[Dict], None]):
+        topic = "device/sensors/power"
+        qos = self._get_qos(topic)
+        self.mqtt.subscribe(topic, qos)
+        self._start_subscriber_thread(topic, callback)
 
-    def subscribe_device_telemetry_imu(self):
-        return self._subscribe_stream("device/telemetry/imu", qos=1)
+    def subscribe_telemetry_imu(self, callback: Callable[[Dict], None]):
+        topic = "device/telemetry/imu"
+        qos = self._get_qos(topic)
+        self.mqtt.subscribe(topic, qos)
+        self._start_subscriber_thread(topic, callback)
 
-    def subscribe_device_sensors_odom(self):
-        return self._subscribe_stream("device/sensors/odom", qos=1)
+    def subscribe_telemetry_odom(self, callback: Callable[[Dict], None]):
+        topic = "device/telemetry/odom"
+        qos = self._get_qos(topic)
+        self.mqtt.subscribe(topic, qos)
+        self._start_subscriber_thread(topic, callback)
 
-    def subscribe_device_sensors_scan(self):
-        return self._subscribe_stream("device/sensors/scan", qos=1)
-
-    def subscribe_device_sensors_camera(self):
-        return self._subscribe_stream("device/sensors/camera", qos=1)
-
-    def subscribe_device_sensors_imu(self):
-        return self._subscribe_stream("device/sensors/imu", qos=1)
-
-    def subscribe_device_sensors_power(self):
-        return self._subscribe_stream("device/sensors/power", qos=1)
-
-    def subscribe_device_telemetry_odom(self):
-        return self._subscribe_stream("device/telemetry/odom", qos=1)
-
-    # PUBLISH: device/commands/cmd_vel, device/commands/led
-    def publish_device_commands_cmd_vel(self, payload: dict):
+    # --- PUBLISH APIs ---
+    def publish_cmd_vel(self, payload: Dict):
         topic = "device/commands/cmd_vel"
-        qos = 1
-        payload_str = json.dumps(payload)
-        return self.mqtt_manager.publish(topic, payload_str, qos=qos)
+        qos = self._get_qos(topic)
+        self.mqtt.publish(topic, payload, qos)
 
-    def publish_device_commands_led(self, payload: dict):
+    def publish_led(self, payload: Dict):
         topic = "device/commands/led"
-        qos = 1
-        payload_str = json.dumps(payload)
-        return self.mqtt_manager.publish(topic, payload_str, qos=qos)
+        qos = self._get_qos(topic)
+        self.mqtt.publish(topic, payload, qos)
 
-    # Internal subscribe stream helper
-    def _subscribe_stream(self, topic: str, qos: int = 1):
-        queue = []
-        cond = threading.Condition()
+    # --- Helpers ---
+    def _get_qos(self, topic: str) -> int:
+        for api, props in self.api_map.items():
+            if api == topic or api.split('/')[-1] == topic.split('/')[-1]:
+                protocol_props = props.get('protocolPropertyList', {})
+                return int(protocol_props.get('qos', 1))
+        return 1
 
-        def cb(t, payload):
-            with cond:
-                queue.append(payload)
-                cond.notify()
-
-        self.mqtt_manager.subscribe(topic, qos, cb)
-        try:
+    def _start_subscriber_thread(self, topic: str, callback: Callable[[Dict], None]):
+        def run():
             while True:
-                with cond:
-                    while not queue:
-                        cond.wait()
-                    message = queue.pop(0)
-                yield message
-        finally:
-            self.mqtt_manager.unsubscribe(topic)
+                msg = self.mqtt.get_message(topic, timeout=10)
+                if msg:
+                    callback(msg)
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        self.mqtt.subscriber_threads[topic] = t
 
-# --- Entry Point for Testing (not for production use) ---
+# ---------------------- Status Updater Thread ----------------------
+
+def status_updater_loop(crd: EdgeDeviceCRD, mqtt_handler: MQTTClientHandler):
+    prev_status = None
+    while True:
+        if mqtt_handler.connected.is_set():
+            phase = PHASE_RUNNING
+        else:
+            phase = PHASE_PENDING
+        if prev_status != phase:
+            crd.update_status_phase(phase)
+            prev_status = phase
+        time.sleep(5)
+
+# ---------------------- Main Entrypoint ----------------------
+
+def main():
+    # Prepare CRD & config
+    crd = EdgeDeviceCRD(EDGEDEVICE_NAME, EDGEDEVICE_NAMESPACE)
+    config = load_instructions_config(CONFIG_PATH)
+
+    # Get device address from CRD (used only for K8s status, not MQTT)
+    device_address = crd.get_device_address()
+
+    # Setup MQTT
+    mqtt_handler = MQTTClientHandler(
+        broker_address=MQTT_BROKER_ADDRESS,
+        config=config,
+        phase_callback=lambda phase: crd.update_status_phase(phase)
+    )
+
+    # Start status updater thread
+    threading.Thread(target=status_updater_loop, args=(crd, mqtt_handler), daemon=True).start()
+
+    # Connect to MQTT Broker
+    mqtt_handler.connect()
+
+    # Init DeviceShifu
+    shifu = DeviceShifu(crd, mqtt_handler, config)
+
+    # Example usage for API subscription (replace with real callbacks/logic as needed)
+    def imu_callback(data):
+        print("IMU Data:", data)
+    shifu.subscribe_imu(imu_callback)
+
+    def odom_callback(data):
+        print("Odometry Data:", data)
+    shifu.subscribe_odom(odom_callback)
+
+    def scan_callback(data):
+        print("LIDAR Scan Data:", data)
+    shifu.subscribe_scan(scan_callback)
+
+    def camera_callback(data):
+        print("Camera Data:", data)
+    shifu.subscribe_camera(camera_callback)
+
+    def power_callback(data):
+        print("Power Data:", data)
+    shifu.subscribe_power(power_callback)
+
+    # Example publish usage
+    # shifu.publish_cmd_vel({"linear": {"x":1.0, "y":0, "z":0}, "angular": {"x":0, "y":0, "z":0.5}})
+    # shifu.publish_led({"status": "on"})
+
+    while True:
+        time.sleep(60)
 
 if __name__ == "__main__":
-    ds = DeviceShifu()
-    # Example usage: subscribe to IMU
-    for msg in ds.subscribe_device_telemetry_imu():
-        print("Received IMU:", msg)
+    main()
