@@ -1,265 +1,229 @@
 import os
-import sys
-import yaml
+import time
 import threading
-import logging
-import signal
+import yaml
 import json
-from typing import Any, Dict, Callable
-
+import traceback
+from kubernetes import client, config
+from kubernetes.client.rest import ApiException
 import paho.mqtt.client as mqtt
 
-from kubernetes import client as k8s_client, config as k8s_config, watch as k8s_watch
+# Constants for EdgeDevice CRD
+CRD_GROUP = "shifu.edgenesis.io"
+CRD_VERSION = "v1alpha1"
+CRD_PLURAL = "edgedevices"
+CRD_KIND = "EdgeDevice"
 
-# -------------------- CONFIGURATION & CONSTANTS --------------------
+# Device phase states
+PHASE_PENDING = "Pending"
+PHASE_RUNNING = "Running"
+PHASE_FAILED = "Failed"
+PHASE_UNKNOWN = "Unknown"
 
-CONFIGMAP_INSTRUCTIONS_PATH = '/etc/edgedevice/config/instructions'
-MQTT_BROKER_ADDRESS = os.environ.get('MQTT_BROKER_ADDRESS')
-EDGEDEVICE_NAME = os.environ.get('EDGEDEVICE_NAME')
-EDGEDEVICE_NAMESPACE = os.environ.get('EDGEDEVICE_NAMESPACE')
+# Load EdgeDevice name and namespace from env
+EDGEDEVICE_NAME = os.environ.get("EDGEDEVICE_NAME")
+EDGEDEVICE_NAMESPACE = os.environ.get("EDGEDEVICE_NAMESPACE")
+MQTT_BROKER_ADDRESS = os.environ.get("MQTT_BROKER_ADDRESS")
 
-if not (MQTT_BROKER_ADDRESS and EDGEDEVICE_NAME and EDGEDEVICE_NAMESPACE):
-    sys.stderr.write("Missing required environment variables: MQTT_BROKER_ADDRESS, EDGEDEVICE_NAME, EDGEDEVICE_NAMESPACE\n")
-    sys.exit(1)
+if not EDGEDEVICE_NAME or not EDGEDEVICE_NAMESPACE or not MQTT_BROKER_ADDRESS:
+    raise Exception("EDGEDEVICE_NAME, EDGEDEVICE_NAMESPACE, and MQTT_BROKER_ADDRESS envs are required.")
 
-# MQTT topics to subscribe (from given driver api info)
-CONTROL_TOPICS = [
-    'wheeltecros/move/forward',
-    'wheeltecros/move/backward',
-    'wheeltecros/turn/left',
-    'wheeltecros/turn/right',
-    'wheeltecros/stop'
-]
+# Load instruction config
+CONFIG_INSTRUCTIONS_PATH = "/etc/edgedevice/config/instructions"
+try:
+    with open(CONFIG_INSTRUCTIONS_PATH, "r") as f:
+        instruction_config = yaml.safe_load(f)
+except Exception:
+    instruction_config = {}
 
-# For deduplication, only subscribe each topic once
-CONTROL_TOPICS = list(set(CONTROL_TOPICS))
+def get_api_settings(api_path):
+    # Returns the settings for given api_path from instruction_config
+    return instruction_config.get(api_path, {}).get("protocolPropertyList", {})
 
-# -------------------- LOGGING SETUP --------------------
+# Kubernetes API setup
+config.load_incluster_config()
+api = client.CustomObjectsApi()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s %(message)s',
-    handlers=[logging.StreamHandler()]
-)
+def get_device_cr():
+    return api.get_namespaced_custom_object(
+        group=CRD_GROUP,
+        version=CRD_VERSION,
+        namespace=EDGEDEVICE_NAMESPACE,
+        plural=CRD_PLURAL,
+        name=EDGEDEVICE_NAME,
+    )
 
-logger = logging.getLogger('DeviceShifu')
-
-# -------------------- LOAD DEVICE INSTRUCTIONS --------------------
-
-def load_instructions(config_path: str) -> Dict[str, Any]:
-    if not os.path.exists(config_path):
-        logger.warning(f"Instructions config not found: {config_path}")
-        return {}
-    with open(config_path, 'r') as f:
-        return yaml.safe_load(f) or {}
-
-instructions = load_instructions(CONFIGMAP_INSTRUCTIONS_PATH)
-
-# -------------------- KUBERNETES CLIENT SETUP --------------------
-
-def get_k8s_client():
-    try:
-        k8s_config.load_incluster_config()
-    except Exception as e:
-        logger.error(f"Failed to load in-cluster config: {e}")
-        sys.exit(1)
-    return k8s_client.CustomObjectsApi()
-
-k8s_api = get_k8s_client()
-
-EDGEDEVICE_CRD_GROUP = "shifu.edgenesis.io"
-EDGEDEVICE_CRD_VERSION = "v1alpha1"
-EDGEDEVICE_CRD_PLURAL = "edgedevices"
-
-# -------------------- EDGEDEVICE STATUS MANAGEMENT --------------------
-
-def update_edgedevice_phase(phase: str):
+def update_device_phase(phase):
+    # Patch only the .status.edgeDevicePhase
     body = {"status": {"edgeDevicePhase": phase}}
     try:
-        k8s_api.patch_namespaced_custom_object_status(
-            group=EDGEDEVICE_CRD_GROUP,
-            version=EDGEDEVICE_CRD_VERSION,
+        api.patch_namespaced_custom_object_status(
+            group=CRD_GROUP,
+            version=CRD_VERSION,
             namespace=EDGEDEVICE_NAMESPACE,
-            plural=EDGEDEVICE_CRD_PLURAL,
+            plural=CRD_PLURAL,
             name=EDGEDEVICE_NAME,
-            body=body
+            body=body,
         )
-        logger.info(f"Updated EdgeDevice status to phase: {phase}")
-    except Exception as e:
-        logger.error(f"Failed to update EdgeDevice status: {e}")
+    except ApiException as e:
+        pass  # Ignore patching errors to avoid crash loop
 
-def get_edgedevice_address() -> str:
+def get_device_address():
     try:
-        dev = k8s_api.get_namespaced_custom_object(
-            group=EDGEDEVICE_CRD_GROUP,
-            version=EDGEDEVICE_CRD_VERSION,
-            namespace=EDGEDEVICE_NAMESPACE,
-            plural=EDGEDEVICE_CRD_PLURAL,
-            name=EDGEDEVICE_NAME
-        )
-        return dev.get("spec", {}).get("address", "")
-    except Exception as e:
-        logger.error(f"Failed to get EdgeDevice: {e}")
-        return ""
+        device = get_device_cr()
+        return device.get("spec", {}).get("address", None)
+    except Exception:
+        return None
 
-# -------------------- MQTT CLIENT SETUP --------------------
+# MQTT Topics
+MQTT_TOPICS = [
+    {
+        "path": "wheeltecros/move/forward",
+        "description": "Move forward",
+        "api": "wheeltecros/move/forward",
+    },
+    {
+        "path": "wheeltecros/move/backward",
+        "description": "Move backward",
+        "api": "wheeltecros/move/backward",
+    },
+    {
+        "path": "wheeltecros/turn/left",
+        "description": "Turn left",
+        "api": "wheeltecros/turn/left",
+    },
+    {
+        "path": "wheeltecros/turn/right",
+        "description": "Turn right",
+        "api": "wheeltecros/turn/right",
+    },
+    {
+        "path": "wheeltecros/stop",
+        "description": "Stop",
+        "api": "wheeltecros/stop",
+    },
+]
 
-class WheeltecrosMQTTClient:
-    def __init__(self, broker_addr: str, topics: list, instructions: Dict[str, Any]):
-        self.broker_addr = broker_addr
+# MQTT Client
+class DeviceShifuMQTTClient:
+    def __init__(self, broker_address, topics):
+        self.broker_address, self.broker_port = self.parse_broker_address(broker_address)
         self.topics = topics
-        self.instructions = instructions
-        self.client = mqtt.Client()
-        self.connected_event = threading.Event()
+        self.mqtt_client = mqtt.Client()
+        self.connected = False
         self.should_stop = threading.Event()
-        self.subscribed_topics = set()
-        self._setup_handlers()
+        self.status_lock = threading.Lock()
+        self.status_phase = PHASE_PENDING
+        self.last_status_update = 0
 
-    def _setup_handlers(self):
-        self.client.on_connect = self._on_connect
-        self.client.on_disconnect = self._on_disconnect
-        self.client.on_message = self._on_message
-        self.client.on_subscribe = self._on_subscribe
+        # Register callbacks
+        self.mqtt_client.on_connect = self.on_connect
+        self.mqtt_client.on_disconnect = self.on_disconnect
+        self.mqtt_client.on_message = self.on_message
 
-    def _on_connect(self, client, userdata, flags, rc):
-        if rc == 0:
-            logger.info("Connected to MQTT broker successfully.")
-            self.connected_event.set()
-            update_edgedevice_phase("Running")
-            self._subscribe_topics()
+    @staticmethod
+    def parse_broker_address(addr):
+        # Accepts address:port or address
+        if ':' in addr:
+            host, port = addr.split(':')
+            return host.strip(), int(port.strip())
         else:
-            logger.error("Failed to connect to MQTT broker, rc=%s", rc)
-            update_edgedevice_phase("Failed")
-
-    def _on_disconnect(self, client, userdata, rc):
-        if rc != 0:
-            logger.warning("Unexpected MQTT disconnection.")
-            update_edgedevice_phase("Pending")
-        else:
-            logger.info("Disconnected from MQTT broker gracefully.")
-            update_edgedevice_phase("Pending")
-        self.connected_event.clear()
-        self.subscribed_topics.clear()
-
-    def _on_subscribe(self, client, userdata, mid, granted_qos):
-        logger.info(f"Subscribed (mid={mid}) with QoS: {granted_qos}")
-
-    def _on_message(self, client, userdata, msg):
-        logger.info(f"Received MQTT message on topic '{msg.topic}': {msg.payload}")
-        try:
-            payload = json.loads(msg.payload.decode("utf-8"))
-        except Exception:
-            payload = msg.payload.decode("utf-8")
-        method = "SUBSCRIBE"
-        topic_key = msg.topic.replace('/', '_')
-        api_instruction = self.instructions.get(topic_key, {})
-        self.handle_device_command(msg.topic, payload, api_instruction)
-
-    def _subscribe_topics(self):
-        for topic in self.topics:
-            if topic not in self.subscribed_topics:
-                # Get QoS from instructions or default to 1
-                topic_key = topic.replace('/', '_')
-                qos = 1
-                if topic_key in self.instructions:
-                    protocol_props = self.instructions[topic_key].get('protocolPropertyList', {})
-                    qos = int(protocol_props.get('qos', 1))
-                self.client.subscribe(topic, qos)
-                self.subscribed_topics.add(topic)
-                logger.info(f"Subscribing to topic: {topic} with QoS {qos}")
-
-    def handle_device_command(self, topic: str, payload: Any, api_instruction: Dict[str, Any]):
-        # The actual command handling for each topic
-        if topic.endswith("move/forward"):
-            self._move_forward(payload)
-        elif topic.endswith("move/backward"):
-            self._move_backward(payload)
-        elif topic.endswith("turn/left"):
-            self._turn_left(payload)
-        elif topic.endswith("turn/right"):
-            self._turn_right(payload)
-        elif topic.endswith("stop"):
-            self._stop(payload)
-        else:
-            logger.warning(f"Received command for unknown topic: {topic}")
-
-    def _move_forward(self, payload: Any):
-        logger.info(f"Handling move forward with payload: {payload}")
-        # Implement actual device communication here
-
-    def _move_backward(self, payload: Any):
-        logger.info(f"Handling move backward with payload: {payload}")
-        # Implement actual device communication here
-
-    def _turn_left(self, payload: Any):
-        logger.info(f"Handling turn left with payload: {payload}")
-        # Implement actual device communication here
-
-    def _turn_right(self, payload: Any):
-        logger.info(f"Handling turn right with payload: {payload}")
-        # Implement actual device communication here
-
-    def _stop(self, payload: Any):
-        logger.info(f"Handling stop with payload: {payload}")
-        # Implement actual device communication here
-
-    def loop_forever(self):
-        while not self.should_stop.is_set():
-            try:
-                self.client.loop(timeout=1.0)
-            except Exception as e:
-                logger.error(f"Exception in MQTT loop: {e}")
-                update_edgedevice_phase("Failed")
-                self.connected_event.clear()
-                break
+            return addr.strip(), 1883
 
     def start(self):
-        try:
-            broker, port = self.broker_addr.split(':')
-            port = int(port)
-        except Exception:
-            logger.error(f"Invalid MQTT_BROKER_ADDRESS: {self.broker_addr}")
-            update_edgedevice_phase("Failed")
-            return
-        update_edgedevice_phase("Pending")
-        self.client.connect_async(broker, port, keepalive=60)
-        self.client.loop_start()
+        threading.Thread(target=self._run_forever, daemon=True).start()
+        threading.Thread(target=self._status_monitor_loop, daemon=True).start()
 
     def stop(self):
         self.should_stop.set()
+        self.mqtt_client.disconnect()
+
+    def _run_forever(self):
+        while not self.should_stop.is_set():
+            try:
+                self.mqtt_client.connect(self.broker_address, self.broker_port, keepalive=60)
+                self.mqtt_client.loop_forever()
+            except Exception:
+                self.set_status(PHASE_FAILED)
+                time.sleep(5)  # Retry
+            else:
+                break
+
+    def _status_monitor_loop(self):
+        # Periodically update the device phase
+        while not self.should_stop.is_set():
+            with self.status_lock:
+                phase = self.status_phase
+            update_device_phase(phase)
+            time.sleep(5)
+
+    def set_status(self, phase):
+        with self.status_lock:
+            self.status_phase = phase
+
+    def on_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            self.set_status(PHASE_RUNNING)
+            # Subscribe to all control topics
+            for topic in self.topics:
+                api_settings = get_api_settings(topic["api"])
+                qos = api_settings.get("qos", 1)
+                client.subscribe(topic["path"], qos)
+        else:
+            self.set_status(PHASE_FAILED)
+
+    def on_disconnect(self, client, userdata, rc):
+        self.set_status(PHASE_PENDING)
+
+    def on_message(self, client, userdata, msg):
+        # Dispatch to the appropriate handler
         try:
-            self.client.disconnect()
+            payload = msg.payload.decode("utf-8")
+            try:
+                data = json.loads(payload) if payload else {}
+            except Exception:
+                data = {}
+            topic = msg.topic
+            if topic == "wheeltecros/move/forward":
+                self.handle_move_forward(data)
+            elif topic == "wheeltecros/move/backward":
+                self.handle_move_backward(data)
+            elif topic == "wheeltecros/turn/left":
+                self.handle_turn_left(data)
+            elif topic == "wheeltecros/turn/right":
+                self.handle_turn_right(data)
+            elif topic == "wheeltecros/stop":
+                self.handle_stop(data)
         except Exception:
-            pass
-        self.client.loop_stop()
+            traceback.print_exc()
 
-# -------------------- SIGNAL HANDLING --------------------
+    def handle_move_forward(self, params):
+        # Implement movement logic here
+        # Example: send command to ROS node or device over local IPC
+        print("[Action] Move Forward:", params)
 
-def handle_signal(signum, frame):
-    logger.info("Received termination signal, shutting down...")
-    update_edgedevice_phase("Pending")
-    mqtt_client.stop()
-    sys.exit(0)
+    def handle_move_backward(self, params):
+        print("[Action] Move Backward:", params)
 
-signal.signal(signal.SIGTERM, handle_signal)
-signal.signal(signal.SIGINT, handle_signal)
+    def handle_turn_left(self, params):
+        print("[Action] Turn Left:", params)
 
-# -------------------- MAIN --------------------
+    def handle_turn_right(self, params):
+        print("[Action] Turn Right:", params)
+
+    def handle_stop(self, params):
+        print("[Action] Stop:", params)
+
+def main():
+    device_address = get_device_address()
+    # The device_address is not used for MQTT but may be useful for local integrations
+
+    mqtt_topics = MQTT_TOPICS
+    client = DeviceShifuMQTTClient(MQTT_BROKER_ADDRESS, mqtt_topics)
+    client.start()
+
+    while True:
+        time.sleep(60)
 
 if __name__ == "__main__":
-    update_edgedevice_phase("Pending")
-    device_address = get_edgedevice_address()
-    logger.info(f"EdgeDevice Address from CRD: {device_address}")
-
-    mqtt_client = WheeltecrosMQTTClient(
-        broker_addr=MQTT_BROKER_ADDRESS,
-        topics=CONTROL_TOPICS,
-        instructions=instructions
-    )
-    mqtt_client.start()
-
-    try:
-        while True:
-            signal.pause()
-    except KeyboardInterrupt:
-        handle_signal(signal.SIGINT, None)
+    main()
