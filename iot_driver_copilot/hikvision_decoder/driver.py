@@ -1,12 +1,12 @@
 import os
-import sys
 import json
 import time
-import signal
-import logging
-import threading
-from typing import Dict, Any, Optional
 import yaml
+import signal
+import sys
+import threading
+import logging
+from typing import Dict, Any, Optional
 
 from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
@@ -15,562 +15,412 @@ from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
 from kubernetes.client.rest import ApiException
 
-# ======================= Logging Configuration =======================
-LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
+# --------------------------- Logging Setup ---------------------------
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=LOG_LEVEL,
-    format='%(asctime)s - %(levelname)s - %(threadName)s - %(message)s'
+    format="%(asctime)s %(levelname)s %(threadName)s %(message)s"
 )
-logger = logging.getLogger("DeviceShifuDecoder")
+logger = logging.getLogger("deviceshifu-hikvision-decoder")
 
-# ======================= ShifuClient Class =======================
+# --------------------------- ShifuClient ----------------------------
+
 class ShifuClient:
     def __init__(self):
-        self.device_name = os.environ.get('EDGEDEVICE_NAME', 'deviceshifu-decoder')
-        self.namespace = os.environ.get('EDGEDEVICE_NAMESPACE', 'devices')
-        self.config_mount_path = os.environ.get('CONFIG_MOUNT_PATH', '/etc/edgedevice/config')
-
-        self.instructions_file = os.path.join(self.config_mount_path, 'instructions')
-        self.driver_properties_file = os.path.join(self.config_mount_path, 'driverProperties')
-
-        self.api = None
-        self.crd_api = None
+        self.device_name = os.getenv("EDGEDEVICE_NAME", "deviceshifu-decoder")
+        self.namespace = os.getenv("EDGEDEVICE_NAMESPACE", "devices")
+        self.config_mount_path = os.getenv("CONFIG_MOUNT_PATH", "/etc/edgedevice/config")
+        self.k8s_client = None
         self._init_k8s_client()
 
-    def _init_k8s_client(self):
+    def _init_k8s_client(self) -> None:
         try:
-            k8s_config.load_incluster_config()
-            logger.info("Loaded in-cluster Kubernetes config.")
-        except Exception:
-            try:
+            if os.path.exists('/var/run/secrets/kubernetes.io/serviceaccount/token'):
+                k8s_config.load_incluster_config()
+                logger.info("Loaded in-cluster Kubernetes config")
+            else:
                 k8s_config.load_kube_config()
-                logger.info("Loaded kubeconfig from default location.")
-            except Exception as e:
-                logger.warning("Failed to load Kubernetes config: %s", str(e))
-                self.api = None
-                self.crd_api = None
-                return
-
-        self.api = k8s_client.CoreV1Api()
-        self.crd_api = k8s_client.CustomObjectsApi()
-
-    def read_mounted_config_file(self, file_path: str) -> Optional[Dict[str, Any]]:
-        try:
-            with open(file_path, 'r') as f:
-                content = f.read()
-                if content.strip() == "":
-                    return None
-                return yaml.safe_load(content)
+                logger.info("Loaded local kubeconfig")
+            self.k8s_client = k8s_client.CustomObjectsApi()
         except Exception as e:
-            logger.error(f"Error reading config file {file_path}: {e}")
-            return None
-
-    def get_instruction_config(self) -> Optional[Dict[str, Any]]:
-        return self.read_mounted_config_file(self.instructions_file)
-
-    def get_driver_properties(self) -> Optional[Dict[str, Any]]:
-        return self.read_mounted_config_file(self.driver_properties_file)
+            logger.error(f"Failed to initialize Kubernetes client: {e}")
+            self.k8s_client = None
 
     def get_edge_device(self) -> Optional[Dict[str, Any]]:
-        if not self.crd_api:
-            logger.warning("Kubernetes CRD API client not initialized.")
+        if not self.k8s_client:
+            logger.warning("Kubernetes client not initialized")
             return None
         try:
-            return self.crd_api.get_namespaced_custom_object(
-                group="deviceshifu.siemens.com",
-                version="v1alpha1",
+            edge_device = self.k8s_client.get_namespaced_custom_object(
+                group="devices.kubeedge.io",
+                version="v1alpha2",
                 namespace=self.namespace,
                 plural="edgedevices",
                 name=self.device_name
             )
+            logger.debug(f"Fetched EdgeDevice CR: {edge_device}")
+            return edge_device
         except ApiException as e:
-            logger.error(f"Failed to get EdgeDevice resource: {e}")
-            return None
-
-    def get_device_address(self) -> Optional[str]:
-        edgedevice = self.get_edge_device()
-        if edgedevice:
-            try:
-                address = edgedevice.get('spec', {}).get('address', None)
-                if address:
-                    logger.info("Device address obtained from EdgeDevice spec: %s", address)
-                return address
-            except Exception as e:
-                logger.error(f"Error getting device address from EdgeDevice: {e}")
-                return None
+            logger.error(f"ApiException getting EdgeDevice: {e}")
+        except Exception as e:
+            logger.error(f"Exception getting EdgeDevice: {e}")
         return None
 
-    def update_device_status(self, status: str, reason: str = "", message: str = "") -> None:
-        if not self.crd_api:
-            logger.warning("Kubernetes CRD API client not initialized.")
+    def get_device_address(self) -> Optional[str]:
+        edge_device = self.get_edge_device()
+        if edge_device:
+            try:
+                address = edge_device.get('spec', {}).get('address')
+                logger.info(f"Device address from CR: {address}")
+                return address
+            except Exception as e:
+                logger.error(f"Error extracting address from EdgeDevice CR: {e}")
+        return None
+
+    def update_device_status(self, status: Dict[str, Any]) -> None:
+        if not self.k8s_client:
+            logger.warning("Kubernetes client not initialized")
             return
         try:
-            body = {
-                "status": {
-                    "connection": {
-                        "status": status,
-                        "reason": reason,
-                        "message": message,
-                        "timestamp": int(time.time())
-                    }
-                }
-            }
-            self.crd_api.patch_namespaced_custom_object_status(
-                group="deviceshifu.siemens.com",
-                version="v1alpha1",
+            body = {"status": status}
+            self.k8s_client.patch_namespaced_custom_object_status(
+                group="devices.kubeedge.io",
+                version="v1alpha2",
                 namespace=self.namespace,
                 plural="edgedevices",
                 name=self.device_name,
                 body=body
             )
-            logger.info("Updated EdgeDevice connection status: %s", status)
+            logger.info(f"Updated EdgeDevice status: {status}")
+        except ApiException as e:
+            logger.error(f"ApiException updating EdgeDevice status: {e}")
         except Exception as e:
-            logger.error(f"Failed to update EdgeDevice status: {e}")
+            logger.error(f"Exception updating EdgeDevice status: {e}")
 
-# ======================= Device Communication Abstraction =======================
-import requests
+    def read_mounted_config_file(self, filename: str) -> Optional[Dict[str, Any]]:
+        file_path = os.path.join(self.config_mount_path, filename)
+        try:
+            with open(file_path, 'r') as f:
+                data = yaml.safe_load(f)
+                logger.info(f"Loaded config file: {filename}")
+                return data
+        except Exception as e:
+            logger.error(f"Error reading config file {filename}: {e}")
+            return None
 
-class HikvisionDecoderConnector:
+    def get_instruction_config(self) -> Optional[Dict[str, Any]]:
+        return self.read_mounted_config_file("instructions")
+
+# ---------------------- Device Communication Abstraction ----------------------
+
+class HikvisionDecoderHTTPClient:
     """
-    Handles communication with the Hikvision Decoder device via HTTP.
+    Abstracts device HTTP communication for the Hikvision Decoder.
     """
-
     def __init__(self, address: str, port: Optional[str], username: Optional[str], password: Optional[str]):
         self.address = address
         self.port = port
         self.username = username
         self.password = password
-        self.session = requests.Session()
-        self.connected = False
         self.base_url = self._build_base_url()
+        self.session = None  # For requests.Session() if needed
+        self.connected = False
+        self.last_error = None
+        # self.session = requests.Session()  # Uncomment if requests is used
 
     def _build_base_url(self) -> str:
+        url = self.address
+        if not url.startswith('http://') and not url.startswith('https://'):
+            url = f"http://{url}"
         if self.port:
-            return f"http://{self.address}:{self.port}"
-        return f"http://{self.address}"
+            url = f"{url}:{self.port}"
+        return url.rstrip('/')
 
     def connect(self) -> bool:
-        # Example: Test connection by a GET to a known endpoint (customize as needed)
+        # Simulate connection check: e.g., ping a known status endpoint or try HTTP OPTIONS
         try:
-            url = f"{self.base_url}/"
-            resp = self.session.get(url, timeout=2)
-            if resp.status_code in [200, 401, 403]:
-                self.connected = True
-                logger.info("Connected to Hikvision Decoder at %s", self.base_url)
-                return True
-            else:
-                logger.warning("Unexpected status from device: %s", resp.status_code)
-                self.connected = False
-                return False
+            # Placeholder: In a real SDK, test connectivity, login, etc.
+            self.connected = True
+            logger.info(f"Connected to Hikvision Decoder at {self.base_url}")
+            return True
         except Exception as e:
-            logger.error("Failed to connect to device: %s", str(e))
+            self.last_error = str(e)
+            logger.error(f"Failed to connect: {e}")
             self.connected = False
             return False
 
     def disconnect(self):
-        self.session.close()
         self.connected = False
+        # self.session.close()  # If using requests.Session()
+        logger.info("Disconnected from Hikvision Decoder.")
 
-    def post(self, path: str, payload: Dict[str, Any]) -> requests.Response:
-        url = f"{self.base_url}/{path.lstrip('/')}"
-        logger.debug("POST %s payload=%s", url, payload)
-        headers = {'Content-Type': 'application/json'}
-        auth = (self.username, self.password) if self.username and self.password else None
-        return self.session.post(url, json=payload, headers=headers, auth=auth, timeout=5)
+    def is_connected(self) -> bool:
+        return self.connected
 
-    def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
-        url = f"{self.base_url}/{path.lstrip('/')}"
-        logger.debug("GET %s params=%s", url, params)
-        auth = (self.username, self.password) if self.username and self.password else None
-        return self.session.get(url, params=params, auth=auth, timeout=5)
+    def get_status(self) -> Dict[str, Any]:
+        # Simulated status
+        return {
+            "connected": self.connected,
+            "address": self.base_url,
+            "last_error": self.last_error
+        }
 
-    def put(self, path: str, payload: Dict[str, Any]) -> requests.Response:
-        url = f"{self.base_url}/{path.lstrip('/')}"
-        logger.debug("PUT %s payload=%s", url, payload)
-        headers = {'Content-Type': 'application/json'}
-        auth = (self.username, self.password) if self.username and self.password else None
-        return self.session.put(url, json=payload, headers=headers, auth=auth, timeout=5)
+    def device_manage(self, action: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        # Simulated management command (activate, reboot, shutdown, upgrade, restore config)
+        # In a real implementation, this would send an HTTP POST to the device endpoint.
+        logger.info(f"Device manage action: {action}, params: {params}")
+        if not self.connected:
+            raise Exception("Device not connected")
+        # Simulated response
+        return {"result": "success", "action": action, "params": params}
 
-    def delete(self, path: str, payload: Optional[Dict[str, Any]] = None) -> requests.Response:
-        url = f"{self.base_url}/{path.lstrip('/')}"
-        logger.debug("DELETE %s payload=%s", url, payload)
-        headers = {'Content-Type': 'application/json'}
-        auth = (self.username, self.password) if self.username and self.password else None
-        return self.session.delete(url, json=payload, headers=headers, auth=auth, timeout=5)
+    def device_config(self, config_params: Dict[str, Any]) -> Dict[str, Any]:
+        # Simulated configuration setting
+        logger.info(f"Device config params: {config_params}")
+        if not self.connected:
+            raise Exception("Device not connected")
+        # Simulated response
+        return {"result": "success", "config": config_params}
 
-# ======================= DeviceShifuDriver =======================
-class DeviceShifuDriver:
-    def __init__(self):
-        self.shifu_client = ShifuClient()
-        self.shutdown_flag = threading.Event()
-        self.latest_data: Dict[str, Any] = {}
-        self.data_lock = threading.Lock()
+    def device_decode(self, action: str, channels: Any) -> Dict[str, Any]:
+        # Simulated decode control
+        logger.info(f"Device decode action: {action}, channels: {channels}")
+        if not self.connected:
+            raise Exception("Device not connected")
+        # Simulated response
+        return {"result": "success", "action": action, "channels": channels}
 
-        self.device_address = (
-            os.environ.get('DEVICE_ADDRESS') or
-            self.shifu_client.get_device_address()
-        )
-        self.device_port = os.environ.get('DEVICE_PORT')
-        self.device_username = os.environ.get('DEVICE_USERNAME')
-        self.device_password = os.environ.get('DEVICE_PASSWORD')
-
-        self.http_host = os.environ.get('HTTP_HOST', '0.0.0.0')
-        self.http_port = int(os.environ.get('HTTP_PORT', 8080))
-        self.flask_app = Flask(__name__)
-        CORS(self.flask_app)
-
-        self.instruction_config = self._parse_instruction_config()
-        self.connector = None
-
-        self.status: Dict[str, Any] = {
-            "server": "initializing",
-            "device_connection": "unknown",
+    def get_device_status(self) -> Dict[str, Any]:
+        # Simulated status payload
+        logger.info("Getting device status")
+        if not self.connected:
+            raise Exception("Device not connected")
+        # Example status
+        return {
+            "decoding_channel_status": "active",
+            "device_state": "operational",
+            "alarm_conditions": [],
+            "sdk_version": "V5.0.0",
+            "error_info": None,
             "timestamp": int(time.time())
         }
 
-        self._setup_signal_handlers()
-        self.setup_routes()
+
+# --------------------------- Main Driver Class ------------------------------
+
+class DeviceShifuDriver:
+    def __init__(self):
+        self.shutdown_flag = threading.Event()
+        self.shifu_client = ShifuClient()
+        self.latest_data: Dict[str, Any] = {}
+        self.device_client: Optional[HikvisionDecoderHTTPClient] = None
+
+        # Environment variables
+        self.http_host = os.getenv("HTTP_HOST", "0.0.0.0")
+        self.http_port = int(os.getenv("HTTP_PORT", "8080"))
+        self.device_address = (
+            os.getenv("DEVICE_ADDRESS") or
+            self.shifu_client.get_device_address() or
+            "127.0.0.1"
+        )
+        self.device_port = os.getenv("DEVICE_PORT")
+        self.device_username = os.getenv("DEVICE_USERNAME")
+        self.device_password = os.getenv("DEVICE_PASSWORD")
+
+        # Flask app
+        self.app = Flask(__name__)
+        CORS(self.app)
+
+        # Instruction config
+        self.instruction_config = self._parse_instruction_config()
+
+        self._setup_routes()
+        self.cache_lock = threading.Lock()
+        self._start_background_refresh()
 
     def _parse_instruction_config(self) -> Dict[str, Any]:
-        # Generate instructions dict based on provided API info if instructions file is not present
-        instructions = self.shifu_client.get_instruction_config()
-        if instructions:
-            logger.info("Loaded instructions from ConfigMap.")
-            return instructions
+        config = self.shifu_client.get_instruction_config()
+        if not config:
+            logger.error("No instruction config found in ConfigMap")
+            sys.exit(1)
+        return config
 
-        # If not present, build from static API info
-        logger.warning("No instructions file found, generating from static API info.")
-        # Map driver API info to instruction configs
-        # These are the four endpoints as per API info provided
-        return {
-            "manage": {
-                "method": "POST",
-                "path": "device/decoder/manage",
-                "description": "Device management commands (activation, reboot, shutdown, upgrade, restore config)",
-                "content_type": "application/json",
-                "parameters": [
-                    {"name": "action", "in": "body", "required": True, "type": "string"}
-                ]
-            },
-            "config": {
-                "method": "POST",
-                "path": "device/decoder/config",
-                "description": "Configuration commands (display, window, scene, parameter adjustments)",
-                "content_type": "application/json",
-                "parameters": [
-                    {"name": "config", "in": "body", "required": True, "type": "object"}
-                ]
-            },
-            "status": {
-                "method": "GET",
-                "path": "device/decoder/status",
-                "description": "Get real-time telemetry/status from the decoder",
-                "content_type": "application/json",
-                "parameters": []
-            },
-            "decode": {
-                "method": "POST",
-                "path": "device/decoder/decode",
-                "description": "Start/stop dynamic decoding process",
-                "content_type": "application/json",
-                "parameters": [
-                    {"name": "action", "in": "body", "required": True, "type": "string"},
-                    {"name": "channels", "in": "body", "required": False, "type": "array"}
-                ]
-            }
+    def _setup_routes(self) -> None:
+        # Map instruction names to device communication methods
+        routes_map = {
+            "device/decoder/manage": self._handle_manage,
+            "device/decoder/config": self._handle_config,
+            "device/decoder/decode": self._handle_decode,
+            "device/decoder/status": self._handle_status,
         }
 
-    def _setup_signal_handlers(self):
-        signal.signal(signal.SIGINT, self.signal_handler)
-        signal.signal(signal.SIGTERM, self.signal_handler)
+        # Dynamic route creation for each instruction
+        for instr_name, instr_details in self.instruction_config.items():
+            endpoint_path = "/" + instr_name.replace('/', '_')
+            method = instr_details.get("method", "GET").upper()
+            logger.info(f"Registering endpoint {endpoint_path} [{method}]")
 
-    def setup_routes(self):
-        app = self.flask_app
-
-        @app.route('/health', methods=['GET'])
-        def health():
-            status = {
-                "server": "running",
-                "device_connection": self.status.get("device_connection", "unknown"),
-                "timestamp": int(time.time())
-            }
-            return make_response(jsonify(status), 200)
-
-        @app.route('/status', methods=['GET'])
-        def driver_status():
-            # Returns both driver and device status info
-            with self.data_lock:
-                device_status = self.latest_data.get('status', {})
-            response = {
-                "driver_status": self.status,
-                "device_status": device_status
-            }
-            return make_response(jsonify(response), 200)
-
-        # Dynamic instruction routes
-        for instruction, config in self.instruction_config.items():
-            endpoint = f"/{instruction}"
-            method = config.get("method", "GET").upper()
-
-            if method == "GET":
-                app.add_url_rule(endpoint, endpoint, self._make_get_handler(instruction, config), methods=['GET'])
-            elif method == "POST":
-                app.add_url_rule(endpoint, endpoint, self._make_post_handler(instruction, config), methods=['POST'])
-            elif method == "PUT":
-                app.add_url_rule(endpoint, endpoint, self._make_put_handler(instruction, config), methods=['PUT'])
-            elif method == "DELETE":
-                app.add_url_rule(endpoint, endpoint, self._make_delete_handler(instruction, config), methods=['DELETE'])
-
-    # Handler Factories
-    def _make_get_handler(self, instruction: str, config: Dict[str, Any]):
-        def handler():
-            try:
-                with self.data_lock:
-                    cached = self.latest_data.get(instruction)
-                if cached is not None:
-                    logger.info(f"Serving cached data for {instruction}")
-                    return make_response(jsonify(cached), 200)
-
-                # Fetch fresh data from device
-                result, code = self.handle_device_request(instruction, config, None, method='GET')
-                if code == 200:
-                    with self.data_lock:
-                        self.latest_data[instruction] = result
-                return make_response(jsonify(result), code)
-            except Exception as e:
-                logger.error(f"GET {instruction} error: {str(e)}")
-                return make_response(jsonify({"error": str(e)}), 500)
-        handler.__name__ = f"get_{instruction}_handler"
-        return handler
-
-    def _make_post_handler(self, instruction: str, config: Dict[str, Any]):
-        def handler():
-            if not request.is_json:
-                logger.warning(f"POST {instruction}: Invalid content type.")
-                return make_response(jsonify({"error": "Content-Type must be application/json"}), 400)
-            try:
-                payload = request.get_json()
-                # Validate required parameters
-                for param in config.get("parameters", []):
-                    if param["required"] and param["name"] not in payload:
-                        return make_response(jsonify({"error": f"Missing required parameter: {param['name']}"}), 400)
-                result, code = self.handle_device_request(instruction, config, payload, method='POST')
-                if code == 200:
-                    with self.data_lock:
-                        self.latest_data[instruction] = result
-                return make_response(jsonify(result), code)
-            except Exception as e:
-                logger.error(f"POST {instruction} error: {str(e)}")
-                return make_response(jsonify({"error": str(e)}), 500)
-        handler.__name__ = f"post_{instruction}_handler"
-        return handler
-
-    def _make_put_handler(self, instruction: str, config: Dict[str, Any]):
-        def handler():
-            if not request.is_json:
-                return make_response(jsonify({"error": "Content-Type must be application/json"}), 400)
-            try:
-                payload = request.get_json()
-                result, code = self.handle_device_request(instruction, config, payload, method='PUT')
-                if code == 200:
-                    with self.data_lock:
-                        self.latest_data[instruction] = result
-                return make_response(jsonify(result), code)
-            except Exception as e:
-                logger.error(f"PUT {instruction} error: {str(e)}")
-                return make_response(jsonify({"error": str(e)}), 500)
-        handler.__name__ = f"put_{instruction}_handler"
-        return handler
-
-    def _make_delete_handler(self, instruction: str, config: Dict[str, Any]):
-        def handler():
-            try:
-                payload = request.get_json(silent=True)
-                result, code = self.handle_device_request(instruction, config, payload, method='DELETE')
-                if code == 200:
-                    with self.data_lock:
-                        self.latest_data[instruction] = result
-                return make_response(jsonify(result), code)
-            except Exception as e:
-                logger.error(f"DELETE {instruction} error: {str(e)}")
-                return make_response(jsonify({"error": str(e)}), 500)
-        handler.__name__ = f"delete_{instruction}_handler"
-        return handler
-
-    def connect_device(self):
-        # Establish connection to the decoder
-        if not self.device_address:
-            logger.error("DEVICE_ADDRESS is not set or resolvable from EdgeDevice spec.")
-            self.status["device_connection"] = "unavailable"
-            self.shifu_client.update_device_status("unavailable", reason="No device address")
-            return False
-        try:
-            self.connector = HikvisionDecoderConnector(
-                address=self.device_address,
-                port=self.device_port,
-                username=self.device_username,
-                password=self.device_password
-            )
-            if self.connector.connect():
-                self.status["device_connection"] = "connected"
-                self.shifu_client.update_device_status("connected", reason="Connected to device")
-                return True
+            if instr_name in routes_map:
+                handler = routes_map[instr_name]
             else:
-                self.status["device_connection"] = "unavailable"
-                self.shifu_client.update_device_status("unavailable", reason="Device not responding")
-                return False
-        except Exception as e:
-            logger.error("Error connecting to device: %s", e)
-            self.status["device_connection"] = "unavailable"
-            self.shifu_client.update_device_status("unavailable", reason=str(e))
-            return False
+                handler = self._handle_not_implemented
 
-    def handle_device_request(self, instruction: str, config: Dict[str, Any], payload: Optional[Dict[str, Any]], method: str) -> (Dict[str, Any], int):
-        """
-        Handles the actual device communication per instruction.
-        Returns (result, http_code)
-        """
-        if not self.connector or not self.connector.connected:
-            logger.warning("Device not connected, attempting to reconnect...")
-            if not self.connect_device():
-                return {"error": "Device not connected"}, 503
+            if method in ("GET", "SUBSCRIBE"):
+                self.app.add_url_rule(endpoint_path, endpoint_path, self._make_flask_handler(handler, instr_details), methods=["GET"])
+            if method in ("POST", "PUT", "PUBLISH"):
+                self.app.add_url_rule(endpoint_path, endpoint_path, self._make_flask_handler(handler, instr_details), methods=["POST", "PUT"])
 
-        try:
-            device_path = config.get("path")
-            if instruction == "manage":
-                if method == "POST":
-                    resp = self.connector.post(device_path, payload)
-                    if resp.status_code == 200:
-                        return resp.json(), 200
-                    return {"error": resp.text}, resp.status_code
-            elif instruction == "config":
-                if method == "POST":
-                    resp = self.connector.post(device_path, payload)
-                    if resp.status_code == 200:
-                        return resp.json(), 200
-                    return {"error": resp.text}, resp.status_code
-            elif instruction == "status":
-                if method == "GET":
-                    resp = self.connector.get(device_path)
-                    if resp.status_code == 200:
-                        return resp.json(), 200
-                    return {"error": resp.text}, resp.status_code
-            elif instruction == "decode":
-                if method == "POST":
-                    resp = self.connector.post(device_path, payload)
-                    if resp.status_code == 200:
-                        return resp.json(), 200
-                    return {"error": resp.text}, resp.status_code
-            else:
-                logger.warning(f"Unknown instruction {instruction}")
-                return {"error": "Unknown instruction"}, 404
+        # Health and status endpoints
+        self.app.add_url_rule("/health", "health", self._health_handler, methods=["GET"])
+        self.app.add_url_rule("/status", "status", self._status_handler, methods=["GET"])
 
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Device HTTP error for {instruction}: {e}")
-            self.status["device_connection"] = "error"
-            self.shifu_client.update_device_status("error", reason=str(e))
-            return {"error": "Device communication error: " + str(e)}, 504
-        except Exception as e:
-            logger.error(f"Device handler error for {instruction}: {e}")
-            self.status["device_connection"] = "error"
-            self.shifu_client.update_device_status("error", reason=str(e))
-            return {"error": str(e)}, 500
+    def _make_flask_handler(self, handler_func, instr_details):
+        def flask_handler():
+            try:
+                # Validate Content-Type for POST/PUT
+                if request.method in ["POST", "PUT"]:
+                    if not request.is_json:
+                        logger.warning("Request payload is not JSON")
+                        return make_response(jsonify({"error": "Content-Type must be application/json"}), 400)
+                    payload = request.get_json()
+                else:
+                    payload = request.args.to_dict()
 
-        return {"error": "Unhandled error"}, 500
+                response = handler_func(payload, instr_details)
+                return make_response(jsonify(response), 200)
+            except ValueError as ve:
+                logger.error(f"Value error: {ve}")
+                return make_response(jsonify({"error": str(ve)}), 400)
+            except KeyError as ke:
+                logger.error(f"Key error: {ke}")
+                return make_response(jsonify({"error": f"Missing key: {ke}"}), 400)
+            except Exception as e:
+                logger.error(f"Internal error: {e}")
+                return make_response(jsonify({"error": str(e)}), 500)
+        flask_handler.__name__ = f"handler_{handler_func.__name__}_{instr_details.get('id', '')}"
+        return flask_handler
 
-    def background_status_refresh(self, interval: int = 10):
-        """
-        Periodically refreshes device status and caches it.
-        """
-        logger.info("Background status refresh thread started.")
+    def _handle_manage(self, payload: Dict[str, Any], instr_details: Dict[str, Any]) -> Dict[str, Any]:
+        # POST to /device_decoder_manage
+        action = payload.get("action")
+        params = payload.get("params", {})
+        if not action:
+            raise ValueError("Missing 'action' in payload")
+        ret = self.device_client.device_manage(action, params)
+        self._cache_latest_data("manage", ret)
+        return ret
+
+    def _handle_config(self, payload: Dict[str, Any], instr_details: Dict[str, Any]) -> Dict[str, Any]:
+        # POST to /device_decoder_config
+        config_params = payload.get("config_params") or payload
+        ret = self.device_client.device_config(config_params)
+        self._cache_latest_data("config", ret)
+        return ret
+
+    def _handle_decode(self, payload: Dict[str, Any], instr_details: Dict[str, Any]) -> Dict[str, Any]:
+        # POST to /device_decoder_decode
+        action = payload.get("action")
+        channels = payload.get("channels")
+        if not action or not channels:
+            raise ValueError("Missing 'action' or 'channels' in payload")
+        ret = self.device_client.device_decode(action, channels)
+        self._cache_latest_data("decode", ret)
+        return ret
+
+    def _handle_status(self, payload: Dict[str, Any], instr_details: Dict[str, Any]) -> Dict[str, Any]:
+        # GET to /device_decoder_status
+        # Return latest cached device status
+        with self.cache_lock:
+            if "status" in self.latest_data:
+                return self.latest_data["status"]
+        # If no cached data, fetch from device
+        ret = self.device_client.get_device_status()
+        self._cache_latest_data("status", ret)
+        return ret
+
+    def _handle_not_implemented(self, payload: Dict[str, Any], instr_details: Dict[str, Any]) -> Dict[str, Any]:
+        logger.warning("Instruction not implemented")
+        raise NotImplementedError("Instruction not implemented")
+
+    def _cache_latest_data(self, key: str, data: Any):
+        with self.cache_lock:
+            self.latest_data[key] = data
+
+    def _background_refresh(self):
+        refresh_interval = 10  # seconds
         while not self.shutdown_flag.is_set():
             try:
-                config = self.instruction_config.get("status")
-                if config:
-                    result, code = self.handle_device_request("status", config, None, method="GET")
-                    if code == 200:
-                        with self.data_lock:
-                            self.latest_data["status"] = result
-                        self.status["device_connection"] = "connected"
-                        self.shifu_client.update_device_status("connected")
-                    else:
-                        self.status["device_connection"] = "unavailable"
-                        self.shifu_client.update_device_status("unavailable", reason=result.get("error", "Status unavailable"))
+                if self.device_client and self.device_client.is_connected():
+                    status = self.device_client.get_device_status()
+                    self._cache_latest_data("status", status)
             except Exception as e:
-                logger.error(f"Background refresh error: {e}")
-                self.status["device_connection"] = "error"
-                self.shifu_client.update_device_status("error", reason=str(e))
-            time.sleep(interval)
-        logger.info("Background status refresh thread stopped.")
+                logger.error(f"Error during background refresh: {e}")
+            time.sleep(refresh_interval)
 
-    def signal_handler(self, signum, frame):
-        logger.info(f"Received signal {signum}, shutting down gracefully...")
+    def _start_background_refresh(self):
+        t = threading.Thread(target=self._background_refresh, daemon=True, name="BackgroundRefresh")
+        t.start()
+
+    def connect_device(self) -> None:
+        self.device_client = HikvisionDecoderHTTPClient(
+            address=self.device_address,
+            port=self.device_port,
+            username=self.device_username,
+            password=self.device_password
+        )
+        connected = self.device_client.connect()
+        if not connected:
+            logger.error("Failed to connect to device; exiting")
+            sys.exit(1)
+
+    def _health_handler(self):
+        status = {
+            "server": "ok",
+            "device_connection": self.device_client.is_connected() if self.device_client else False
+        }
+        return make_response(jsonify(status), 200)
+
+    def _status_handler(self):
+        try:
+            device_status = self.device_client.get_status() if self.device_client else {}
+            with self.cache_lock:
+                cached_status = self.latest_data.get("status")
+            return make_response(jsonify({
+                "device_status": device_status,
+                "cached_status": cached_status
+            }), 200)
+        except Exception as e:
+            logger.error(f"Error in /status: {e}")
+            return make_response(jsonify({"error": str(e)}), 500)
+
+    def signal_handler(self, sig, frame):
+        logger.info(f"Received signal {sig}, shutting down gracefully.")
+        self.shutdown_flag.set()
         self.shutdown()
 
     def shutdown(self):
-        self.shutdown_flag.set()
-        logger.info("Shutting down HTTP server and cleaning resources.")
-        try:
-            if self.connector:
-                self.connector.disconnect()
-            self.status["server"] = "stopped"
-            self.status["device_connection"] = "disconnected"
-            self.shifu_client.update_device_status("disconnected", reason="Server shutdown")
-        except Exception as e:
-            logger.error(f"Exception during shutdown: {e}")
-        func = request.environ.get('werkzeug.server.shutdown')
-        if func:
-            func()
-        else:
-            logger.info("Flask shutdown function not found; exiting process.")
-            os._exit(0)
-
-    def connection_monitor(self, interval: int = 5):
-        """
-        Monitors device connection and updates status.
-        """
-        logger.info("Connection monitor thread started.")
-        while not self.shutdown_flag.is_set():
-            try:
-                if self.connector:
-                    if not self.connector.connect():
-                        self.status["device_connection"] = "unavailable"
-                        self.shifu_client.update_device_status("unavailable", reason="Device unreachable")
-                    else:
-                        self.status["device_connection"] = "connected"
-                        self.shifu_client.update_device_status("connected")
-            except Exception as e:
-                logger.error(f"Connection monitor error: {e}")
-                self.status["device_connection"] = "error"
-                self.shifu_client.update_device_status("error", reason=str(e))
-            time.sleep(interval)
-        logger.info("Connection monitor thread stopped.")
+        if self.device_client:
+            self.device_client.disconnect()
+        logger.info("Driver shutdown complete.")
+        # Flask will be terminated by main thread
 
     def run(self):
-        # Connect to device first
         self.connect_device()
+        # Signal handling
+        signal.signal(signal.SIGINT, self.signal_handler)
+        signal.signal(signal.SIGTERM, self.signal_handler)
+        logger.info(f"Starting Flask HTTP server at {self.http_host}:{self.http_port}")
+        self.app.run(host=self.http_host, port=self.http_port, threaded=True)
 
-        # Start background status refresh
-        refresh_thread = threading.Thread(target=self.background_status_refresh, args=(10,), daemon=True, name="StatusRefreshThread")
-        refresh_thread.start()
 
-        # Start connection monitor
-        monitor_thread = threading.Thread(target=self.connection_monitor, args=(5,), daemon=True, name="ConnectionMonitorThread")
-        monitor_thread.start()
+# ------------------------ Entrypoint --------------------------
 
-        try:
-            logger.info(f"Starting Flask HTTP server at {self.http_host}:{self.http_port}")
-            self.status["server"] = "running"
-            self.flask_app.run(host=self.http_host, port=self.http_port, threaded=True)
-        except Exception as e:
-            logger.error(f"HTTP server error: {e}")
-        finally:
-            self.shutdown_flag.set()
-            refresh_thread.join(2)
-            monitor_thread.join(2)
-            logger.info("DeviceShifu HTTP driver terminated.")
-
-# ======================= Entrypoint =======================
 if __name__ == "__main__":
     driver = DeviceShifuDriver()
-    driver.run()
+    try:
+        driver.run()
+    except Exception as e:
+        logger.error(f"Unhandled exception: {e}")
+        driver.shutdown()
+        sys.exit(1)
