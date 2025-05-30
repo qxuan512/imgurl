@@ -1,285 +1,251 @@
 import os
-import yaml
-import asyncio
-import json
-import logging
+import sys
 import signal
-from typing import Dict, Any, Optional
+import time
+import yaml
+import threading
+import json
 
-from fastapi import FastAPI, Request, HTTPException, Body, Response, status
-from fastapi.responses import StreamingResponse, JSONResponse
-import uvicorn
-
-from kubernetes import client as k8s_client, config as k8s_config
+from kubernetes import client, config, watch
 from kubernetes.client.rest import ApiException
-
 import paho.mqtt.client as mqtt
 
-# --- Configurations from environment variables ---
-EDGEDEVICE_NAME = os.environ["EDGEDEVICE_NAME"]
-EDGEDEVICE_NAMESPACE = os.environ["EDGEDEVICE_NAMESPACE"]
-MQTT_BROKER_HOST = os.environ.get("MQTT_BROKER_HOST", "localhost")
-MQTT_BROKER_PORT = int(os.environ.get("MQTT_BROKER_PORT", "1883"))
-MQTT_USERNAME = os.environ.get("MQTT_USERNAME", "")
-MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD", "")
-MQTT_KEEPALIVE = int(os.environ.get("MQTT_KEEPALIVE", "60"))
-MQTT_PREFIX = os.environ.get("MQTT_PREFIX", "deviceshifu-car-mqtt")
+INSTRUCTION_PATH = "/etc/edgedevice/config/instructions"
 
-SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
+EDGEDEVICE_NAME = os.environ.get("EDGEDEVICE_NAME")
+EDGEDEVICE_NAMESPACE = os.environ.get("EDGEDEVICE_NAMESPACE")
+MQTT_BROKER_ADDRESS = os.environ.get("MQTT_BROKER_ADDRESS")
 
-INSTRUCTIONS_PATH = "/etc/edgedevice/config/instructions"
+if not EDGEDEVICE_NAME or not EDGEDEVICE_NAMESPACE or not MQTT_BROKER_ADDRESS:
+    sys.stderr.write("Required environment variables not set: EDGEDEVICE_NAME, EDGEDEVICE_NAMESPACE, MQTT_BROKER_ADDRESS\n")
+    sys.exit(1)
 
-# --- Logging ---
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("deviceshifu")
+# DeviceShifu status phases
+EDGEDEVICE_PHASE_PENDING = "Pending"
+EDGEDEVICE_PHASE_RUNNING = "Running"
+EDGEDEVICE_PHASE_FAILED = "Failed"
+EDGEDEVICE_PHASE_UNKNOWN = "Unknown"
 
-# --- Load API instructions from YAML ---
-def load_api_instructions(path: str) -> Dict[str, Any]:
+# API Topics/Settings
+API_TOPICS = {
+    "SUBSCRIBE_current_position": "device/telemetry/current_position",
+    "PUBLISH_navigation": "device/commands/navigation",
+    "PUBLISH_cmd_vel": "device/commands/cmd_vel"
+}
+API_CONFIG = {}
+
+# Initialize Kubernetes in-cluster config and API client
+config.load_incluster_config()
+crd_api = client.CustomObjectsApi()
+
+def get_edgedevice():
     try:
-        with open(path, 'r') as f:
-            return yaml.safe_load(f) or {}
-    except Exception as e:
-        logger.error(f"Failed to load API instructions: {e}")
-        return {}
-
-api_instructions = load_api_instructions(INSTRUCTIONS_PATH)
-
-# --- Kubernetes Client Setup ---
-def get_k8s_api():
-    try:
-        k8s_config.load_incluster_config()
-    except Exception as e:
-        logger.error(f"Failed to load in-cluster K8s config: {e}")
-        raise
-    return k8s_client.CustomObjectsApi()
-
-def get_edgedevice_resource(api: k8s_client.CustomObjectsApi):
-    try:
-        ed = api.get_namespaced_custom_object(
-            group="shifu.edgenesis.io",
-            version="v1alpha1",
-            namespace=EDGEDEVICE_NAMESPACE,
-            plural="edgedevices",
-            name=EDGEDEVICE_NAME
-        )
-        return ed
-    except ApiException as e:
-        logger.error(f"Error retrieving EdgeDevice CRD: {e}")
-        return None
-
-def update_edgedevice_phase(api: k8s_client.CustomObjectsApi, phase: str):
-    body = {"status": {"edgeDevicePhase": phase}}
-    try:
-        api.patch_namespaced_custom_object_status(
+        return crd_api.get_namespaced_custom_object(
             group="shifu.edgenesis.io",
             version="v1alpha1",
             namespace=EDGEDEVICE_NAMESPACE,
             plural="edgedevices",
             name=EDGEDEVICE_NAME,
-            body=body
         )
     except ApiException as e:
-        logger.error(f"Failed to update EdgeDevice phase: {e}")
+        return None
 
-# --- MQTT Client Handling ---
-class MQTTClientManager:
-    def __init__(self, prefix: str):
-        self.prefix = prefix
-        self.data_cache = {}
-        self.connected = False
-        self.loop = asyncio.get_event_loop()
-        self.sub_topics = [
-            "odom", "scan", "joint_states", "point_cloud", "status"
-        ]
-        self.client = mqtt.Client()
-        if MQTT_USERNAME and MQTT_PASSWORD:
-            self.client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
-        self.client.on_connect = self.on_connect
-        self.client.on_message = self.on_message
-        self.client.on_disconnect = self.on_disconnect
-        self._connect_future: Optional[asyncio.Future] = None
-
-    def _topic(self, suffix: str) -> str:
-        return f"{self.prefix}/{suffix}"
-
-    def on_connect(self, client, userdata, flags, rc):
-        logger.info(f"MQTT: Connected with result code {rc}")
-        if rc == 0:
-            self.connected = True
-            for topic in self.sub_topics:
-                client.subscribe(self._topic(topic))
-            logger.info("MQTT: Subscribed to topics.")
-            if self._connect_future and not self._connect_future.done():
-                self.loop.call_soon_threadsafe(self._connect_future.set_result, True)
-        else:
-            self.connected = False
-            if self._connect_future and not self._connect_future.done():
-                self.loop.call_soon_threadsafe(self._connect_future.set_result, False)
-
-    def on_disconnect(self, client, userdata, rc):
-        logger.warning("MQTT: Disconnected.")
-        self.connected = False
-
-    def on_message(self, client, userdata, msg):
-        suffix = msg.topic.replace(f"{self.prefix}/", "")
-        # Try to decode JSON, fallback to raw text
+def update_edgeDevice_phase(phase):
+    for _ in range(3):
         try:
-            payload = json.loads(msg.payload.decode())
+            body = {"status": {"edgeDevicePhase": phase}}
+            crd_api.patch_namespaced_custom_object_status(
+                group="shifu.edgenesis.io",
+                version="v1alpha1",
+                namespace=EDGEDEVICE_NAMESPACE,
+                plural="edgedevices",
+                name=EDGEDEVICE_NAME,
+                body=body
+            )
+            return True
+        except ApiException:
+            time.sleep(1)
+    return False
+
+def load_api_config():
+    global API_CONFIG
+    try:
+        with open(INSTRUCTION_PATH, "r") as f:
+            API_CONFIG = yaml.safe_load(f)
+    except Exception:
+        API_CONFIG = {}
+
+class DeviceShifuMQTTClient:
+    def __init__(self, broker_addr):
+        self.broker_host, self.broker_port = self._split_addr(broker_addr)
+        self.client = mqtt.Client()
+        self.client.on_connect = self._on_connect
+        self.client.on_disconnect = self._on_disconnect
+        self.client.on_message = self._on_message
+        # Used for tracking subscribe status
+        self.connected = threading.Event()
+        self.failed = threading.Event()
+        self.subscribed_topics = {}
+        self.lock = threading.Lock()
+
+    def _split_addr(self, addr):
+        if ':' not in addr:
+            return addr, 1883
+        host, port = addr.rsplit(':', 1)
+        return host, int(port)
+
+    def _on_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            self.connected.set()
+            update_edgeDevice_phase(EDGEDEVICE_PHASE_RUNNING)
+        else:
+            self.failed.set()
+            update_edgeDevice_phase(EDGEDEVICE_PHASE_FAILED)
+    
+    def _on_disconnect(self, client, userdata, rc):
+        self.connected.clear()
+        update_edgeDevice_phase(EDGEDEVICE_PHASE_PENDING)
+
+    def _on_message(self, client, userdata, msg):
+        topic = msg.topic
+        payload = msg.payload.decode()
+        with self.lock:
+            if topic in self.subscribed_topics:
+                cb = self.subscribed_topics[topic]
+                try:
+                    cb(topic, payload)
+                except Exception:
+                    pass
+
+    def connect(self):
+        try:
+            self.client.connect(self.broker_host, self.broker_port, keepalive=60)
+            self.client.loop_start()
+            if not self.connected.wait(timeout=8):
+                update_edgeDevice_phase(EDGEDEVICE_PHASE_FAILED)
+                return False
+            return True
         except Exception:
-            payload = msg.payload.decode(errors="replace")
-        self.data_cache[suffix] = payload
+            self.failed.set()
+            update_edgeDevice_phase(EDGEDEVICE_PHASE_FAILED)
+            return False
 
-    def start(self):
-        self.client.connect_async(MQTT_BROKER_HOST, MQTT_BROKER_PORT, MQTT_KEEPALIVE)
-        self.client.loop_start()
-
-    async def ensure_connected(self, retries=5, delay=2):
-        for _ in range(retries):
-            if self.connected:
-                return True
-            self._connect_future = asyncio.Future()
-            self.client.reconnect()
-            try:
-                await asyncio.wait_for(self._connect_future, timeout=10)
-                if self.connected:
-                    return True
-            except asyncio.TimeoutError:
-                pass
-            await asyncio.sleep(delay)
-        return False
-
-    def stop(self):
+    def disconnect(self):
         self.client.loop_stop()
         self.client.disconnect()
+        self.connected.clear()
+        update_edgeDevice_phase(EDGEDEVICE_PHASE_PENDING)
 
-    def get_data(self, key: str):
-        return self.data_cache.get(key)
+    def subscribe(self, topic, qos, callback):
+        with self.lock:
+            self.subscribed_topics[topic] = callback
+        self.client.subscribe(topic, qos=qos)
 
-    def publish_command(self, command: str, payload: Optional[dict] = None):
-        topic = self._topic(command)
-        payload_str = json.dumps(payload) if payload else ""
-        logger.info(f"Publishing to {topic}: {payload_str}")
-        self.client.publish(topic, payload=payload_str)
+    def publish(self, topic, payload, qos=1):
+        result = self.client.publish(topic, payload=payload, qos=qos)
+        return result.rc == mqtt.MQTT_ERR_SUCCESS
 
-# --- Initialize MQTT Client Manager ---
-mqtt_manager = MQTTClientManager(MQTT_PREFIX)
-mqtt_manager.start()
+    def stop(self):
+        self.disconnect()
 
-# --- FastAPI App ---
-app = FastAPI()
+# DeviceShifu API logic
 
-# --- Helper: Kubernetes Phase Update ---
-@app.on_event("startup")
-async def startup_event():
-    app.state.k8s_api = get_k8s_api()
-    app.state.phase_task = asyncio.create_task(phase_heartbeat())
+class DeviceShifu:
+    def __init__(self, mqtt_client):
+        self.mqtt_client = mqtt_client
+        self.stop_event = threading.Event()
+        self.sub_thread = None
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    mqtt_manager.stop()
-    if hasattr(app.state, "phase_task"):
-        app.state.phase_task.cancel()
+    def api_subscribe_current_position(self, callback=None):
+        api_name = "api1"
+        topic = API_TOPICS["SUBSCRIBE_current_position"]
+        api_conf = API_CONFIG.get(api_name, {})
+        qos = int(api_conf.get("protocolPropertyList", {}).get("qos", 1))
+        def _default_cb(topic, payload):
+            # Placeholder: handle incoming position update (payload is JSON string)
+            print(payload)
+        cb = callback or _default_cb
+        self.mqtt_client.subscribe(topic, qos, cb)
 
-async def phase_heartbeat():
-    api = app.state.k8s_api
-    last_phase = None
-    while True:
+    def api_publish_navigation(self, navigation_goal_json):
+        api_name = "api2"
+        topic = API_TOPICS["PUBLISH_navigation"]
+        api_conf = API_CONFIG.get(api_name, {})
+        qos = int(api_conf.get("protocolPropertyList", {}).get("qos", 1))
+        payload = (
+            json.dumps(navigation_goal_json)
+            if not isinstance(navigation_goal_json, str)
+            else navigation_goal_json
+        )
+        return self.mqtt_client.publish(topic, payload, qos=qos)
+
+    def api_publish_cmd_vel(self, cmd_vel_json):
+        api_name = "api3"
+        topic = API_TOPICS["PUBLISH_cmd_vel"]
+        api_conf = API_CONFIG.get(api_name, {})
+        qos = int(api_conf.get("protocolPropertyList", {}).get("qos", 1))
+        payload = (
+            json.dumps(cmd_vel_json)
+            if not isinstance(cmd_vel_json, str)
+            else cmd_vel_json
+        )
+        return self.mqtt_client.publish(topic, payload, qos=qos)
+
+    def stop(self):
+        self.stop_event.set()
+        self.mqtt_client.stop()
+
+
+def main():
+    # Set initial phase
+    update_edgeDevice_phase(EDGEDEVICE_PHASE_PENDING)
+
+    # Load instruction config
+    load_api_config()
+    device_spec = get_edgedevice()
+    if not device_spec:
+        update_edgeDevice_phase(EDGEDEVICE_PHASE_UNKNOWN)
+        sys.exit(1)
+
+    address = device_spec.get("spec", {}).get("address", "")
+    if not address:
+        update_edgeDevice_phase(EDGEDEVICE_PHASE_UNKNOWN)
+        sys.exit(1)
+
+    mqtt_client = DeviceShifuMQTTClient(MQTT_BROKER_ADDRESS)
+
+    def signal_handler(sig, frame):
+        mqtt_client.stop()
+        update_edgeDevice_phase(EDGEDEVICE_PHASE_PENDING)
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
+    if not mqtt_client.connect():
+        update_edgeDevice_phase(EDGEDEVICE_PHASE_FAILED)
+        sys.exit(1)
+
+    shifu = DeviceShifu(mqtt_client)
+
+    # Example: subscribe to position updates and print them
+    def print_position(topic, payload):
         try:
-            # Check MQTT connection status for phase
-            if mqtt_manager.connected:
-                phase = "Running"
-            else:
-                phase = "Failed"
-            if phase != last_phase:
-                update_edgedevice_phase(api, phase)
-                last_phase = phase
-        except Exception as e:
-            logger.error(f"Error updating device phase: {e}")
-        await asyncio.sleep(5)
+            data = json.loads(payload)
+            print("Received Position:", data)
+        except Exception:
+            print("Malformed position payload:", payload)
+    shifu.api_subscribe_current_position(print_position)
 
-# --- HTTP API Endpoints ---
-
-@app.get("/odom")
-async def get_odom():
-    data = mqtt_manager.get_data("odom")
-    if data is None:
-        raise HTTPException(status_code=404, detail="No odometry data yet.")
-    return JSONResponse(content=data)
-
-@app.get("/scan")
-async def get_scan():
-    data = mqtt_manager.get_data("scan")
-    if data is None:
-        raise HTTPException(status_code=404, detail="No scan data yet.")
-    return JSONResponse(content=data)
-
-@app.get("/joint_states")
-async def get_joint_states():
-    data = mqtt_manager.get_data("joint_states")
-    if data is None:
-        raise HTTPException(status_code=404, detail="No joint_states data yet.")
-    return JSONResponse(content=data)
-
-@app.get("/point_cloud")
-async def get_point_cloud():
-    data = mqtt_manager.get_data("point_cloud")
-    if data is None:
-        raise HTTPException(status_code=404, detail="No point_cloud data yet.")
-    return JSONResponse(content=data)
-
-@app.get("/status")
-async def get_status():
-    data = mqtt_manager.get_data("status")
-    if data is None:
-        raise HTTPException(status_code=404, detail="No status data yet.")
-    return JSONResponse(content=data)
-
-@app.post("/move/forward")
-async def move_forward(request: Request):
+    # Main loop: keep running, handle instructions if needed
     try:
-        payload = await request.json()
-    except Exception:
-        payload = None
-    mqtt_manager.publish_command("move/forward", payload)
-    return {"result": "forward command sent"}
-
-@app.post("/move/backward")
-async def move_backward(request: Request):
-    try:
-        payload = await request.json()
-    except Exception:
-        payload = None
-    mqtt_manager.publish_command("move/backward", payload)
-    return {"result": "backward command sent"}
-
-@app.post("/turn/left")
-async def turn_left(request: Request):
-    try:
-        payload = await request.json()
-    except Exception:
-        payload = None
-    mqtt_manager.publish_command("turn/left", payload)
-    return {"result": "left command sent"}
-
-@app.post("/turn/right")
-async def turn_right(request: Request):
-    try:
-        payload = await request.json()
-    except Exception:
-        payload = None
-    mqtt_manager.publish_command("turn/right", payload)
-    return {"result": "right command sent"}
-
-@app.post("/stop")
-async def stop_robot():
-    mqtt_manager.publish_command("stop")
-    return {"result": "stop command sent"}
-
-# --- Healthz endpoint for liveness/readiness probe ---
-@app.get("/healthz")
-async def healthz():
-    return {"status": "ok"}
+        while True:
+            time.sleep(2)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        shifu.stop()
+        update_edgeDevice_phase(EDGEDEVICE_PHASE_PENDING)
 
 if __name__ == "__main__":
-    uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT)
+    main()
