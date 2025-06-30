@@ -1,127 +1,132 @@
 import os
 import threading
-import queue
 import time
+import queue
+import io
 from flask import Flask, Response, jsonify, request
 import cv2
 
-app = Flask(__name__)
-
 # Configuration from environment variables
-RTSP_URL = os.environ.get('RTSP_URL', 'rtsp://localhost:554/stream')
+RTSP_URL = os.environ.get('RTSP_URL', '')
 HTTP_SERVER_HOST = os.environ.get('HTTP_SERVER_HOST', '0.0.0.0')
 HTTP_SERVER_PORT = int(os.environ.get('HTTP_SERVER_PORT', '8080'))
-STREAM_RESOLUTION = os.environ.get('STREAM_RESOLUTION')  # e.g., '1280x720'
-STREAM_BITRATE = os.environ.get('STREAM_BITRATE')        # e.g., '2048k'
+HTTP_STREAM_PATH = os.environ.get('HTTP_STREAM_PATH', '/video')
+HTTP_STREAM_PORT = int(os.environ.get('HTTP_STREAM_PORT', HTTP_SERVER_PORT))  # Not used but configurable if needed
 
-# Streaming state
-streaming_active = False
-stream_thread = None
-frame_queue = queue.Queue(maxsize=100)
-stream_lock = threading.Lock()
-stream_meta = {
-    "video_encoding": "H.264/H.265",
-    "audio_encoding": "AAC",
-    "rtsp_url": RTSP_URL
+# Video streaming state
+streaming_state = {
+    "active": False,
+    "thread": None,
+    "frame_queue": None,
+    "stop_event": None,
+    "encoding": {
+        "video": "H.264/H.265",
+        "audio": "AAC"
+    },
+    "rtsp_url": RTSP_URL,
+    "resolution": None,
+    "bitrate": None,
 }
 
-def parse_resolution(res_str):
-    if res_str and 'x' in res_str:
-        w, h = res_str.lower().split('x')
-        return int(w), int(h)
-    return None, None
+app = Flask(__name__)
 
-def frame_capture_thread(rtsp_url, resolution=None):
-    global streaming_active
+def capture_frames(rtsp_url, frame_queue, stop_event):
     cap = cv2.VideoCapture(rtsp_url)
-    if resolution and all(resolution):
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, resolution[0])
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, resolution[1])
     if not cap.isOpened():
-        streaming_active = False
+        stop_event.set()
         return
-    streaming_active = True
-    while streaming_active:
+    # Set metadata (resolution)
+    streaming_state["resolution"] = {
+        "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+        "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    }
+    streaming_state["bitrate"] = int(cap.get(cv2.CAP_PROP_BITRATE)) if cap.get(cv2.CAP_PROP_BITRATE) > 0 else None
+    while not stop_event.is_set():
         ret, frame = cap.read()
         if not ret:
-            time.sleep(0.1)
             continue
-        ret, jpeg = cv2.imencode('.jpg', frame)
-        if ret:
-            try:
-                if not frame_queue.full():
-                    frame_queue.put(jpeg.tobytes())
-            except Exception:
-                pass
+        # Encode frame as JPEG
+        ret2, jpeg = cv2.imencode('.jpg', frame)
+        if not ret2:
+            continue
+        try:
+            frame_queue.put(jpeg.tobytes(), timeout=1)
+        except queue.Full:
+            pass
     cap.release()
 
-def start_streaming():
-    global stream_thread, streaming_active
-    with stream_lock:
-        if streaming_active:
-            return
-        w, h = parse_resolution(STREAM_RESOLUTION)
-        stream_thread = threading.Thread(target=frame_capture_thread, args=(RTSP_URL, (w, h)), daemon=True)
-        streaming_active = True
-        stream_thread.start()
-
-def stop_streaming():
-    global streaming_active, frame_queue
-    with stream_lock:
-        streaming_active = False
-        while not frame_queue.empty():
-            frame_queue.get()
+def generate_mjpeg():
+    frame_queue = streaming_state["frame_queue"]
+    stop_event = streaming_state["stop_event"]
+    while streaming_state["active"] and not stop_event.is_set():
+        try:
+            frame = frame_queue.get(timeout=1)
+        except queue.Empty:
+            continue
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+    return
 
 @app.route('/stream', methods=['GET'])
-def get_stream_status():
-    status = {
-        "streaming": streaming_active,
-        "rtsp_url": RTSP_URL if streaming_active else None,
-        "video_encoding": stream_meta["video_encoding"],
-        "audio_encoding": stream_meta["audio_encoding"]
-    }
+def stream_status():
     filters = {}
-    res = request.args.get('resolution')
-    br = request.args.get('bitrate')
-    if res:
-        filters["resolution"] = res
-    if br:
-        filters["bitrate"] = br
-    if filters:
-        status["filters"] = filters
-    return jsonify(status), 200
+    res_filter = request.args.get('resolution')
+    bitrate_filter = request.args.get('bitrate')
+    result = {
+        "streaming": streaming_state["active"],
+        "rtsp_url": streaming_state["rtsp_url"] if streaming_state["active"] else None,
+        "encoding": streaming_state["encoding"],
+        "resolution": streaming_state.get("resolution"),
+        "bitrate": streaming_state.get("bitrate"),
+    }
+    if res_filter and result["resolution"]:
+        if res_filter != f'{result["resolution"]["width"]}x{result["resolution"]["height"]}':
+            result["streaming"] = False
+            result["rtsp_url"] = None
+    if bitrate_filter and result["bitrate"]:
+        if str(result["bitrate"]) != bitrate_filter:
+            result["streaming"] = False
+            result["rtsp_url"] = None
+    return jsonify(result)
 
 @app.route('/stream/start', methods=['POST'])
 def start_stream():
-    if streaming_active:
-        return jsonify({"result": "Stream already running."}), 200
-    start_streaming()
-    if streaming_active:
-        return jsonify({"result": "Stream started successfully."}), 200
-    else:
-        return jsonify({"result": "Failed to start stream."}), 500
+    if streaming_state["active"]:
+        return jsonify({"result": "already streaming"}), 200
+    if not streaming_state["rtsp_url"]:
+        return jsonify({"error": "RTSP_URL not configured"}), 400
+    streaming_state["stop_event"] = threading.Event()
+    streaming_state["frame_queue"] = queue.Queue(maxsize=10)
+    streaming_state["thread"] = threading.Thread(target=capture_frames, args=(streaming_state["rtsp_url"], streaming_state["frame_queue"], streaming_state["stop_event"]))
+    streaming_state["thread"].daemon = True
+    streaming_state["thread"].start()
+    # Wait briefly to ensure the thread starts and connection is successful
+    time.sleep(1)
+    if streaming_state["stop_event"].is_set():
+        streaming_state["active"] = False
+        return jsonify({"error": "Failed to connect to RTSP stream"}), 500
+    streaming_state["active"] = True
+    return jsonify({"result": "stream started", "video_endpoint": f"http://{HTTP_SERVER_HOST}:{HTTP_STREAM_PORT}{HTTP_STREAM_PATH}"}), 200
 
 @app.route('/stream/stop', methods=['POST'])
 def stop_stream():
-    if not streaming_active:
-        return jsonify({"result": "Stream already stopped."}), 200
-    stop_streaming()
-    return jsonify({"result": "Stream stopped successfully."}), 200
+    if not streaming_state["active"]:
+        return jsonify({"result": "not streaming"}), 200
+    streaming_state["stop_event"].set()
+    if streaming_state["thread"]:
+        streaming_state["thread"].join(timeout=2)
+    streaming_state["active"] = False
+    streaming_state["thread"] = None
+    streaming_state["frame_queue"] = None
+    streaming_state["stop_event"] = None
+    return jsonify({"result": "stream stopped"}), 200
 
-def generate_mjpeg():
-    while streaming_active:
-        try:
-            frame = frame_queue.get(timeout=1)
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-        except queue.Empty:
-            continue
-
-@app.route('/stream/video', methods=['GET'])
-def stream_video():
-    if not streaming_active:
-        return jsonify({"error": "Stream is not active. Start stream first."}), 400
-    return Response(generate_mjpeg(), mimetype='multipart/x-mixed-replace; boundary=frame')
+@app.route(HTTP_STREAM_PATH, methods=['GET'])
+def video_feed():
+    if not streaming_state["active"]:
+        return Response("Stream not started", status=503)
+    return Response(generate_mjpeg(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
 
 if __name__ == '__main__':
     app.run(host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT, threaded=True)
