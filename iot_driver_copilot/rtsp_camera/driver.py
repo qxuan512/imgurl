@@ -1,166 +1,163 @@
 import os
-import io
-import asyncio
 import threading
-from typing import Optional, Dict, Any
-from fastapi import FastAPI, Response, Request, BackgroundTasks, HTTPException, Query
-from fastapi.responses import StreamingResponse, JSONResponse
-from starlette.concurrency import run_in_threadpool
-import av
+import time
+from flask import Flask, Response, request, jsonify
+import cv2
 
-# Configuration from environment variables
-RTSP_HOST = os.getenv("RTSP_CAMERA_IP", "127.0.0.1")
-RTSP_PORT = int(os.getenv("RTSP_CAMERA_RTSP_PORT", "554"))
-RTSP_USER = os.getenv("RTSP_CAMERA_USERNAME", "")
-RTSP_PASS = os.getenv("RTSP_CAMERA_PASSWORD", "")
-RTSP_PATH = os.getenv("RTSP_CAMERA_PATH", "stream")
-HTTP_SERVER_HOST = os.getenv("HTTP_SERVER_HOST", "0.0.0.0")
-HTTP_SERVER_PORT = int(os.getenv("HTTP_SERVER_PORT", "8080"))
+# Environment Variables Setup
+HTTP_SERVER_HOST = os.getenv('SHIFU_HTTP_SERVER_HOST', '0.0.0.0')
+HTTP_SERVER_PORT = int(os.getenv('SHIFU_HTTP_SERVER_PORT', '8080'))
+RTSP_CAMERA_IP = os.getenv('SHIFU_RTSP_CAMERA_IP', '127.0.0.1')
+RTSP_CAMERA_PORT = os.getenv('SHIFU_RTSP_CAMERA_RTSP_PORT', '554')
+RTSP_CAMERA_USER = os.getenv('SHIFU_RTSP_CAMERA_USER', '')
+RTSP_CAMERA_PASSWORD = os.getenv('SHIFU_RTSP_CAMERA_PASSWORD', '')
+RTSP_CAMERA_PATH = os.getenv('SHIFU_RTSP_CAMERA_PATH', 'stream')
+# e.g., "stream", "h264", "live.sdp", etc.
 
-RTSP_URL = f"rtsp://{f'{RTSP_USER}:{RTSP_PASS}@' if RTSP_USER else ''}{RTSP_HOST}:{RTSP_PORT}/{RTSP_PATH}"
+SUPPORTED_VIDEO_CODECS = ["H.264", "H.265"]
+SUPPORTED_AUDIO_CODECS = ["AAC"]
 
-app = FastAPI(title="RTSP Camera HTTP Proxy")
+def build_rtsp_url():
+    userinfo = ''
+    if RTSP_CAMERA_USER and RTSP_CAMERA_PASSWORD:
+        userinfo = f"{RTSP_CAMERA_USER}:{RTSP_CAMERA_PASSWORD}@"
+    elif RTSP_CAMERA_USER:
+        userinfo = f"{RTSP_CAMERA_USER}@"
+    return f"rtsp://{userinfo}{RTSP_CAMERA_IP}:{RTSP_CAMERA_PORT}/{RTSP_CAMERA_PATH}"
 
-# Streaming state and metadata
-stream_state = {
-    "active": False,
-    "rtsp_url": RTSP_URL,
-    "video_codec": None,
-    "audio_codec": None,
-    "resolution": None,
-    "bitrate": None,
-    "container": None,
-    "task": None
-}
+class RTSPStreamManager:
+    def __init__(self):
+        self.rtsp_url = build_rtsp_url()
+        self.streaming = False
+        self.capture = None
+        self.lock = threading.Lock()
+        self.last_frame = None
+        self.thread = None
+        self.resolution = None
+        self.bitrate = None
+        self.video_codec = "H.264"  # OpenCV does not expose this, so we assume common default.
+        self.audio_codec = "AAC"    # Assumed, as OpenCV does not handle audio.
 
-stream_state_lock = threading.Lock()
+    def start_stream(self, resolution=None, bitrate=None):
+        with self.lock:
+            if self.streaming:
+                return True
+            self.capture = cv2.VideoCapture(self.rtsp_url)
+            if not self.capture.isOpened():
+                self.capture = None
+                return False
+            self.streaming = True
+            self.resolution = resolution
+            self.bitrate = bitrate
+            self.thread = threading.Thread(target=self._frame_worker)
+            self.thread.daemon = True
+            self.thread.start()
+            return True
 
-def probe_rtsp_stream(rtsp_url: str, timeout: float = 5.0) -> Dict[str, Any]:
-    try:
-        container = av.open(rtsp_url, timeout=timeout)
-        info = {
-            "video_codec": None,
-            "audio_codec": None,
-            "resolution": None,
-            "bitrate": None,
-            "container": container.format.name if container.format else None
+    def stop_stream(self):
+        with self.lock:
+            if not self.streaming:
+                return True
+            self.streaming = False
+            if self.capture:
+                self.capture.release()
+                self.capture = None
+            self.thread = None
+            self.last_frame = None
+            return True
+
+    def _frame_worker(self):
+        while self.streaming and self.capture:
+            ret, frame = self.capture.read()
+            if not ret:
+                self.last_frame = None
+                time.sleep(0.05)
+                continue
+            # Optionally, resize frame to requested resolution
+            if self.resolution:
+                try:
+                    width, height = map(int, self.resolution.lower().split('x'))
+                    frame = cv2.resize(frame, (width, height))
+                except Exception:
+                    pass
+            # Encode frame as JPEG for browser streaming
+            ok, jpeg = cv2.imencode('.jpg', frame)
+            if ok:
+                self.last_frame = jpeg.tobytes()
+            else:
+                self.last_frame = None
+            time.sleep(0.03)  # ~30fps
+
+    def get_frame(self):
+        with self.lock:
+            return self.last_frame
+
+    def is_streaming(self):
+        with self.lock:
+            return self.streaming
+
+    def get_metadata(self):
+        meta = {
+            "status": "streaming" if self.streaming else "stopped",
+            "rtsp_url": self.rtsp_url if self.streaming else None,
+            "video_codec": self.video_codec,
+            "audio_codec": self.audio_codec,
+            "resolution": self.resolution,
+            "bitrate": self.bitrate,
         }
-        for stream in container.streams:
-            if stream.type == "video":
-                info["video_codec"] = stream.codec.name
-                info["resolution"] = f"{stream.width}x{stream.height}"
-                info["bitrate"] = stream.bit_rate
-            elif stream.type == "audio":
-                info["audio_codec"] = stream.codec.name
-        container.close()
-        return info
-    except Exception:
-        return {
-            "video_codec": None,
-            "audio_codec": None,
-            "resolution": None,
-            "bitrate": None,
-            "container": None
-        }
+        return meta
 
-def get_stream_metadata():
-    meta = probe_rtsp_stream(RTSP_URL)
-    return {
-        "active": stream_state["active"],
-        "rtsp_url": RTSP_URL if stream_state["active"] else None,
-        "video_codec": meta["video_codec"],
-        "audio_codec": meta["audio_codec"],
-        "resolution": meta["resolution"],
-        "bitrate": meta["bitrate"],
-        "container": meta["container"]
-    }
+# Flask App Setup
+app = Flask(__name__)
+stream_manager = RTSPStreamManager()
 
-def start_stream_worker():
-    with stream_state_lock:
-        if not stream_state["active"]:
-            stream_state["active"] = True
-            meta = probe_rtsp_stream(RTSP_URL)
-            stream_state.update(meta)
+@app.route('/stream', methods=['GET'])
+def stream_status():
+    # Optional filters
+    resolution = request.args.get('resolution')
+    bitrate = request.args.get('bitrate')
+    meta = stream_manager.get_metadata()
+    if resolution and meta["resolution"] != resolution:
+        meta["status"] = "stopped"  # Not streaming at requested resolution
+        meta["rtsp_url"] = None
+    if bitrate and meta["bitrate"] != bitrate:
+        meta["status"] = "stopped"
+        meta["rtsp_url"] = None
+    return jsonify(meta)
 
-def stop_stream_worker():
-    with stream_state_lock:
-        stream_state["active"] = False
+@app.route('/stream/start', methods=['POST'])
+def start_stream():
+    req = request.get_json(silent=True) or {}
+    resolution = req.get('resolution')
+    bitrate = req.get('bitrate')
+    success = stream_manager.start_stream(resolution=resolution, bitrate=bitrate)
+    if success:
+        return jsonify({"result": "success", "message": "Stream started"}), 200
+    else:
+        return jsonify({"result": "error", "message": "Failed to start stream"}), 500
 
-def rtp_to_mjpeg(rtsp_url: str, filter_resolution: Optional[str]=None, filter_bitrate: Optional[int]=None):
-    """
-    Convert RTSP stream to multipart/x-mixed-replace (MJPEG) HTTP stream.
-    """
-    try:
-        container = av.open(rtsp_url)
-        video_stream = next((s for s in container.streams if s.type == "video"), None)
-        if not video_stream:
-            raise RuntimeError("No video stream found")
-        for packet in container.demux(video_stream):
-            if not stream_state["active"]:
-                break
-            for frame in packet.decode():
-                # Optionally filter by resolution
-                if filter_resolution:
-                    w, h = map(int, filter_resolution.lower().split("x"))
-                    if frame.width != w or frame.height != h:
-                        continue
-                # Optionally filter by bitrate (approximate, not enforced strictly)
-                # Bitrate filter is not directly enforced here
-                buf = io.BytesIO()
-                frame.to_image().save(buf, format="JPEG")
-                jpg = buf.getvalue()
-                yield (
-                    b"--frame\r\n"
-                    b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
-                )
-        container.close()
-    except Exception as e:
-        stop_stream_worker()
+@app.route('/stream/stop', methods=['POST'])
+def stop_stream():
+    success = stream_manager.stop_stream()
+    if success:
+        return jsonify({"result": "success", "message": "Stream stopped"}), 200
+    else:
+        return jsonify({"result": "error", "message": "Failed to stop stream"}), 500
 
-@app.get("/stream", response_class=JSONResponse)
-async def get_stream_status(
-    resolution: Optional[str] = Query(None, description="Resolution filter, e.g. 1920x1080"),
-    bitrate: Optional[int] = Query(None, description="Bitrate filter (bps)")
-):
-    meta = get_stream_metadata()
-    # Optionally filter by parameters
-    if resolution and meta["resolution"]:
-        if meta["resolution"].lower() != resolution.lower():
-            return JSONResponse(content={"error": "No stream matching the requested resolution"}, status_code=404)
-    if bitrate and meta["bitrate"]:
-        if int(meta["bitrate"]) != int(bitrate):
-            return JSONResponse(content={"error": "No stream matching the requested bitrate"}, status_code=404)
-    return meta
+@app.route('/stream/video', methods=['GET'])
+def stream_video():
+    if not stream_manager.is_streaming():
+        return jsonify({"result": "error", "message": "Stream is not active"}), 503
 
-@app.post("/stream/start")
-async def start_stream():
-    with stream_state_lock:
-        if stream_state["active"]:
-            return {"status": "already active"}
-        start_stream_worker()
-        return {"status": "stream started", "rtsp_url": RTSP_URL}
+    def generate():
+        while stream_manager.is_streaming():
+            frame = stream_manager.get_frame()
+            if frame is not None:
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+            else:
+                time.sleep(0.05)
+    return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-@app.post("/stream/stop")
-async def stop_stream():
-    with stream_state_lock:
-        if not stream_state["active"]:
-            return {"status": "already stopped"}
-        stop_stream_worker()
-        return {"status": "stream stopped"}
-
-@app.get("/stream/video")
-async def get_video_stream(
-    resolution: Optional[str] = Query(None, description="Resolution filter, e.g. 1920x1080"),
-    bitrate: Optional[int] = Query(None, description="Bitrate filter (bps)")
-):
-    with stream_state_lock:
-        if not stream_state["active"]:
-            raise HTTPException(status_code=404, detail="Stream not active")
-    return StreamingResponse(
-        rtp_to_mjpeg(RTSP_URL, filter_resolution=resolution, filter_bitrate=bitrate),
-        media_type="multipart/x-mixed-replace; boundary=frame"
-    )
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT)
+if __name__ == '__main__':
+    app.run(host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT, threaded=True)
