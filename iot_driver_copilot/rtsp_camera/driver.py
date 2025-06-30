@@ -1,143 +1,148 @@
 import os
 import threading
+import queue
 import time
-from flask import Flask, Response, jsonify, request, stream_with_context, abort
+from flask import Flask, Response, jsonify, request
+
 import cv2
 
-app = Flask(__name__)
+# === Configuration from Environment Variables ===
+RTSP_URL = os.environ.get("RTSP_URL")
+RTSP_USERNAME = os.environ.get("RTSP_USERNAME")
+RTSP_PASSWORD = os.environ.get("RTSP_PASSWORD")
+RTSP_IP = os.environ.get("RTSP_IP")
+RTSP_PORT = os.environ.get("RTSP_PORT", "554")
+RTSP_PATH = os.environ.get("RTSP_PATH", "Streaming/Channels/101")
+SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
 
-# Config from environment variables
-DEVICE_IP = os.environ.get("DEVICE_IP", "127.0.0.1")
-RTSP_PORT = int(os.environ.get("RTSP_PORT", "554"))
-RTSP_USERNAME = os.environ.get("RTSP_USERNAME", "")
-RTSP_PASSWORD = os.environ.get("RTSP_PASSWORD", "")
-RTSP_PATH = os.environ.get("RTSP_PATH", "/stream")
-HTTP_HOST = os.environ.get("HTTP_HOST", "0.0.0.0")
-HTTP_PORT = int(os.environ.get("HTTP_PORT", "8000"))
+# Compose RTSP url if not fully specified
+def build_rtsp_url():
+    if RTSP_URL:
+        return RTSP_URL
+    userinfo = ""
+    if RTSP_USERNAME and RTSP_PASSWORD:
+        userinfo = f"{RTSP_USERNAME}:{RTSP_PASSWORD}@"
+    elif RTSP_USERNAME:
+        userinfo = f"{RTSP_USERNAME}@"
+    return f"rtsp://{userinfo}{RTSP_IP}:{RTSP_PORT}/{RTSP_PATH}"
 
-# Construct RTSP URL
-if RTSP_USERNAME and RTSP_PASSWORD:
-    RTSP_URL = f"rtsp://{RTSP_USERNAME}:{RTSP_PASSWORD}@{DEVICE_IP}:{RTSP_PORT}{RTSP_PATH}"
-else:
-    RTSP_URL = f"rtsp://{DEVICE_IP}:{RTSP_PORT}{RTSP_PATH}"
-
-class StreamState:
+# === Stream Management ===
+class RTSPStreamManager:
     def __init__(self):
+        self.rtsp_url = build_rtsp_url()
         self.active = False
         self.capture = None
+        self.frame_queue = queue.Queue(maxsize=10)
+        self.thread = None
         self.lock = threading.Lock()
-        self.last_frame = None
-        self.reader_thread = None
         self.stop_event = threading.Event()
-    
-    def start(self):
-        with self.lock:
-            if not self.active:
-                self.stop_event.clear()
-                self.capture = cv2.VideoCapture(RTSP_URL)
-                if not self.capture.isOpened():
-                    self.capture.release()
-                    self.capture = None
-                    return False
-                self.active = True
-                self.reader_thread = threading.Thread(target=self._reader, daemon=True)
-                self.reader_thread.start()
-                return True
-            return False
 
-    def _reader(self):
-        while self.active and not self.stop_event.is_set():
-            if self.capture is None:
-                break
-            ret, frame = self.capture.read()
-            if not ret:
-                time.sleep(0.05)
-                continue
-            self.last_frame = frame
-        self._release()
-
-    def stop(self):
+    def start_stream(self):
         with self.lock:
             if self.active:
-                self.active = False
-                self.stop_event.set()
-                if self.reader_thread:
-                    self.reader_thread.join(timeout=2)
-                self._release()
                 return True
-            return False
+            self.stop_event.clear()
+            self.capture = cv2.VideoCapture(self.rtsp_url)
+            if not self.capture.isOpened():
+                self.capture.release()
+                self.capture = None
+                return False
+            self.active = True
+            self.thread = threading.Thread(target=self._reader_thread, daemon=True)
+            self.thread.start()
+            return True
 
-    def _release(self):
-        if self.capture is not None:
+    def _reader_thread(self):
+        while self.active and not self.stop_event.is_set():
+            ret, frame = self.capture.read()
+            if not ret:
+                time.sleep(0.1)
+                continue
+            ret, jpeg = cv2.imencode('.jpg', frame)
+            if not ret:
+                continue
+            try:
+                if self.frame_queue.full():
+                    self.frame_queue.get_nowait()
+                self.frame_queue.put_nowait(jpeg.tobytes())
+            except queue.Full:
+                pass
+        if self.capture:
             self.capture.release()
-            self.capture = None
+        self.capture = None
 
-    def get_frame(self):
-        if self.last_frame is not None:
-            ret, jpeg = cv2.imencode('.jpg', self.last_frame)
-            if ret:
-                return jpeg.tobytes()
-        return None
+    def stop_stream(self):
+        with self.lock:
+            if not self.active:
+                return
+            self.active = False
+            self.stop_event.set()
+            if self.thread and self.thread.is_alive():
+                self.thread.join(timeout=2)
+            self.frame_queue.queue.clear()
+
+    def get_frame(self, timeout=2):
+        try:
+            return self.frame_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
 
     def is_active(self):
         return self.active
 
-stream_state = StreamState()
+    def get_rtsp_url(self):
+        return self.rtsp_url
+
+# === Flask App ===
+app = Flask(__name__)
+stream_manager = RTSPStreamManager()
+
+# --- API Endpoints ---
 
 @app.route('/stream', methods=['GET'])
 def stream_status():
     return jsonify({
-        "active": stream_state.is_active(),
-        "rtsp_url": RTSP_URL if stream_state.is_active() else None
+        "active": stream_manager.is_active(),
+        "rtsp_url": stream_manager.get_rtsp_url() if stream_manager.is_active() else None
     })
-
-@app.route('/stream', methods=['GET'])
-def stream_status_duplicate():
-    return stream_status()
 
 @app.route('/cmd/start', methods=['POST'])
 @app.route('/stream/start', methods=['POST'])
 def start_stream():
-    started = stream_state.start()
-    if started or stream_state.is_active():
-        return jsonify({
-            "status": "started",
-            "active": True,
-            "rtsp_url": RTSP_URL
-        }), 200
-    else:
-        return jsonify({
-            "status": "error",
-            "message": "Failed to start stream"
-        }), 500
+    success = stream_manager.start_stream()
+    return jsonify({
+        "success": success,
+        "rtsp_url": stream_manager.get_rtsp_url() if success else None,
+        "active": stream_manager.is_active()
+    }), 200 if success else 500
 
 @app.route('/cmd/stop', methods=['POST'])
 @app.route('/stream/stop', methods=['POST'])
 def stop_stream():
-    stopped = stream_state.stop()
+    stream_manager.stop_stream()
     return jsonify({
-        "status": "stopped" if stopped else "already_stopped",
-        "active": stream_state.is_active()
-    }), 200
-
-def gen_mjpeg():
-    while stream_state.is_active():
-        frame = stream_state.get_frame()
-        if frame is None:
-            time.sleep(0.05)
-            continue
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-    # End of stream
-    yield (b'--frame\r\n'
-           b'Content-Type: text/plain\r\n\r\nStream stopped\r\n')
+        "success": True,
+        "active": stream_manager.is_active()
+    })
 
 @app.route('/video', methods=['GET'])
 def video_feed():
-    if not stream_state.is_active():
-        abort(503, "Stream is not active. Use /cmd/start or /stream/start first.")
-    return Response(stream_with_context(gen_mjpeg()),
+    if not stream_manager.is_active():
+        started = stream_manager.start_stream()
+        if not started:
+            return jsonify({"error": "Cannot start RTSP stream"}), 500
+
+    def generate():
+        while stream_manager.is_active():
+            frame = stream_manager.get_frame(timeout=5)
+            if frame is None:
+                continue
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+    return Response(generate(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
+# === Main Entrypoint ===
 if __name__ == '__main__':
-    app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True)
+    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
