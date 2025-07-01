@@ -1,212 +1,256 @@
+// device-shifu-driver-rtsp-camera.js
+
 const http = require('http');
 const url = require('url');
 const { spawn } = require('child_process');
 const { PassThrough } = require('stream');
 
-// ==== ENVIRONMENT VARIABLES ====
-const DEVICE_IP = process.env.RTSP_CAMERA_IP || '192.168.1.64';
-const DEVICE_PORT = process.env.RTSP_CAMERA_RTSP_PORT || '554';
-const DEVICE_USER = process.env.RTSP_CAMERA_USER || '';
-const DEVICE_PASS = process.env.RTSP_CAMERA_PASS || '';
-const RTSP_PATH = process.env.RTSP_CAMERA_RTSP_PATH || 'stream1';
-const SERVER_HOST = process.env.HTTP_SERVER_HOST || '0.0.0.0';
-const SERVER_PORT = parseInt(process.env.HTTP_SERVER_PORT || '8080', 10);
+// Configuration from environment variables
+const DEVICE_IP = process.env.DEVICE_IP || '127.0.0.1';
+const RTSP_PORT = process.env.RTSP_PORT || '554';
+const RTSP_PATH = process.env.RTSP_PATH || '/stream';
+const RTSP_USERNAME = process.env.RTSP_USERNAME || '';
+const RTSP_PASSWORD = process.env.RTSP_PASSWORD || '';
+const SERVER_HOST = process.env.SERVER_HOST || '0.0.0.0';
+const SERVER_PORT = parseInt(process.env.SERVER_PORT || '8080', 10);
 
-const RTSP_URL = `rtsp://${DEVICE_USER ? DEVICE_USER + (DEVICE_PASS ? `:${DEVICE_PASS}` : '') + '@' : ''}${DEVICE_IP}:${DEVICE_PORT}/${RTSP_PATH}`;
+const VIDEO_CODEC = process.env.VIDEO_CODEC || 'h264'; // or h265 or mjpeg
+const AUDIO_CODEC = process.env.AUDIO_CODEC || 'aac'; // or g711
 
-// ==== STREAM STATE ====
-let isStreaming = false;
-let videoClients = [];
-let audioClients = [];
-let ffmpegVideoProcess = null;
-let ffmpegAudioProcess = null;
+const STREAM_TIMEOUT = parseInt(process.env.STREAM_TIMEOUT || '600', 10); // seconds
 
-// ==== UTILITY: Spawn ffmpeg as a library process ====
-function startFFmpegStream(type) {
-    if (type === 'video' && !ffmpegVideoProcess) {
-        // Video stream as MJPEG for browser compatibility
-        ffmpegVideoProcess = spawn('ffmpeg', [
-            '-rtsp_transport', 'tcp',
-            '-i', RTSP_URL,
-            '-an',
-            '-c:v', 'mjpeg',
-            '-f', 'mjpeg',
-            '-q:v', '5',
-            '-r', '15',
-            'pipe:1'
-        ], { stdio: ['ignore', 'pipe', 'ignore'] });
+// Internal state
+let videoStreamProcess = null;
+let audioStreamProcess = null;
+let videoStreamActive = false;
+let audioStreamActive = false;
+let videoStreamClients = [];
+let audioStreamClients = [];
+let videoStreamPT = null;
+let audioStreamPT = null;
 
-        ffmpegVideoProcess.on('close', () => {
-            ffmpegVideoProcess = null;
-            videoClients.forEach(res => {
-                try { res.end(); } catch(e){}
-            });
-            videoClients = [];
-        });
+function getRtspUrl() {
+    let auth = '';
+    if (RTSP_USERNAME && RTSP_PASSWORD) {
+        auth = `${encodeURIComponent(RTSP_USERNAME)}:${encodeURIComponent(RTSP_PASSWORD)}@`;
     }
-    if (type === 'audio' && !ffmpegAudioProcess) {
-        // Audio stream as WAV for browser/CLI compatibility
-        ffmpegAudioProcess = spawn('ffmpeg', [
-            '-rtsp_transport', 'tcp',
-            '-i', RTSP_URL,
-            '-vn',
-            '-c:a', 'pcm_s16le',
-            '-ar', '44100',
-            '-ac', '1',
-            '-f', 'wav',
-            'pipe:1'
-        ], { stdio: ['ignore', 'pipe', 'ignore'] });
-
-        ffmpegAudioProcess.on('close', () => {
-            ffmpegAudioProcess = null;
-            audioClients.forEach(res => {
-                try { res.end(); } catch(e){}
-            });
-            audioClients = [];
-        });
-    }
+    return `rtsp://${auth}${DEVICE_IP}:${RTSP_PORT}${RTSP_PATH}`;
 }
 
-function stopFFmpegStream(type) {
-    if (type === 'video' && ffmpegVideoProcess) {
-        ffmpegVideoProcess.kill('SIGTERM');
-        ffmpegVideoProcess = null;
-    }
-    if (type === 'audio' && ffmpegAudioProcess) {
-        ffmpegAudioProcess.kill('SIGTERM');
-        ffmpegAudioProcess = null;
-    }
-    if (type === 'all') {
-        stopFFmpegStream('video');
-        stopFFmpegStream('audio');
-    }
+function startVideoStream() {
+    if (videoStreamActive) return;
+    const inputUrl = getRtspUrl();
+    let args = [
+        '-rtsp_transport', 'tcp',
+        '-i', inputUrl,
+        '-an',
+        '-c:v', 'copy',
+        '-f', 'mp4',
+        '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+        'pipe:1'
+    ];
+    videoStreamPT = new PassThrough();
+    videoStreamProcess = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'ignore'] });
+    videoStreamProcess.stdout.pipe(videoStreamPT);
+    videoStreamActive = true;
+
+    videoStreamProcess.on('close', () => {
+        videoStreamActive = false;
+        videoStreamPT && videoStreamPT.end();
+        videoStreamPT = null;
+        videoStreamProcess = null;
+        videoStreamClients.forEach(res => res.end());
+        videoStreamClients = [];
+    });
 }
 
-// ==== HTTP SERVER ====
-const server = http.createServer(async (req, res) => {
+function stopVideoStream() {
+    if (videoStreamProcess) {
+        videoStreamProcess.kill('SIGTERM');
+    }
+    videoStreamActive = false;
+}
+
+function startAudioStream() {
+    if (audioStreamActive) return;
+    const inputUrl = getRtspUrl();
+    let args = [
+        '-rtsp_transport', 'tcp',
+        '-i', inputUrl,
+        '-vn',
+        '-c:a', AUDIO_CODEC === 'g711' ? 'pcm_alaw' : 'aac',
+        '-f', AUDIO_CODEC === 'g711' ? 'wav' : 'adts',
+        'pipe:1'
+    ];
+    audioStreamPT = new PassThrough();
+    audioStreamProcess = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'ignore'] });
+    audioStreamProcess.stdout.pipe(audioStreamPT);
+    audioStreamActive = true;
+
+    audioStreamProcess.on('close', () => {
+        audioStreamActive = false;
+        audioStreamPT && audioStreamPT.end();
+        audioStreamPT = null;
+        audioStreamProcess = null;
+        audioStreamClients.forEach(res => res.end());
+        audioStreamClients = [];
+    });
+}
+
+function stopAudioStream() {
+    if (audioStreamProcess) {
+        audioStreamProcess.kill('SIGTERM');
+    }
+    audioStreamActive = false;
+}
+
+function handleStart(req, res) {
+    startVideoStream();
+    startAudioStream();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+        status: 'started',
+        video: videoStreamActive,
+        audio: audioStreamActive
+    }));
+}
+
+function handleStop(req, res) {
+    stopVideoStream();
+    stopAudioStream();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+        status: 'stopped',
+        video: videoStreamActive,
+        audio: audioStreamActive
+    }));
+}
+
+function handleGetStream(req, res) {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+        active: videoStreamActive || audioStreamActive,
+        video: {
+            active: videoStreamActive,
+            codec: VIDEO_CODEC,
+            url: `/streams/video`
+        },
+        audio: {
+            active: audioStreamActive,
+            codec: AUDIO_CODEC,
+            url: `/streams/audio`
+        },
+        rtsp: {
+            url: getRtspUrl()
+        }
+    }));
+}
+
+function handleStreamsVideo(req, res) {
+    if (!videoStreamActive) startVideoStream();
+
+    res.writeHead(200, {
+        'Content-Type': 'video/mp4',
+        'Transfer-Encoding': 'chunked',
+        'Cache-Control': 'no-cache'
+    });
+    videoStreamClients.push(res);
+
+    if (!videoStreamPT) {
+        res.end();
+        return;
+    }
+
+    const clientStream = videoStreamPT.pipe(new PassThrough());
+    clientStream.pipe(res);
+
+    req.on('close', () => {
+        clientStream.unpipe(res);
+        const idx = videoStreamClients.indexOf(res);
+        if (idx >= 0) videoStreamClients.splice(idx, 1);
+        if (videoStreamClients.length === 0) stopVideoStream();
+    });
+}
+
+function handleStreamsAudio(req, res) {
+    if (!audioStreamActive) startAudioStream();
+
+    let contentType = AUDIO_CODEC === 'g711' ? 'audio/wav' : 'audio/aac';
+    res.writeHead(200, {
+        'Content-Type': contentType,
+        'Transfer-Encoding': 'chunked',
+        'Cache-Control': 'no-cache'
+    });
+    audioStreamClients.push(res);
+
+    if (!audioStreamPT) {
+        res.end();
+        return;
+    }
+
+    const clientStream = audioStreamPT.pipe(new PassThrough());
+    clientStream.pipe(res);
+
+    req.on('close', () => {
+        clientStream.unpipe(res);
+        const idx = audioStreamClients.indexOf(res);
+        if (idx >= 0) audioStreamClients.splice(idx, 1);
+        if (audioStreamClients.length === 0) stopAudioStream();
+    });
+}
+
+function parseBody(req, callback) {
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+        try {
+            callback(JSON.parse(body));
+        } catch {
+            callback({});
+        }
+    });
+}
+
+const server = http.createServer((req, res) => {
     const parsedUrl = url.parse(req.url, true);
-    const method = req.method.toUpperCase();
-    const path = parsedUrl.pathname;
 
-    // === /commands/start and /cmd/start (POST) ===
-    if ((path === '/commands/start' || path === '/cmd/start') && method === 'POST') {
-        isStreaming = true;
-        res.writeHead(200, {'Content-Type': 'application/json'});
-        res.end(JSON.stringify({
-            status: "started",
-            details: "Media streams started.",
-            video: true,
-            audio: true
-        }));
+    // POST /commands/start or /cmd/start
+    if ((req.method === 'POST') &&
+        (parsedUrl.pathname === '/commands/start' || parsedUrl.pathname === '/cmd/start')) {
+        parseBody(req, () => handleStart(req, res));
         return;
     }
 
-    // === /commands/stop and /cmd/stop (POST) ===
-    if ((path === '/commands/stop' || path === '/cmd/stop') && method === 'POST') {
-        isStreaming = false;
-        stopFFmpegStream('all');
-        res.writeHead(200, {'Content-Type': 'application/json'});
-        res.end(JSON.stringify({
-            status: "stopped",
-            details: "Media streams stopped.",
-            video: false,
-            audio: false
-        }));
+    // POST /commands/stop or /cmd/stop
+    if ((req.method === 'POST') &&
+        (parsedUrl.pathname === '/commands/stop' || parsedUrl.pathname === '/cmd/stop')) {
+        parseBody(req, () => handleStop(req, res));
         return;
     }
 
-    // === /stream (GET) ===
-    if (path === '/stream' && method === 'GET') {
-        res.writeHead(200, {'Content-Type': 'application/json'});
-        res.end(JSON.stringify({
-            active: isStreaming,
-            video: isStreaming,
-            audio: isStreaming,
-            video_format: "MJPEG (proxied)",
-            audio_format: "WAV (proxied)",
-            rtsp_url: RTSP_URL
-        }));
+    // GET /stream
+    if (req.method === 'GET' && parsedUrl.pathname === '/stream') {
+        handleGetStream(req, res);
         return;
     }
 
-    // === /streams/video (GET) ===
-    if (path === '/streams/video' && method === 'GET') {
-        if (!isStreaming) {
-            res.writeHead(503, {'Content-Type': 'application/json'});
-            res.end(JSON.stringify({ error: 'Stream not started. Use /commands/start.' }));
-            return;
-        }
-        res.writeHead(200, {
-            'Content-Type': 'multipart/x-mixed-replace; boundary=ffmpegvideo',
-            'Cache-Control': 'no-cache',
-            'Connection': 'close',
-            'Pragma': 'no-cache'
-        });
-        videoClients.push(res);
-
-        startFFmpegStream('video');
-
-        const ffmpeg = ffmpegVideoProcess;
-        if (ffmpeg && ffmpeg.stdout) {
-            const writer = (data) => {
-                try {
-                    res.write(`--ffmpegvideo\r\nContent-Type: image/jpeg\r\nContent-Length: ${data.length}\r\n\r\n`);
-                    res.write(data);
-                    res.write('\r\n');
-                } catch(e) {}
-            };
-            ffmpeg.stdout.on('data', writer);
-
-            req.on('close', () => {
-                ffmpeg.stdout.off('data', writer);
-                videoClients = videoClients.filter(r => r !== res);
-                if (videoClients.length === 0) stopFFmpegStream('video');
-            });
-        }
+    // GET /streams/video
+    if (req.method === 'GET' && parsedUrl.pathname === '/streams/video') {
+        handleStreamsVideo(req, res);
         return;
     }
 
-    // === /streams/audio (GET) ===
-    if (path === '/streams/audio' && method === 'GET') {
-        if (!isStreaming) {
-            res.writeHead(503, {'Content-Type': 'application/json'});
-            res.end(JSON.stringify({ error: 'Stream not started. Use /commands/start.' }));
-            return;
-        }
-        res.writeHead(200, {
-            'Content-Type': 'audio/wav',
-            'Cache-Control': 'no-cache',
-            'Connection': 'close',
-            'Pragma': 'no-cache'
-        });
-        audioClients.push(res);
-
-        startFFmpegStream('audio');
-
-        const ffmpeg = ffmpegAudioProcess;
-        if (ffmpeg && ffmpeg.stdout) {
-            const writer = (data) => {
-                try {
-                    res.write(data);
-                } catch(e) {}
-            };
-            ffmpeg.stdout.on('data', writer);
-
-            req.on('close', () => {
-                ffmpeg.stdout.off('data', writer);
-                audioClients = audioClients.filter(r => r !== res);
-                if (audioClients.length === 0) stopFFmpegStream('audio');
-            });
-        }
+    // GET /streams/audio
+    if (req.method === 'GET' && parsedUrl.pathname === '/streams/audio') {
+        handleStreamsAudio(req, res);
         return;
     }
 
-    // === Fallback: 404 ===
-    res.writeHead(404, {'Content-Type': 'application/json'});
-    res.end(JSON.stringify({ error: 'Not Found' }));
+    // 404
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Not found' }));
 });
 
-// ==== SERVER BOOT ====
 server.listen(SERVER_PORT, SERVER_HOST, () => {
-    console.log(`RTSP Camera HTTP Proxy listening on http://${SERVER_HOST}:${SERVER_PORT}`);
+    console.log(`RTSP Camera HTTP Driver listening on http://${SERVER_HOST}:${SERVER_PORT}/`);
 });
