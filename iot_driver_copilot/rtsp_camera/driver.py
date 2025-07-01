@@ -1,140 +1,126 @@
 import os
 import threading
+import io
 import time
-from flask import Flask, Response, jsonify, request, stream_with_context, abort
+import json
+from flask import Flask, Response, request, jsonify, stream_with_context, abort
 import cv2
 
-# Configuration from environment variables
-RTSP_URL = os.environ.get("RTSP_URL", "")
-DEVICE_IP = os.environ.get("DEVICE_IP", "")
-RTSP_PORT = int(os.environ.get("RTSP_PORT", "554"))
-SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
+# Load configuration from environment variables
+RTSP_CAMERA_IP = os.environ.get("RTSP_CAMERA_IP", "127.0.0.1")
+RTSP_CAMERA_PORT = os.environ.get("RTSP_CAMERA_PORT", "554")
+RTSP_CAMERA_USERNAME = os.environ.get("RTSP_CAMERA_USERNAME", "")
+RTSP_CAMERA_PASSWORD = os.environ.get("RTSP_CAMERA_PASSWORD", "")
+RTSP_CAMERA_PATH = os.environ.get("RTSP_CAMERA_PATH", "Streaming/Channels/101")
+HTTP_SERVER_HOST = os.environ.get("HTTP_SERVER_HOST", "0.0.0.0")
+HTTP_SERVER_PORT = int(os.environ.get("HTTP_SERVER_PORT", "8080"))
 
-if not RTSP_URL:
-    # Construct RTSP URL from device IP and port if not directly given
-    username = os.environ.get("RTSP_USERNAME", "")
-    password = os.environ.get("RTSP_PASSWORD", "")
-    path = os.environ.get("RTSP_PATH", "Streaming/Channels/101")
-    if username and password:
-        RTSP_URL = f"rtsp://{username}:{password}@{DEVICE_IP}:{RTSP_PORT}/{path}"
-    else:
-        RTSP_URL = f"rtsp://{DEVICE_IP}:{RTSP_PORT}/{path}"
+# Compose RTSP URL
+def build_rtsp_url():
+    creds = ""
+    if RTSP_CAMERA_USERNAME and RTSP_CAMERA_PASSWORD:
+        creds = f"{RTSP_CAMERA_USERNAME}:{RTSP_CAMERA_PASSWORD}@"
+    return f"rtsp://{creds}{RTSP_CAMERA_IP}:{RTSP_CAMERA_PORT}/{RTSP_CAMERA_PATH}"
+
+RTSP_URL = build_rtsp_url()
 
 app = Flask(__name__)
 
-class CameraStream:
-    def __init__(self):
+class CameraStreamer:
+    def __init__(self, rtsp_url):
+        self.rtsp_url = rtsp_url
+        self.cap = None
+        self.frame = None
         self.active = False
-        self.capture = None
-        self.lock = threading.Lock()
-        self.last_frame = None
         self.thread = None
-        self.rtsp_url = RTSP_URL
-        self.last_access = 0
+        self.lock = threading.Lock()
+        self.stopped = threading.Event()
 
     def start(self):
         with self.lock:
-            if self.active:
-                return True
-            self.capture = cv2.VideoCapture(self.rtsp_url)
-            if not self.capture.isOpened():
-                self.capture = None
-                self.active = False
-                return False
-            self.active = True
-            self.thread = threading.Thread(target=self._update, daemon=True)
-            self.thread.start()
-            return True
+            if not self.active:
+                self.stopped.clear()
+                self.cap = cv2.VideoCapture(self.rtsp_url)
+                if not self.cap.isOpened():
+                    self.cap.release()
+                    self.cap = None
+                    return False
+                self.active = True
+                self.thread = threading.Thread(target=self.update, daemon=True)
+                self.thread.start()
+        return True
 
     def stop(self):
         with self.lock:
             self.active = False
-            if self.capture:
-                self.capture.release()
-            self.capture = None
-            self.last_frame = None
-            self.thread = None
-            return True
+            self.stopped.set()
+            if self.cap:
+                self.cap.release()
+                self.cap = None
 
-    def _update(self):
-        while self.active and self.capture:
-            ret, frame = self.capture.read()
-            if not ret:
+    def update(self):
+        while self.active and self.cap and self.cap.isOpened():
+            ret, frame = self.cap.read()
+            if ret:
+                self.frame = frame
+            else:
                 time.sleep(0.05)
-                continue
-            self.last_frame = frame
-            self.last_access = time.time()
-            # Auto-stop after a period of inactivity
-            if time.time() - self.last_access > 60:
-                self.stop()
+            if self.stopped.is_set():
                 break
 
-    def get_frame(self):
-        self.last_access = time.time()
-        if self.last_frame is not None:
-            ret, jpeg = cv2.imencode('.jpg', self.last_frame)
-            if ret:
-                return jpeg.tobytes()
-        return None
+    def get_jpeg_frame(self):
+        with self.lock:
+            if self.frame is not None:
+                ret, jpeg = cv2.imencode('.jpg', self.frame)
+                if ret:
+                    return jpeg.tobytes()
+            return None
 
     def is_active(self):
         with self.lock:
-            return self.active and self.capture is not None and self.capture.isOpened()
+            return self.active and self.cap is not None and self.cap.isOpened()
 
-    def get_rtsp_url(self):
-        return self.rtsp_url
-
-camera = CameraStream()
+streamer = CameraStreamer(RTSP_URL)
 
 @app.route('/stream', methods=['GET'])
-def stream_status():
+def get_stream_status():
     status = {
-        "stream_active": camera.is_active(),
-        "rtsp_url": camera.get_rtsp_url() if camera.is_active() else None
+        "active": streamer.is_active(),
+        "stream_http_url": None
     }
+    if streamer.is_active():
+        host = request.host.split(':')[0]
+        port = HTTP_SERVER_PORT
+        status["stream_http_url"] = f"http://{host}:{port}/stream/video"
     return jsonify(status)
 
-@app.route('/cmd/start', methods=['POST'])
 @app.route('/stream/start', methods=['POST'])
 def start_stream():
-    if camera.start():
-        return jsonify({
-            "status": "stream started",
-            "rtsp_url": camera.get_rtsp_url(),
-            "stream_active": True
-        })
-    else:
-        return jsonify({
-            "status": "failed to start stream",
-            "stream_active": False
-        }), 500
+    started = streamer.start()
+    if not started:
+        return jsonify({"active": False, "error": "Failed to open RTSP stream"}), 500
+    return jsonify({"active": True, "message": "Stream started"})
 
-@app.route('/cmd/stop', methods=['POST'])
 @app.route('/stream/stop', methods=['POST'])
 def stop_stream():
-    camera.stop()
-    return jsonify({
-        "status": "stream stopped",
-        "stream_active": False
-    })
+    streamer.stop()
+    return jsonify({"active": False, "message": "Stream stopped"})
 
-def generate_mjpeg():
-    while camera.is_active():
-        frame = camera.get_frame()
+def mjpeg_streamer():
+    while streamer.is_active():
+        frame = streamer.get_jpeg_frame()
         if frame is not None:
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
         else:
             time.sleep(0.05)
 
-@app.route('/video', methods=['GET'])
-def video_feed():
-    if not camera.is_active():
-        if not camera.start():
-            abort(503, "Unable to start stream")
-    return Response(stream_with_context(generate_mjpeg()),
+@app.route('/stream/video', methods=['GET'])
+def stream_video():
+    if not streamer.is_active():
+        abort(404, description="Stream is not active. Start it first.")
+    return Response(stream_with_context(mjpeg_streamer()),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
 if __name__ == '__main__':
-    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
+    app.run(host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT, threaded=True)
