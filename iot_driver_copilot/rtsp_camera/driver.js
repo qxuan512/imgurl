@@ -1,256 +1,177 @@
-// device-shifu-driver-rtsp-camera.js
-
-const http = require('http');
-const url = require('url');
-const { spawn } = require('child_process');
+const express = require('express');
+const { RTSPClient, H264Transport, AACTransport } = require('rtsp-client');
 const { PassThrough } = require('stream');
 
-// Configuration from environment variables
-const DEVICE_IP = process.env.DEVICE_IP || '127.0.0.1';
-const RTSP_PORT = process.env.RTSP_PORT || '554';
-const RTSP_PATH = process.env.RTSP_PATH || '/stream';
+// Environment Variables
+const RTSP_URL = process.env.RTSP_URL || '';
 const RTSP_USERNAME = process.env.RTSP_USERNAME || '';
 const RTSP_PASSWORD = process.env.RTSP_PASSWORD || '';
-const SERVER_HOST = process.env.SERVER_HOST || '0.0.0.0';
-const SERVER_PORT = parseInt(process.env.SERVER_PORT || '8080', 10);
+const RTSP_IP = process.env.RTSP_IP || '';
+const RTSP_PORT = process.env.RTSP_PORT || '554';
+const HTTP_HOST = process.env.HTTP_HOST || '0.0.0.0';
+const HTTP_PORT = process.env.HTTP_PORT || 8080;
+const RTSP_PATH = process.env.RTSP_PATH || '/stream';
 
-const VIDEO_CODEC = process.env.VIDEO_CODEC || 'h264'; // or h265 or mjpeg
-const AUDIO_CODEC = process.env.AUDIO_CODEC || 'aac'; // or g711
+const VIDEO_FORMAT = process.env.VIDEO_FORMAT || 'H264'; // or H265, MJPEG
+const AUDIO_FORMAT = process.env.AUDIO_FORMAT || 'AAC'; // or G711
 
-const STREAM_TIMEOUT = parseInt(process.env.STREAM_TIMEOUT || '600', 10); // seconds
-
-// Internal state
-let videoStreamProcess = null;
-let audioStreamProcess = null;
-let videoStreamActive = false;
-let audioStreamActive = false;
-let videoStreamClients = [];
-let audioStreamClients = [];
-let videoStreamPT = null;
-let audioStreamPT = null;
-
-function getRtspUrl() {
+// Compose RTSP URL if not directly given
+const composeRtspUrl = () => {
+    if (RTSP_URL) return RTSP_URL;
     let auth = '';
     if (RTSP_USERNAME && RTSP_PASSWORD) {
-        auth = `${encodeURIComponent(RTSP_USERNAME)}:${encodeURIComponent(RTSP_PASSWORD)}@`;
+        auth = encodeURIComponent(RTSP_USERNAME) + ':' + encodeURIComponent(RTSP_PASSWORD) + '@';
     }
-    return `rtsp://${auth}${DEVICE_IP}:${RTSP_PORT}${RTSP_PATH}`;
-}
+    return `rtsp://${auth}${RTSP_IP}:${RTSP_PORT}${RTSP_PATH}`;
+};
 
-function startVideoStream() {
-    if (videoStreamActive) return;
-    const inputUrl = getRtspUrl();
-    let args = [
-        '-rtsp_transport', 'tcp',
-        '-i', inputUrl,
-        '-an',
-        '-c:v', 'copy',
-        '-f', 'mp4',
-        '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-        'pipe:1'
-    ];
-    videoStreamPT = new PassThrough();
-    videoStreamProcess = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'ignore'] });
-    videoStreamProcess.stdout.pipe(videoStreamPT);
-    videoStreamActive = true;
+let streamActive = false;
+let videoStream = null;
+let audioStream = null;
+let client = null;
 
-    videoStreamProcess.on('close', () => {
-        videoStreamActive = false;
-        videoStreamPT && videoStreamPT.end();
-        videoStreamPT = null;
-        videoStreamProcess = null;
-        videoStreamClients.forEach(res => res.end());
-        videoStreamClients = [];
+// Utility: Start RTSP client and stream
+async function startRtspStreams() {
+    if (streamActive) return;
+    client = new RTSPClient();
+    await client.connect(composeRtspUrl(), {
+        connection: { username: RTSP_USERNAME, password: RTSP_PASSWORD }
     });
-}
 
-function stopVideoStream() {
-    if (videoStreamProcess) {
-        videoStreamProcess.kill('SIGTERM');
-    }
-    videoStreamActive = false;
-}
+    // Setup video
+    let videoPt = new PassThrough();
+    let audioPt = new PassThrough();
 
-function startAudioStream() {
-    if (audioStreamActive) return;
-    const inputUrl = getRtspUrl();
-    let args = [
-        '-rtsp_transport', 'tcp',
-        '-i', inputUrl,
-        '-vn',
-        '-c:a', AUDIO_CODEC === 'g711' ? 'pcm_alaw' : 'aac',
-        '-f', AUDIO_CODEC === 'g711' ? 'wav' : 'adts',
-        'pipe:1'
-    ];
-    audioStreamPT = new PassThrough();
-    audioStreamProcess = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'ignore'] });
-    audioStreamProcess.stdout.pipe(audioStreamPT);
-    audioStreamActive = true;
-
-    audioStreamProcess.on('close', () => {
-        audioStreamActive = false;
-        audioStreamPT && audioStreamPT.end();
-        audioStreamPT = null;
-        audioStreamProcess = null;
-        audioStreamClients.forEach(res => res.end());
-        audioStreamClients = [];
-    });
-}
-
-function stopAudioStream() {
-    if (audioStreamProcess) {
-        audioStreamProcess.kill('SIGTERM');
-    }
-    audioStreamActive = false;
-}
-
-function handleStart(req, res) {
-    startVideoStream();
-    startAudioStream();
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-        status: 'started',
-        video: videoStreamActive,
-        audio: audioStreamActive
-    }));
-}
-
-function handleStop(req, res) {
-    stopVideoStream();
-    stopAudioStream();
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-        status: 'stopped',
-        video: videoStreamActive,
-        audio: audioStreamActive
-    }));
-}
-
-function handleGetStream(req, res) {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-        active: videoStreamActive || audioStreamActive,
-        video: {
-            active: videoStreamActive,
-            codec: VIDEO_CODEC,
-            url: `/streams/video`
-        },
-        audio: {
-            active: audioStreamActive,
-            codec: AUDIO_CODEC,
-            url: `/streams/audio`
-        },
-        rtsp: {
-            url: getRtspUrl()
+    client.on('data', (channel, data, packet) => {
+        if (packet && packet.type === 'video') {
+            videoPt.write(packet.data);
         }
-    }));
-}
-
-function handleStreamsVideo(req, res) {
-    if (!videoStreamActive) startVideoStream();
-
-    res.writeHead(200, {
-        'Content-Type': 'video/mp4',
-        'Transfer-Encoding': 'chunked',
-        'Cache-Control': 'no-cache'
-    });
-    videoStreamClients.push(res);
-
-    if (!videoStreamPT) {
-        res.end();
-        return;
-    }
-
-    const clientStream = videoStreamPT.pipe(new PassThrough());
-    clientStream.pipe(res);
-
-    req.on('close', () => {
-        clientStream.unpipe(res);
-        const idx = videoStreamClients.indexOf(res);
-        if (idx >= 0) videoStreamClients.splice(idx, 1);
-        if (videoStreamClients.length === 0) stopVideoStream();
-    });
-}
-
-function handleStreamsAudio(req, res) {
-    if (!audioStreamActive) startAudioStream();
-
-    let contentType = AUDIO_CODEC === 'g711' ? 'audio/wav' : 'audio/aac';
-    res.writeHead(200, {
-        'Content-Type': contentType,
-        'Transfer-Encoding': 'chunked',
-        'Cache-Control': 'no-cache'
-    });
-    audioStreamClients.push(res);
-
-    if (!audioStreamPT) {
-        res.end();
-        return;
-    }
-
-    const clientStream = audioStreamPT.pipe(new PassThrough());
-    clientStream.pipe(res);
-
-    req.on('close', () => {
-        clientStream.unpipe(res);
-        const idx = audioStreamClients.indexOf(res);
-        if (idx >= 0) audioStreamClients.splice(idx, 1);
-        if (audioStreamClients.length === 0) stopAudioStream();
-    });
-}
-
-function parseBody(req, callback) {
-    let body = '';
-    req.on('data', chunk => { body += chunk; });
-    req.on('end', () => {
-        try {
-            callback(JSON.parse(body));
-        } catch {
-            callback({});
+        if (packet && packet.type === 'audio') {
+            audioPt.write(packet.data);
         }
     });
+
+    // Setup transports
+    let transports = [];
+    if (VIDEO_FORMAT === 'H264' || VIDEO_FORMAT === 'H265' || VIDEO_FORMAT === 'MJPEG') {
+        transports.push(new H264Transport());
+    }
+    if (AUDIO_FORMAT === 'AAC') {
+        transports.push(new AACTransport());
+    }
+    await client.play(transports);
+
+    videoStream = videoPt;
+    audioStream = audioPt;
+    streamActive = true;
 }
 
-const server = http.createServer((req, res) => {
-    const parsedUrl = url.parse(req.url, true);
-
-    // POST /commands/start or /cmd/start
-    if ((req.method === 'POST') &&
-        (parsedUrl.pathname === '/commands/start' || parsedUrl.pathname === '/cmd/start')) {
-        parseBody(req, () => handleStart(req, res));
-        return;
+// Utility: Stop RTSP client and streams
+async function stopRtspStreams() {
+    streamActive = false;
+    if (client) {
+        await client.close();
+        client = null;
     }
-
-    // POST /commands/stop or /cmd/stop
-    if ((req.method === 'POST') &&
-        (parsedUrl.pathname === '/commands/stop' || parsedUrl.pathname === '/cmd/stop')) {
-        parseBody(req, () => handleStop(req, res));
-        return;
+    if (videoStream) {
+        videoStream.end();
+        videoStream = null;
     }
-
-    // GET /stream
-    if (req.method === 'GET' && parsedUrl.pathname === '/stream') {
-        handleGetStream(req, res);
-        return;
+    if (audioStream) {
+        audioStream.end();
+        audioStream = null;
     }
+}
 
-    // GET /streams/video
-    if (req.method === 'GET' && parsedUrl.pathname === '/streams/video') {
-        handleStreamsVideo(req, res);
-        return;
+// Express setup
+const app = express();
+app.use(express.json());
+
+// Start stream command (POST /commands/start, /cmd/start)
+app.post(['/commands/start', '/cmd/start'], async (req, res) => {
+    try {
+        await startRtspStreams();
+        res.json({ status: 'started', active: streamActive });
+    } catch (e) {
+        res.status(500).json({ status: 'error', message: e.message });
     }
-
-    // GET /streams/audio
-    if (req.method === 'GET' && parsedUrl.pathname === '/streams/audio') {
-        handleStreamsAudio(req, res);
-        return;
-    }
-
-    // 404
-    res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Not found' }));
 });
 
-server.listen(SERVER_PORT, SERVER_HOST, () => {
-    console.log(`RTSP Camera HTTP Driver listening on http://${SERVER_HOST}:${SERVER_PORT}/`);
+// Stop stream command (POST /commands/stop, /cmd/stop)
+app.post(['/commands/stop', '/cmd/stop'], async (req, res) => {
+    try {
+        await stopRtspStreams();
+        res.json({ status: 'stopped', active: streamActive });
+    } catch (e) {
+        res.status(500).json({ status: 'error', message: e.message });
+    }
+});
+
+// Streaming status (GET /stream)
+app.get('/stream', (req, res) => {
+    res.json({
+        active: streamActive,
+        video: {
+            format: VIDEO_FORMAT,
+            endpoint: '/streams/video'
+        },
+        audio: {
+            format: AUDIO_FORMAT,
+            endpoint: '/streams/audio'
+        },
+        rtsp_url: composeRtspUrl()
+    });
+});
+
+// Stream video (GET /streams/video)
+app.get('/streams/video', async (req, res) => {
+    try {
+        if (!streamActive) await startRtspStreams();
+        res.setHeader('Content-Type', 'video/mp4');
+        // For browser: Use MP4 fragment, but here raw stream, adjust as needed for real browser support
+        videoStream.pipe(res);
+        req.on('close', () => {
+            videoStream.unpipe(res);
+        });
+    } catch (e) {
+        res.status(500).json({ status: 'error', message: e.message });
+    }
+});
+
+// Stream audio (GET /streams/audio)
+app.get('/streams/audio', async (req, res) => {
+    try {
+        if (!streamActive) await startRtspStreams();
+        res.setHeader('Content-type', AUDIO_FORMAT === 'AAC' ? 'audio/aac' : 'audio/basic');
+        audioStream.pipe(res);
+        req.on('close', () => {
+            audioStream.unpipe(res);
+        });
+    } catch (e) {
+        res.status(500).json({ status: 'error', message: e.message });
+    }
+});
+
+// Stream info (GET /streams/video - JSON endpoint)
+app.get('/streams/video', (req, res) => {
+    res.json({
+        active: streamActive,
+        format: VIDEO_FORMAT,
+        endpoint: '/streams/video',
+        rtsp_url: composeRtspUrl()
+    });
+});
+
+// Stream info (GET /streams/audio - JSON endpoint)
+app.get('/streams/audio', (req, res) => {
+    res.json({
+        active: streamActive,
+        format: AUDIO_FORMAT,
+        endpoint: '/streams/audio',
+        rtsp_url: composeRtspUrl()
+    });
+});
+
+app.listen(HTTP_PORT, HTTP_HOST, () => {
+    console.log(`RTSP Camera Driver HTTP server running at http://${HTTP_HOST}:${HTTP_PORT}/`);
 });
