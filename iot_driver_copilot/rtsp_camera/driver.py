@@ -1,113 +1,112 @@
 import os
-import threading
 import cv2
+import threading
 import time
-from flask import Flask, Response, jsonify, request, abort
-
-# Configuration from environment variables
-RTSP_URL = os.environ.get('RTSP_URL')
-CAMERA_IP = os.environ.get('CAMERA_IP')
-CAMERA_PORT = os.environ.get('CAMERA_PORT', '554')
-CAMERA_USER = os.environ.get('CAMERA_USER', '')
-CAMERA_PASS = os.environ.get('CAMERA_PASS', '')
-SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
-SERVER_PORT = int(os.environ.get('SERVER_PORT', '8080'))
-
-# Build RTSP URL if not explicitly set
-if not RTSP_URL:
-    userinfo = f"{CAMERA_USER}:{CAMERA_PASS}@" if CAMERA_USER or CAMERA_PASS else ""
-    RTSP_URL = f"rtsp://{userinfo}{CAMERA_IP}:{CAMERA_PORT}/"
+from flask import Flask, Response, jsonify, stream_with_context, request
 
 app = Flask(__name__)
 
-# Global state for streaming
-streaming_enabled = threading.Event()
-frame_lock = threading.Lock()
-latest_frame = [None]
-video_capture = [None]
-stream_thread = [None]
+# Config from environment variables
+RTSP_URL = os.environ.get("RTSP_URL")   # Full RTSP URL (e.g., rtsp://user:pass@ip:port/stream)
+HTTP_HOST = os.environ.get("HTTP_HOST", "0.0.0.0")
+HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
+FRAME_RATE = float(os.environ.get("FRAME_RATE", "10.0"))  # frame/sec for MJPEG stream
 
-def _open_camera():
-    cap = cv2.VideoCapture(RTSP_URL)
-    if not cap.isOpened():
-        return None
-    return cap
+if not RTSP_URL:
+    raise RuntimeError("RTSP_URL environment variable must be set.")
 
-def _release_camera():
-    if video_capture[0]:
-        video_capture[0].release()
-        video_capture[0] = None
+class CameraStream:
+    def __init__(self, rtsp_url):
+        self.rtsp_url = rtsp_url
+        self.cap = None
+        self.running = False
+        self.lock = threading.Lock()
+        self.latest_frame = None
+        self.thread = None
 
-def _stream_reader():
-    cap = _open_camera()
-    if not cap:
-        streaming_enabled.clear()
-        return
-    video_capture[0] = cap
-    while streaming_enabled.is_set():
-        ok, frame = cap.read()
-        if not ok:
-            time.sleep(0.1)
-            continue
-        with frame_lock:
-            latest_frame[0] = frame
-    _release_camera()
+    def start(self):
+        with self.lock:
+            if self.running:
+                return
+            self.running = True
+            self.cap = cv2.VideoCapture(self.rtsp_url)
+            self.thread = threading.Thread(target=self.update_frames, daemon=True)
+            self.thread.start()
 
-@app.route('/cmd/start', methods=['POST'])
-def cmd_start():
-    if not streaming_enabled.is_set():
-        streaming_enabled.set()
-        t = threading.Thread(target=_stream_reader, daemon=True)
-        stream_thread[0] = t
-        t.start()
-        return jsonify({'status': 'streaming started'})
-    else:
-        return jsonify({'status': 'already streaming'})
+    def stop(self):
+        with self.lock:
+            self.running = False
+            if self.cap:
+                self.cap.release()
+                self.cap = None
+            self.latest_frame = None
+            self.thread = None
 
-@app.route('/cmd/stop', methods=['POST'])
-def cmd_stop():
-    streaming_enabled.clear()
-    time.sleep(0.5)
-    _release_camera()
-    return jsonify({'status': 'streaming stopped'})
+    def update_frames(self):
+        while self.running and self.cap and self.cap.isOpened():
+            ret, frame = self.cap.read()
+            if not ret:
+                time.sleep(0.2)
+                continue
+            self.latest_frame = frame
+            time.sleep(1.0 / FRAME_RATE)
+        self.stop()
 
-def gen_mjpeg():
-    while streaming_enabled.is_set():
-        with frame_lock:
-            frame = latest_frame[0]
-        if frame is None:
-            time.sleep(0.05)
-            continue
-        ret, jpeg = cv2.imencode('.jpg', frame)
-        if not ret:
-            continue
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
-        time.sleep(0.04)  # ~25 fps
+    def get_frame(self):
+        with self.lock:
+            return self.latest_frame.copy() if self.latest_frame is not None else None
 
-@app.route('/video', methods=['GET'])
+    def is_running(self):
+        with self.lock:
+            return self.running
+
+camera_stream = CameraStream(RTSP_URL)
+
+@app.route("/video", methods=["GET"])
 def video_feed():
-    if not streaming_enabled.is_set():
-        abort(503, description='Stream not started yet. Use /cmd/start')
-    return Response(gen_mjpeg(),
+    if not camera_stream.is_running():
+        camera_stream.start()
+
+    def mjpeg_stream():
+        while camera_stream.is_running():
+            frame = camera_stream.get_frame()
+            if frame is not None:
+                ret, jpeg = cv2.imencode('.jpg', frame)
+                if not ret:
+                    continue
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
+            else:
+                time.sleep(0.05)
+    return Response(stream_with_context(mjpeg_stream()),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
-@app.route('/snap', methods=['GET'])
+@app.route("/snap", methods=["GET"])
 def snapshot():
-    if not streaming_enabled.is_set():
-        abort(503, description='Stream not started yet. Use /cmd/start')
-    with frame_lock:
-        frame = latest_frame[0]
+    if not camera_stream.is_running():
+        camera_stream.start()
+        # Wait for a frame to be available
+        timeout = 5
+        t0 = time.time()
+        while camera_stream.get_frame() is None and (time.time() - t0) < timeout:
+            time.sleep(0.1)
+    frame = camera_stream.get_frame()
     if frame is None:
-        abort(503, description='No frame available yet')
+        return jsonify({"error": "Unable to retrieve frame from camera."}), 500
     ret, jpeg = cv2.imencode('.jpg', frame)
     if not ret:
-        abort(500, description='Failed to encode image')
+        return jsonify({"error": "Failed to encode JPEG."}), 500
     return Response(jpeg.tobytes(), mimetype='image/jpeg')
 
-@app.route('/healthz', methods=['GET'])
-def health():
-    return jsonify({'status': 'ok'})
+@app.route("/cmd/start", methods=["POST"])
+def start_stream():
+    camera_stream.start()
+    return jsonify({"status": "started"})
 
-if __name__ == '__main__':
-    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
+@app.route("/cmd/stop", methods=["POST"])
+def stop_stream():
+    camera_stream.stop()
+    return jsonify({"status": "stopped"})
+
+if __name__ == "__main__":
+    app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True)
