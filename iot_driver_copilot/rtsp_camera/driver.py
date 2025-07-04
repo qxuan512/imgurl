@@ -1,111 +1,135 @@
 import os
-import cv2
+import io
 import threading
-import queue
 import time
-from flask import Flask, Response, send_file, jsonify, make_response
+from flask import Flask, Response, request, jsonify, abort
+import cv2
 
-# Environment variables for configuration
-CAMERA_IP = os.environ.get("CAMERA_IP", "127.0.0.1")
-CAMERA_RTSP_PORT = int(os.environ.get("CAMERA_RTSP_PORT", 554))
-CAMERA_RTSP_PATH = os.environ.get("CAMERA_RTSP_PATH", "stream")
-CAMERA_RTSP_USER = os.environ.get("CAMERA_RTSP_USER", "")
-CAMERA_RTSP_PASSWORD = os.environ.get("CAMERA_RTSP_PASSWORD", "")
-HTTP_SERVER_HOST = os.environ.get("HTTP_SERVER_HOST", "0.0.0.0")
-HTTP_SERVER_PORT = int(os.environ.get("HTTP_SERVER_PORT", 8000))
+# Configurations from environment variables
+DEVICE_IP = os.environ.get("DEVICE_IP")
+DEVICE_RTSP_PORT = int(os.environ.get("DEVICE_RTSP_PORT", "554"))
+RTSP_USERNAME = os.environ.get("RTSP_USERNAME", "")
+RTSP_PASSWORD = os.environ.get("RTSP_PASSWORD", "")
+RTSP_PATH = os.environ.get("RTSP_PATH", "Streaming/Channels/101")
+SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
 
-app = Flask(__name__)
-
-# RTSP URL Construction
+# Build RTSP URL
 def build_rtsp_url():
-    auth = ""
-    if CAMERA_RTSP_USER and CAMERA_RTSP_PASSWORD:
-        auth = f"{CAMERA_RTSP_USER}:{CAMERA_RTSP_PASSWORD}@"
-    return f"rtsp://{auth}{CAMERA_IP}:{CAMERA_RTSP_PORT}/{CAMERA_RTSP_PATH}"
+    userinfo = ""
+    if RTSP_USERNAME:
+        userinfo = RTSP_USERNAME
+        if RTSP_PASSWORD:
+            userinfo += f":{RTSP_PASSWORD}"
+        userinfo += "@"
+    return f"rtsp://{userinfo}{DEVICE_IP}:{DEVICE_RTSP_PORT}/{RTSP_PATH}"
 
 RTSP_URL = build_rtsp_url()
 
-# Streaming control
-streaming_thread = None
-streaming_running = False
-frame_queue = queue.Queue(maxsize=100)
+app = Flask(__name__)
 
-def rtsp_stream_worker(rtsp_url, frame_queue, stop_event):
-    cap = cv2.VideoCapture(rtsp_url)
-    if not cap.isOpened():
-        stop_event.set()
-        return
-    while not stop_event.is_set():
-        ret, frame = cap.read()
-        if not ret:
+class StreamHandler:
+    def __init__(self, rtsp_url):
+        self.rtsp_url = rtsp_url
+        self.cap = None
+        self.running = False
+        self.frame = None
+        self.lock = threading.Lock()
+        self.thread = None
+
+    def start(self):
+        if self.running:
+            return True
+        self.running = True
+        self.thread = threading.Thread(target=self.update, daemon=True)
+        self.thread.start()
+        # Wait for initial frame to be available
+        t0 = time.time()
+        while self.frame is None and time.time() - t0 < 5:
             time.sleep(0.1)
-            continue
-        if not frame_queue.full():
-            frame_queue.put(frame)
-    cap.release()
+        return self.frame is not None
 
-stop_event = threading.Event()
+    def stop(self):
+        self.running = False
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+        self.thread = None
 
-@app.route("/snapshot", methods=["GET"])
-def get_snapshot():
-    cap = cv2.VideoCapture(RTSP_URL)
-    if not cap.isOpened():
-        return make_response(jsonify({'error': 'Unable to open camera stream'}), 503)
-    ret, frame = cap.read()
-    cap.release()
-    if not ret or frame is None:
-        return make_response(jsonify({'error': 'Unable to capture snapshot'}), 500)
-    ret, jpeg = cv2.imencode('.jpg', frame)
-    if not ret:
-        return make_response(jsonify({'error': 'Unable to encode snapshot'}), 500)
-    response = Response(jpeg.tobytes(), mimetype='image/jpeg')
-    response.headers['Content-Disposition'] = 'inline; filename=snapshot.jpg'
-    return response
+    def update(self):
+        self.cap = cv2.VideoCapture(self.rtsp_url)
+        if not self.cap.isOpened():
+            self.stop()
+            return
+        while self.running:
+            ret, frame = self.cap.read()
+            if not ret:
+                time.sleep(0.2)
+                continue
+            with self.lock:
+                self.frame = frame
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
 
-@app.route("/stream/start", methods=["POST"])
-def start_stream():
-    global streaming_thread, streaming_running, stop_event, frame_queue
-    if streaming_running:
-        return jsonify({'status': 'already running'})
-    # Clear prior state
-    stop_event.clear()
-    with frame_queue.mutex:
-        frame_queue.queue.clear()
-    streaming_thread = threading.Thread(target=rtsp_stream_worker, args=(RTSP_URL, frame_queue, stop_event))
-    streaming_thread.daemon = True
-    streaming_thread.start()
-    streaming_running = True
-    return jsonify({'status': 'stream started'})
-
-@app.route("/stream/stop", methods=["POST"])
-def stop_stream():
-    global streaming_running, stop_event
-    if not streaming_running:
-        return jsonify({'status': 'already stopped'})
-    stop_event.set()
-    streaming_running = False
-    return jsonify({'status': 'stream stopped'})
-
-def gen_mjpeg():
-    """Generator that yields MJPEG frames from frame_queue."""
-    while streaming_running:
-        try:
-            frame = frame_queue.get(timeout=2)
-        except queue.Empty:
-            continue
+    def get_jpeg_frame(self):
+        with self.lock:
+            frame = self.frame
+        if frame is None:
+            return None
         ret, jpeg = cv2.imencode('.jpg', frame)
         if not ret:
-            continue
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
-    # End stream
-    yield b''
+            return None
+        return jpeg.tobytes()
 
-@app.route("/stream/live")
-def live_stream():
-    if not streaming_running:
-        return make_response(jsonify({'error': 'Stream not running. Please POST /stream/start first.'}), 409)
-    return Response(gen_mjpeg(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    def generate_mjpeg(self):
+        while self.running:
+            jpeg = self.get_jpeg_frame()
+            if jpeg is not None:
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + jpeg + b'\r\n')
+            else:
+                time.sleep(0.1)
+
+stream_handler = StreamHandler(RTSP_URL)
+
+@app.route("/snapshot", methods=["GET"])
+def snapshot():
+    if not stream_handler.running:
+        started = stream_handler.start()
+        if not started:
+            abort(503, "Could not start RTSP stream")
+    t0 = time.time()
+    jpeg = None
+    while time.time() - t0 < 3:
+        jpeg = stream_handler.get_jpeg_frame()
+        if jpeg is not None:
+            break
+        time.sleep(0.1)
+    if jpeg is None:
+        abort(504, "Could not retrieve snapshot from stream")
+    return Response(jpeg, mimetype='image/jpeg')
+
+@app.route("/stream/start", methods=["POST"])
+def stream_start():
+    success = stream_handler.start()
+    if not success:
+        return jsonify({"success": False, "error": "Could not start RTSP stream"}), 503
+    return jsonify({"success": True, "message": "Stream started"}), 200
+
+@app.route("/stream/stop", methods=["POST"])
+def stream_stop():
+    stream_handler.stop()
+    return jsonify({"success": True, "message": "Stream stopped"}), 200
+
+@app.route("/stream", methods=["GET"])
+def stream():
+    if not stream_handler.running:
+        started = stream_handler.start()
+        if not started:
+            abort(503, "Could not start RTSP stream")
+    return Response(stream_handler.generate_mjpeg(),
+                    mimetype="multipart/x-mixed-replace; boundary=frame")
 
 if __name__ == "__main__":
-    app.run(host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT, threaded=True)
+    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
