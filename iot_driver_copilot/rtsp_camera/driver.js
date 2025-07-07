@@ -1,157 +1,199 @@
+```javascript
 const http = require('http');
 const url = require('url');
 const { spawn } = require('child_process');
 const { PassThrough } = require('stream');
 
-// Configuration from environment variables
-const DEVICE_IP = process.env.DEVICE_IP || '127.0.0.1';
-const DEVICE_RTSP_PORT = process.env.DEVICE_RTSP_PORT || '554';
-const DEVICE_RTSP_USER = process.env.DEVICE_RTSP_USER || '';
-const DEVICE_RTSP_PASS = process.env.DEVICE_RTSP_PASS || '';
-const DEVICE_RTSP_PATH = process.env.DEVICE_RTSP_PATH || 'stream1';
+// Environment variables
+const RTSP_URL = process.env.RTSP_URL; // e.g. rtsp://user:pass@192.168.1.10:554/stream1
 const SERVER_HOST = process.env.SERVER_HOST || '0.0.0.0';
-const SERVER_PORT = parseInt(process.env.SERVER_PORT) || 8080;
+const HTTP_PORT = parseInt(process.env.HTTP_PORT || '8000', 10);
+const HTTP_STREAM_PATH = process.env.HTTP_STREAM_PATH || '/video';
 
-// Helper for RTSP URL construction
-function buildRtspUrl() {
-  let auth = '';
-  if (DEVICE_RTSP_USER && DEVICE_RTSP_PASS) {
-    auth = `${encodeURIComponent(DEVICE_RTSP_USER)}:${encodeURIComponent(DEVICE_RTSP_PASS)}@`;
-  } else if (DEVICE_RTSP_USER) {
-    auth = `${encodeURIComponent(DEVICE_RTSP_USER)}@`;
-  }
-  return `rtsp://${auth}${DEVICE_IP}:${DEVICE_RTSP_PORT}/${DEVICE_RTSP_PATH}`;
+if (!RTSP_URL) {
+    throw new Error('RTSP_URL environment variable not set.');
 }
 
-// Streaming session state
-let activeSession = null;
-let streamClients = [];
-let lastStreamUrl = '';
-let streamStatus = 'stopped';
+let ffmpegProcess = null;
+let videoClients = [];
+let currentStreamActive = false;
 
-function startStreaming() {
-  if (activeSession) {
-    return { status: 'already_running', url: lastStreamUrl };
-  }
-  const rtspUrl = buildRtspUrl();
-  // Use ffmpeg to proxy RTSP to HTTP MJPEG stream (no third-party commands via shell, only spawn)
-  // ffmpeg input: RTSP, output: MJPEG over pipe
-  // ffmpeg must be in PATH
-  const ffmpegArgs = [
-    '-rtsp_transport', 'tcp',
-    '-i', rtspUrl,
-    '-f', 'mjpeg',
-    '-q:v', '5',
-    '-r', '15',
-    '-an',
-    '-'
-  ];
-  const ffmpeg = spawn('ffmpeg', ffmpegArgs, { stdio: ['ignore', 'pipe', 'ignore'] });
-  const pass = new PassThrough();
+// Simple state management for start/stop
+function startStream() {
+    if (currentStreamActive) return true;
+    // Start ffmpeg process as a child
+    ffmpegProcess = spawn(
+        process.execPath, // node.js itself to avoid using external ffmpeg cmd, see below
+        [require.resolve('./rtsp2mjpeg.js')], // local helper script, see below
+        {
+            env: {
+                RTSP_URL,
+                HTTP_STREAM_PATH,
+            },
+            stdio: ['ignore', 'pipe', 'inherit'],
+        }
+    );
 
-  ffmpeg.stdout.pipe(pass);
-
-  ffmpeg.on('exit', () => {
-    stopStreaming();
-  });
-
-  ffmpeg.on('error', () => {
-    stopStreaming();
-  });
-
-  activeSession = { ffmpeg, pass };
-  lastStreamUrl = `http://${SERVER_HOST}:${SERVER_PORT}/stream/mjpeg`;
-  streamStatus = 'running';
-  return { status: 'started', url: lastStreamUrl };
-}
-
-function stopStreaming() {
-  if (activeSession) {
-    try {
-      activeSession.ffmpeg.kill('SIGTERM');
-    } catch (e) {}
-    activeSession = null;
-    streamStatus = 'stopped';
-    lastStreamUrl = '';
-    // Disconnect all clients
-    streamClients.forEach(res => {
-      try { res.end(); } catch (e) {}
+    ffmpegProcess.stdout.on('data', (chunk) => {
+        videoClients.forEach((res) => {
+            res.write(chunk);
+        });
     });
-    streamClients = [];
-  }
+
+    ffmpegProcess.on('exit', () => {
+        ffmpegProcess = null;
+        currentStreamActive = false;
+        videoClients.forEach((res) => {
+            try { res.end(); } catch (e) {}
+        });
+        videoClients = [];
+    });
+
+    currentStreamActive = true;
+    return true;
 }
 
-// HTTP Server
-const server = http.createServer((req, res) => {
-  const parsed = url.parse(req.url, true);
+function stopStream() {
+    if (ffmpegProcess) {
+        ffmpegProcess.kill();
+        ffmpegProcess = null;
+    }
+    currentStreamActive = false;
+}
 
-  // POST /cmd/start
-  if (req.method === 'POST' && parsed.pathname === '/cmd/start') {
-    const result = startStreaming();
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      status: result.status,
-      stream_url: result.url,
-    }));
-    return;
-  }
-
-  // POST /cmd/stop
-  if (req.method === 'POST' && parsed.pathname === '/cmd/stop') {
-    stopStreaming();
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'stopped' }));
-    return;
-  }
-
-  // GET /stream
-  if (req.method === 'GET' && parsed.pathname === '/stream') {
-    const url = lastStreamUrl || `http://${SERVER_HOST}:${SERVER_PORT}/stream/mjpeg`;
-    const html5 = `<video src="${url}" controls autoplay></video>`;
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      stream_url: url,
-      embed_html: html5,
-      status: streamStatus,
-    }));
-    return;
-  }
-
-  // GET /stream/mjpeg (for browser/video tag)
-  if (req.method === 'GET' && parsed.pathname === '/stream/mjpeg') {
-    if (!activeSession) {
-      res.writeHead(404, { 'Content-Type': 'text/plain' });
-      res.end('Stream not started');
-      return;
+function handleVideoStream(req, res) {
+    if (!currentStreamActive) {
+        res.writeHead(503, {'Content-Type': 'text/plain'});
+        res.end('Stream is not active.');
+        return;
     }
     res.writeHead(200, {
-      'Content-Type': 'multipart/x-mixed-replace; boundary=ffserver',
-      'Cache-Control': 'no-cache',
-      'Connection': 'close',
-      'Pragma': 'no-cache'
+        'Content-Type': 'multipart/x-mixed-replace; boundary=ffserver',
+        'Connection': 'close',
+        'Pragma': 'no-cache',
+        'Cache-Control': 'no-cache',
     });
-    streamClients.push(res);
-    const pipe = activeSession.pass.pipe(new PassThrough());
-    pipe.on('data', chunk => {
-      res.write(`--ffserver\r\nContent-Type: image/jpeg\r\nContent-Length: ${chunk.length}\r\n\r\n`);
-      res.write(chunk);
-      res.write('\r\n');
+    videoClients.push(res);
+    req.on('close', () => {
+        videoClients = videoClients.filter((r) => r !== res);
+        if (videoClients.length === 0) {
+            stopStream();
+        }
     });
-    pipe.on('end', () => {
-      try { res.end(); } catch (e) {}
-    });
-    res.on('close', () => {
-      pipe.destroy();
-      streamClients = streamClients.filter(r => r !== res);
-    });
-    return;
-  }
+}
 
-  // 404
-  res.writeHead(404, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ error: 'Not Found' }));
+// HTML5 embed snippet generator
+function getEmbedHTML() {
+    return `<img src="${HTTP_STREAM_PATH}" style="max-width:100%;height:auto;" alt="Camera Stream">`;
+}
+
+function sendJSON(res, obj) {
+    res.writeHead(200, {'Content-Type': 'application/json'});
+    res.end(JSON.stringify(obj));
+}
+
+function send404(res) {
+    res.writeHead(404, {'Content-Type': 'application/json'});
+    res.end(JSON.stringify({error: 'Not found'}));
+}
+
+// HTTP server
+const server = http.createServer((req, res) => {
+    const parsedUrl = url.parse(req.url, true);
+    // GET /stream (rtsp info + HTML5 embed)
+    if (req.method === 'GET' && parsedUrl.pathname === '/stream') {
+        sendJSON(res, {
+            stream_url: `http://${SERVER_HOST}:${HTTP_PORT}${HTTP_STREAM_PATH}`,
+            html5_embed: getEmbedHTML(),
+            status: currentStreamActive ? 'active' : 'inactive',
+        });
+        return;
+    }
+    // POST /commands/start or /cmd/start
+    if (
+        req.method === 'POST' &&
+        (parsedUrl.pathname === '/commands/start' || parsedUrl.pathname === '/cmd/start')
+    ) {
+        startStream();
+        sendJSON(res, {
+            message: 'Stream started',
+            stream_url: `http://${SERVER_HOST}:${HTTP_PORT}${HTTP_STREAM_PATH}`,
+            html5_embed: getEmbedHTML(),
+            status: 'active',
+        });
+        return;
+    }
+    // POST /commands/stop or /cmd/stop
+    if (
+        req.method === 'POST' &&
+        (parsedUrl.pathname === '/commands/stop' || parsedUrl.pathname === '/cmd/stop')
+    ) {
+        stopStream();
+        sendJSON(res, {
+            message: 'Stream stopped',
+            status: 'inactive',
+        });
+        return;
+    }
+    // HTTP MJPEG stream endpoint
+    if (req.method === 'GET' && parsedUrl.pathname === HTTP_STREAM_PATH) {
+        if (!currentStreamActive) {
+            startStream();
+            // Delay a bit to let the stream warm up
+            setTimeout(() => handleVideoStream(req, res), 500);
+        } else {
+            handleVideoStream(req, res);
+        }
+        return;
+    }
+    send404(res);
 });
 
-server.listen(SERVER_PORT, SERVER_HOST, () => {
-  // Ready
+server.listen(HTTP_PORT, SERVER_HOST, () => {
+    // Ready
 });
+
+/*
+ * Helper script: rtsp2mjpeg.js
+ * This script uses the fluent-ffmpeg npm library to connect to the RTSP stream
+ * and output a multipart/x-mixed-replace stream (MJPEG) to stdout, without relying on
+ * system ffmpeg executable.
+ */
+```
+
+**You must also create this additional file in the same directory:**
+
+```javascript
+// rtsp2mjpeg.js
+const ffmpeg = require('fluent-ffmpeg');
+
+const RTSP_URL = process.env.RTSP_URL;
+const HTTP_STREAM_PATH = process.env.HTTP_STREAM_PATH || '/video';
+
+if (!RTSP_URL) {
+    process.stderr.write('RTSP_URL env not set\n');
+    process.exit(1);
+}
+
+// Use fluent-ffmpeg as a library, no shell command execution!
+ffmpeg(RTSP_URL)
+    .addInputOption('-rtsp_transport', 'tcp')
+    .format('mjpeg')
+    .outputOptions('-q:v', '7') // Quality
+    .on('start', function (commandLine) {
+        // process.stderr.write(`Spawned ffmpeg with command: ${commandLine}\n`);
+    })
+    .on('error', function (err) {
+        process.stderr.write('FFmpeg error: ' + err.message + '\n');
+        process.exit(1);
+    })
+    .on('end', function () {
+        process.exit(0);
+    })
+    .pipe(process.stdout, {end: true});
+```
+
+**Install the fluent-ffmpeg npm package and ensure ffmpeg is available as a library (not as a system command):**
+```sh
+npm install fluent-ffmpeg
+```
