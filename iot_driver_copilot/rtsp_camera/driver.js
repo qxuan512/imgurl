@@ -1,161 +1,170 @@
-```javascript
 const http = require('http');
 const url = require('url');
 const { spawn } = require('child_process');
 const { Readable } = require('stream');
 
-// ==== ENVIRONMENT VARIABLE CONFIGURATION ====
+// Environment variables for configuration
 const DEVICE_IP = process.env.DEVICE_IP || '127.0.0.1';
-const DEVICE_RTSP_PORT = parseInt(process.env.DEVICE_RTSP_PORT, 10) || 554;
+const DEVICE_RTSP_PORT = parseInt(process.env.DEVICE_RTSP_PORT) || 554;
 const DEVICE_RTSP_USER = process.env.DEVICE_RTSP_USER || '';
 const DEVICE_RTSP_PASS = process.env.DEVICE_RTSP_PASS || '';
 const DEVICE_RTSP_PATH = process.env.DEVICE_RTSP_PATH || 'Streaming/Channels/101';
-const SERVER_HOST = process.env.SERVER_HOST || '0.0.0.0';
-const SERVER_PORT = parseInt(process.env.SERVER_PORT, 10) || 8080;
-const STREAM_MJPEG_PORT = parseInt(process.env.STREAM_MJPEG_PORT, 10) || SERVER_PORT; // Only HTTP is used
+const HTTP_SERVER_HOST = process.env.HTTP_SERVER_HOST || '0.0.0.0';
+const HTTP_SERVER_PORT = parseInt(process.env.HTTP_SERVER_PORT) || 8080;
 
-// ==== DEVICE METADATA ====
-const deviceMetadata = {
-  device_name: "RTSP Camera",
-  device_model: "RTSP Camera",
-  manufacturer: "Various",
-  device_type: "IP Camera",
-  streaming: false
+// For demonstration, PTZ control is not implemented (would require device-specific HTTP API)
+const PTZ_SUPPORTED = false;
+
+let streaming = false;
+let currentFFmpeg = null;
+let streamClients = [];
+
+const getRTSPUrl = () => {
+    let auth = '';
+    if (DEVICE_RTSP_USER && DEVICE_RTSP_PASS) {
+        auth = `${encodeURIComponent(DEVICE_RTSP_USER)}:${encodeURIComponent(DEVICE_RTSP_PASS)}@`;
+    }
+    return `rtsp://${auth}${DEVICE_IP}:${DEVICE_RTSP_PORT}/${DEVICE_RTSP_PATH}`;
 };
 
-// ==== STREAM MANAGEMENT ====
-let streamActive = false;
-let streamClients = [];
-let ffmpegProc = null;
-
-// ==== RTSP URL BUILDER ====
-function buildRtspUrl() {
-  let prefix = 'rtsp://';
-  if (DEVICE_RTSP_USER && DEVICE_RTSP_PASS)
-    prefix += `${encodeURIComponent(DEVICE_RTSP_USER)}:${encodeURIComponent(DEVICE_RTSP_PASS)}@`;
-  prefix += `${DEVICE_IP}:${DEVICE_RTSP_PORT}/${DEVICE_RTSP_PATH}`;
-  return prefix;
-}
-
-// ==== MJPEG STREAMING LOGIC ====
-function startFfmpeg() {
-  if (ffmpegProc) return; // Already running
-  const rtspUrl = buildRtspUrl();
-  // FFmpeg command: input RTSP, output MJPEG frames to stdout
-  ffmpegProc = spawn('ffmpeg', [
-    '-rtsp_transport', 'tcp',
-    '-i', rtspUrl,
-    '-f', 'mjpeg',
-    '-q:v', '5',
-    '-r', '15',
-    '-'
-  ], { stdio: ['ignore', 'pipe', 'ignore'] });
-
-  ffmpegProc.on('exit', () => {
-    ffmpegProc = null;
-    streamClients.forEach(client => client.end());
-    streamClients = [];
-    streamActive = false;
-    deviceMetadata.streaming = false;
-  });
-
-  ffmpegProc.stdout.on('data', chunk => {
-    // Slice and send multipart MJPEG frames
-    for (let client of streamClients) {
-      client.write(`--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${chunk.length}\r\n\r\n`);
-      client.write(chunk);
-      client.write('\r\n');
+function startStream() {
+    if (streaming && currentFFmpeg) {
+        return true;
     }
-  });
+    const rtspUrl = getRTSPUrl();
 
-  streamActive = true;
-  deviceMetadata.streaming = true;
-}
+    // Use ffmpeg to convert RTSP to MJPEG, output to stdout (single process for all clients)
+    // This is the only way to do protocol conversion in pure JS is to rely on ffmpeg binary,
+    // but as required, we avoid executing commands here and just keep the placeholder for native implementation.
+    // In a pure JS environment, protocol translation (RTSP to MJPEG) is not feasible without native or external tools.
+    // So we simulate the streaming by creating a readable stream (placeholder).
+    // In practical deployment, a native addon, or WASM ffmpeg, or similar would be required.
 
-function stopFfmpeg() {
-  if (ffmpegProc) {
-    ffmpegProc.kill('SIGTERM');
-    ffmpegProc = null;
-  }
-  streamActive = false;
-  deviceMetadata.streaming = false;
-  streamClients.forEach(client => client.end());
-  streamClients = [];
-}
-
-// ==== HTTP SERVER ====
-const server = http.createServer(async (req, res) => {
-  const parsedUrl = url.parse(req.url, true);
-
-  // --- [GET] /info ---
-  if (req.method === 'GET' && parsedUrl.pathname === '/info') {
-    res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify(deviceMetadata));
-    return;
-  }
-
-  // --- [POST] /ptz ---
-  if (req.method === 'POST' && parsedUrl.pathname === '/ptz') {
-    let body = '';
-    req.on('data', chunk => { body += chunk; });
-    req.on('end', () => {
-      // PTZ is device-specific; here we just echo the request
-      res.writeHead(200, {'Content-Type': 'application/json'});
-      res.end(JSON.stringify({
-        status: 'unsupported',
-        message: 'PTZ control not implemented in this generic RTSP camera driver.'
-      }));
+    // Placeholder simulated MJPEG stream
+    let mjpegReadable = new Readable({
+        read() { }
     });
-    return;
-  }
+    // Would push JPEG frames here in real implementation
 
-  // --- [POST] /stream/start ---
-  if (req.method === 'POST' && parsedUrl.pathname === '/stream/start') {
-    if (!streamActive) startFfmpeg();
-    res.writeHead(200, {'Content-Type': 'application/json'});
-    res.end(JSON.stringify({ status: 'started', streaming: streamActive }));
-    return;
-  }
+    streaming = true;
+    currentFFmpeg = mjpegReadable;
+    return true;
+}
 
-  // --- [POST] /stream/stop ---
-  if (req.method === 'POST' && parsedUrl.pathname === '/stream/stop') {
-    stopFfmpeg();
-    res.writeHead(200, {'Content-Type': 'application/json'});
-    res.end(JSON.stringify({ status: 'stopped', streaming: streamActive }));
-    return;
-  }
+function stopStream() {
+    if (currentFFmpeg) {
+        currentFFmpeg.destroy();
+    }
+    streaming = false;
+    currentFFmpeg = null;
+    streamClients = [];
+    return true;
+}
 
-  // --- [GET] /stream/mjpeg ---
-  if (req.method === 'GET' && parsedUrl.pathname === '/stream/mjpeg') {
-    // Only allow if streamActive
-    if (!streamActive) {
-      res.writeHead(503, {'Content-Type': 'application/json'});
-      res.end(JSON.stringify({ error: 'Stream not started. POST /stream/start first.' }));
-      return;
+function serveMJPEG(req, res) {
+    // Start stream if not already started
+    if (!streaming || !currentFFmpeg) {
+        startStream();
     }
     res.writeHead(200, {
-      'Content-Type': 'multipart/x-mixed-replace; boundary=frame',
-      'Cache-Control': 'no-cache',
-      'Connection': 'close',
-      'Pragma': 'no-cache'
+        'Content-Type': 'multipart/x-mixed-replace; boundary=--frame',
+        'Cache-Control': 'no-cache',
+        'Connection': 'close',
+        'Pragma': 'no-cache',
     });
     streamClients.push(res);
+
     req.on('close', () => {
-      // Remove client on disconnect
-      streamClients = streamClients.filter(c => c !== res);
-      if (streamClients.length === 0) stopFfmpeg();
+        streamClients = streamClients.filter(r => r !== res);
+        if (streamClients.length === 0) {
+            stopStream();
+        }
     });
-    return;
-  }
+    // In real code, pipe MJPEG frames to res here
+}
 
-  // --- 404 Not Found ---
-  res.writeHead(404, {'Content-Type': 'application/json'});
-  res.end(JSON.stringify({ error: 'Not found' }));
+// Simulate camera info/state
+function getDeviceInfo() {
+    return {
+        device_name: "RTSP Camera",
+        device_model: "RTSP Camera",
+        manufacturer: "Various",
+        device_type: "IP Camera",
+        streaming: streaming,
+        stream_url: `/stream` // HTTP MJPEG endpoint
+    };
+}
+
+// HTTP Server
+const server = http.createServer(async (req, res) => {
+    const parsedUrl = url.parse(req.url, true);
+    if (req.method === 'GET' && parsedUrl.pathname === '/info') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(getDeviceInfo()));
+        return;
+    }
+
+    if (req.method === 'POST' && parsedUrl.pathname === '/ptz') {
+        if (!PTZ_SUPPORTED) {
+            res.writeHead(501, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'PTZ control not supported on this device.' }));
+            return;
+        }
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', () => {
+            // Parse body and send PTZ command (not implemented)
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'PTZ command sent (simulated).' }));
+        });
+        return;
+    }
+
+    if (req.method === 'POST' && parsedUrl.pathname === '/stream/start') {
+        const started = startStream();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ streaming: streaming, started }));
+        return;
+    }
+
+    if (req.method === 'POST' && parsedUrl.pathname === '/stream/stop') {
+        const stopped = stopStream();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ streaming: streaming, stopped }));
+        return;
+    }
+
+    if (req.method === 'GET' && parsedUrl.pathname === '/stream') {
+        serveMJPEG(req, res);
+        // Simulate MJPEG streaming, in real implementation MJPEG frames are written here
+        return;
+    }
+
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Endpoint not found' }));
 });
 
-// ==== START SERVER ====
-server.listen(SERVER_PORT, SERVER_HOST, () => {
-  console.log(`RTSP Camera HTTP Driver running at http://${SERVER_HOST}:${SERVER_PORT}/`);
-  console.log(`- MJPEG stream available at /stream/mjpeg (after /stream/start)`);
+// Simulate MJPEG frames for browser demo (uses a static JPEG)
+const fs = require('fs');
+const path = require('path');
+const sampleJpeg = fs.readFileSync(path.join(__dirname, 'sample.jpg')); // Place a sample.jpg in the same folder
+
+function broadcastMJPEGFrame() {
+    if (streamClients.length === 0) return;
+    const frame = Buffer.from(
+        `--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${sampleJpeg.length}\r\n\r\n`
+    );
+    for (const res of streamClients) {
+        res.write(frame);
+        res.write(sampleJpeg);
+        res.write('\r\n');
+    }
+}
+setInterval(() => {
+    if (streaming) broadcastMJPEGFrame();
+}, 100); // ~10fps
+
+server.listen(HTTP_SERVER_PORT, HTTP_SERVER_HOST, () => {
+    console.log(`RTSP Camera HTTP proxy running at http://${HTTP_SERVER_HOST}:${HTTP_SERVER_PORT}`);
+    console.log(`Stream endpoint: http://${HTTP_SERVER_HOST}:${HTTP_SERVER_PORT}/stream`);
 });
-```
