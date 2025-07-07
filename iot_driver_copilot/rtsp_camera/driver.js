@@ -1,199 +1,165 @@
 ```javascript
 const http = require('http');
-const url = require('url');
 const { spawn } = require('child_process');
 const { PassThrough } = require('stream');
+const url = require('url');
 
 // Environment variables
-const RTSP_URL = process.env.RTSP_URL; // e.g. rtsp://user:pass@192.168.1.10:554/stream1
 const SERVER_HOST = process.env.SERVER_HOST || '0.0.0.0';
-const HTTP_PORT = parseInt(process.env.HTTP_PORT || '8000', 10);
-const HTTP_STREAM_PATH = process.env.HTTP_STREAM_PATH || '/video';
+const SERVER_PORT = parseInt(process.env.SERVER_PORT || '8080');
+const RTSP_URL = process.env.RTSP_URL || '';
+const HTTP_STREAM_PORT = parseInt(process.env.HTTP_STREAM_PORT || '8081'); // for HTTP stream endpoint
 
 if (!RTSP_URL) {
-    throw new Error('RTSP_URL environment variable not set.');
+  console.error('RTSP_URL environment variable is required');
+  process.exit(1);
 }
 
-let ffmpegProcess = null;
-let videoClients = [];
-let currentStreamActive = false;
+// State
+let streaming = false;
+let streamProcess = null;
+let streamClients = [];
+const streamPassThrough = new PassThrough();
 
-// Simple state management for start/stop
+// Helper: Launch ffmpeg to proxy RTSP to HTTP/MJPEG
 function startStream() {
-    if (currentStreamActive) return true;
-    // Start ffmpeg process as a child
-    ffmpegProcess = spawn(
-        process.execPath, // node.js itself to avoid using external ffmpeg cmd, see below
-        [require.resolve('./rtsp2mjpeg.js')], // local helper script, see below
-        {
-            env: {
-                RTSP_URL,
-                HTTP_STREAM_PATH,
-            },
-            stdio: ['ignore', 'pipe', 'inherit'],
-        }
-    );
+  if (streaming) return;
+  // ffmpeg command: input RTSP, output MJPEG to stdout
+  streamProcess = spawn('ffmpeg', [
+    '-rtsp_transport', 'tcp',
+    '-i', RTSP_URL,
+    '-f', 'mjpeg',
+    '-q:v', '5',
+    '-preset', 'ultrafast',
+    '-r', '15',
+    '-an', // no audio
+    '-'
+  ]);
 
-    ffmpegProcess.stdout.on('data', (chunk) => {
-        videoClients.forEach((res) => {
-            res.write(chunk);
-        });
-    });
+  streamProcess.stdout.on('data', (chunk) => {
+    streamPassThrough.write(chunk);
+  });
 
-    ffmpegProcess.on('exit', () => {
-        ffmpegProcess = null;
-        currentStreamActive = false;
-        videoClients.forEach((res) => {
-            try { res.end(); } catch (e) {}
-        });
-        videoClients = [];
-    });
+  streamProcess.stderr.on('data', () => {
+    // Suppress ffmpeg logs
+  });
 
-    currentStreamActive = true;
-    return true;
+  streamProcess.on('close', () => {
+    streaming = false;
+    streamProcess = null;
+    streamPassThrough.end();
+  });
+
+  streaming = true;
 }
 
 function stopStream() {
-    if (ffmpegProcess) {
-        ffmpegProcess.kill();
-        ffmpegProcess = null;
+  if (!streaming || !streamProcess) return;
+  streamProcess.kill('SIGKILL');
+  streaming = false;
+  streamProcess = null;
+  streamPassThrough.end();
+}
+
+// HTTP MJPEG Streaming Server
+const httpStreamServer = http.createServer((req, res) => {
+  if (req.url !== '/video') {
+    res.writeHead(404);
+    res.end();
+    return;
+  }
+  if (!streaming) {
+    startStream();
+    // Wait a bit to buffer initial data
+  }
+  res.writeHead(200, {
+    'Content-Type': 'multipart/x-mixed-replace; boundary=ffserver',
+    'Cache-Control': 'no-cache',
+    'Connection': 'close',
+    'Pragma': 'no-cache'
+  });
+
+  const onData = (chunk) => {
+    res.write(`--ffserver\r\nContent-Type: image/jpeg\r\nContent-Length: ${chunk.length}\r\n\r\n`);
+    res.write(chunk);
+    res.write('\r\n');
+  };
+  streamPassThrough.on('data', onData);
+
+  res.on('close', () => {
+    streamPassThrough.removeListener('data', onData);
+    streamClients = streamClients.filter(c => c !== res);
+    if (streamClients.length === 0) {
+      stopStream();
     }
-    currentStreamActive = false;
-}
+  });
 
-function handleVideoStream(req, res) {
-    if (!currentStreamActive) {
-        res.writeHead(503, {'Content-Type': 'text/plain'});
-        res.end('Stream is not active.');
-        return;
-    }
-    res.writeHead(200, {
-        'Content-Type': 'multipart/x-mixed-replace; boundary=ffserver',
-        'Connection': 'close',
-        'Pragma': 'no-cache',
-        'Cache-Control': 'no-cache',
-    });
-    videoClients.push(res);
-    req.on('close', () => {
-        videoClients = videoClients.filter((r) => r !== res);
-        if (videoClients.length === 0) {
-            stopStream();
-        }
-    });
-}
+  streamClients.push(res);
+});
 
-// HTML5 embed snippet generator
-function getEmbedHTML() {
-    return `<img src="${HTTP_STREAM_PATH}" style="max-width:100%;height:auto;" alt="Camera Stream">`;
-}
+// Main HTTP API Server
+const apiServer = http.createServer(async (req, res) => {
+  const parsed = url.parse(req.url, true);
 
-function sendJSON(res, obj) {
+  // CORS for browser access
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  // GET /stream (two endpoints)
+  if (req.method === 'GET' && parsed.pathname === '/stream') {
+    // Return URLs and embed snippet
+    const mjpegURL = `http://${SERVER_HOST}:${HTTP_STREAM_PORT}/video`;
     res.writeHead(200, {'Content-Type': 'application/json'});
-    res.end(JSON.stringify(obj));
-}
+    res.end(JSON.stringify({
+      status: streaming ? 'streaming' : 'stopped',
+      urls: {
+        mjpeg: mjpegURL
+      },
+      html5_embed: `<img src="${mjpegURL}" style="max-width:100%;"/>`
+    }));
+    return;
+  }
 
-function send404(res) {
-    res.writeHead(404, {'Content-Type': 'application/json'});
-    res.end(JSON.stringify({error: 'Not found'}));
-}
+  // POST /commands/start and /cmd/start
+  if (req.method === 'POST' && (parsed.pathname === '/commands/start' || parsed.pathname === '/cmd/start')) {
+    if (!streaming) startStream();
+    res.writeHead(200, {'Content-Type': 'application/json'});
+    res.end(JSON.stringify({
+      status: 'streaming',
+      message: 'RTSP stream started',
+      mjpeg_url: `http://${SERVER_HOST}:${HTTP_STREAM_PORT}/video`
+    }));
+    return;
+  }
 
-// HTTP server
-const server = http.createServer((req, res) => {
-    const parsedUrl = url.parse(req.url, true);
-    // GET /stream (rtsp info + HTML5 embed)
-    if (req.method === 'GET' && parsedUrl.pathname === '/stream') {
-        sendJSON(res, {
-            stream_url: `http://${SERVER_HOST}:${HTTP_PORT}${HTTP_STREAM_PATH}`,
-            html5_embed: getEmbedHTML(),
-            status: currentStreamActive ? 'active' : 'inactive',
-        });
-        return;
-    }
-    // POST /commands/start or /cmd/start
-    if (
-        req.method === 'POST' &&
-        (parsedUrl.pathname === '/commands/start' || parsedUrl.pathname === '/cmd/start')
-    ) {
-        startStream();
-        sendJSON(res, {
-            message: 'Stream started',
-            stream_url: `http://${SERVER_HOST}:${HTTP_PORT}${HTTP_STREAM_PATH}`,
-            html5_embed: getEmbedHTML(),
-            status: 'active',
-        });
-        return;
-    }
-    // POST /commands/stop or /cmd/stop
-    if (
-        req.method === 'POST' &&
-        (parsedUrl.pathname === '/commands/stop' || parsedUrl.pathname === '/cmd/stop')
-    ) {
-        stopStream();
-        sendJSON(res, {
-            message: 'Stream stopped',
-            status: 'inactive',
-        });
-        return;
-    }
-    // HTTP MJPEG stream endpoint
-    if (req.method === 'GET' && parsedUrl.pathname === HTTP_STREAM_PATH) {
-        if (!currentStreamActive) {
-            startStream();
-            // Delay a bit to let the stream warm up
-            setTimeout(() => handleVideoStream(req, res), 500);
-        } else {
-            handleVideoStream(req, res);
-        }
-        return;
-    }
-    send404(res);
+  // POST /commands/stop and /cmd/stop
+  if (req.method === 'POST' && (parsed.pathname === '/commands/stop' || parsed.pathname === '/cmd/stop')) {
+    stopStream();
+    res.writeHead(200, {'Content-Type': 'application/json'});
+    res.end(JSON.stringify({
+      status: 'stopped',
+      message: 'RTSP stream stopped'
+    }));
+    return;
+  }
+
+  // 404 fallback
+  res.writeHead(404, {'Content-Type': 'application/json'});
+  res.end(JSON.stringify({error: 'Not found'}));
 });
 
-server.listen(HTTP_PORT, SERVER_HOST, () => {
-    // Ready
+// Start servers
+apiServer.listen(SERVER_PORT, SERVER_HOST, () => {
+  console.log(`API Server listening on http://${SERVER_HOST}:${SERVER_PORT}`);
 });
-
-/*
- * Helper script: rtsp2mjpeg.js
- * This script uses the fluent-ffmpeg npm library to connect to the RTSP stream
- * and output a multipart/x-mixed-replace stream (MJPEG) to stdout, without relying on
- * system ffmpeg executable.
- */
-```
-
-**You must also create this additional file in the same directory:**
-
-```javascript
-// rtsp2mjpeg.js
-const ffmpeg = require('fluent-ffmpeg');
-
-const RTSP_URL = process.env.RTSP_URL;
-const HTTP_STREAM_PATH = process.env.HTTP_STREAM_PATH || '/video';
-
-if (!RTSP_URL) {
-    process.stderr.write('RTSP_URL env not set\n');
-    process.exit(1);
-}
-
-// Use fluent-ffmpeg as a library, no shell command execution!
-ffmpeg(RTSP_URL)
-    .addInputOption('-rtsp_transport', 'tcp')
-    .format('mjpeg')
-    .outputOptions('-q:v', '7') // Quality
-    .on('start', function (commandLine) {
-        // process.stderr.write(`Spawned ffmpeg with command: ${commandLine}\n`);
-    })
-    .on('error', function (err) {
-        process.stderr.write('FFmpeg error: ' + err.message + '\n');
-        process.exit(1);
-    })
-    .on('end', function () {
-        process.exit(0);
-    })
-    .pipe(process.stdout, {end: true});
-```
-
-**Install the fluent-ffmpeg npm package and ensure ffmpeg is available as a library (not as a system command):**
-```sh
-npm install fluent-ffmpeg
+httpStreamServer.listen(HTTP_STREAM_PORT, SERVER_HOST, () => {
+  console.log(`HTTP Stream (MJPEG) Server on http://${SERVER_HOST}:${HTTP_STREAM_PORT}/video`);
+});
 ```
