@@ -1,182 +1,178 @@
 const http = require('http');
 const url = require('url');
 const { spawn } = require('child_process');
-const { StringDecoder } = require('string_decoder');
+const EventEmitter = require('events');
 
-// ==== Config from ENV ====
+// Configuration from environment
 const DEVICE_IP = process.env.DEVICE_IP || '127.0.0.1';
 const DEVICE_RTSP_PORT = process.env.DEVICE_RTSP_PORT || '554';
+const DEVICE_RTSP_PATH = process.env.DEVICE_RTSP_PATH || '/stream';
 const DEVICE_RTSP_USER = process.env.DEVICE_RTSP_USER || '';
 const DEVICE_RTSP_PASS = process.env.DEVICE_RTSP_PASS || '';
-const DEVICE_RTSP_PATH = process.env.DEVICE_RTSP_PATH || 'stream';
-const HTTP_SERVER_HOST = process.env.HTTP_SERVER_HOST || '0.0.0.0';
-const HTTP_SERVER_PORT = parseInt(process.env.HTTP_SERVER_PORT, 10) || 8080;
-const HTTP_STREAM_PATH = process.env.HTTP_STREAM_PATH || '/live.mjpeg';
-const STREAM_CODEC = process.env.STREAM_CODEC || 'mjpeg'; // Only mjpeg will be proxied for browser
+const SERVER_HOST = process.env.SERVER_HOST || '0.0.0.0';
+const SERVER_PORT = parseInt(process.env.SERVER_PORT || '8080', 10);
+const DEFAULT_STREAM_FORMAT = process.env.DEFAULT_STREAM_FORMAT || 'mjpeg'; // mjpeg, h264, mp4
 
-// ==== Internal State ====
-let streamStatus = 'stopped';
-let streamParams = {
-  resolution: '1280x720',
-  bitrate: '2048k',
-  codec: STREAM_CODEC,
+// Supported formats
+const SUPPORTED_FORMATS = ['mjpeg', 'h264', 'mp4'];
+const MIME_TYPES = {
+    'mjpeg': 'multipart/x-mixed-replace; boundary=ffserver',
+    'h264': 'video/h264',
+    'mp4': 'video/mp4'
 };
-let ffmpegProcess = null;
-let clients = [];
 
-// ==== Helper: RTSP URL generator ====
-function getRTSPUrl() {
-  let auth = DEVICE_RTSP_USER && DEVICE_RTSP_PASS ? `${DEVICE_RTSP_USER}:${DEVICE_RTSP_PASS}@` : '';
-  return `rtsp://${auth}${DEVICE_IP}:${DEVICE_RTSP_PORT}/${DEVICE_RTSP_PATH}`;
+// RTSP URL builder
+function getRtspUrl() {
+    if (DEVICE_RTSP_USER && DEVICE_RTSP_PASS) {
+        return `rtsp://${DEVICE_RTSP_USER}:${DEVICE_RTSP_PASS}@${DEVICE_IP}:${DEVICE_RTSP_PORT}${DEVICE_RTSP_PATH}`;
+    }
+    return `rtsp://${DEVICE_IP}:${DEVICE_RTSP_PORT}${DEVICE_RTSP_PATH}`;
 }
 
-// ==== Helper: Start MJPEG Stream (via ffmpeg) ====
-function startStream(customParams = {}) {
-  if (ffmpegProcess) return;
-  streamStatus = 'streaming';
-  streamParams = { ...streamParams, ...customParams };
-
-  // Build FFmpeg args
-  // Inputs:
-  // -i <RTSP-URL>
-  // Outputs:
-  // -f mjpeg  (for browser)
-  // - (stdout)
-  const args = [
-    '-rtsp_transport', 'tcp',
-    '-i', getRTSPUrl(),
-    '-f', 'mjpeg',
-    '-vf', `scale=${streamParams.resolution}`,
-    '-q:v', '5',
-    '-an',
-    '-'
-  ];
-
-  ffmpegProcess = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'ignore'] });
-
-  // When ffmpeg outputs data, push to clients
-  ffmpegProcess.stdout.on('data', chunk => {
-    clients.forEach(res => {
-      res.write(`--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${chunk.length}\r\n\r\n`);
-      res.write(chunk);
-      res.write('\r\n');
-    });
-  });
-
-  // On ffmpeg exit, cleanup
-  ffmpegProcess.on('exit', () => {
-    ffmpegProcess = null;
-    streamStatus = 'stopped';
-    clients.forEach(res => {
-      try { res.end(); } catch {}
-    });
-    clients = [];
-  });
-}
-
-function stopStream() {
-  if (ffmpegProcess) {
-    ffmpegProcess.kill('SIGTERM');
-    ffmpegProcess = null;
-    streamStatus = 'stopped';
-    clients.forEach(res => {
-      try { res.end(); } catch {}
-    });
-    clients = [];
-  }
-}
-
-// ==== HTTP Server ====
-const server = http.createServer((req, res) => {
-  const parsedUrl = url.parse(req.url, true);
-  const decoder = new StringDecoder('utf8');
-  let buffer = '';
-
-  // ==== MJPEG Proxy Endpoint ====
-  if (req.method === 'GET' && parsedUrl.pathname === HTTP_STREAM_PATH) {
-    res.writeHead(200, {
-      'Content-Type': 'multipart/x-mixed-replace; boundary=frame',
-      'Cache-Control': 'no-cache',
-      'Connection': 'close',
-      'Pragma': 'no-cache'
-    });
-    clients.push(res);
-
-    // Start stream if not running
-    if (!ffmpegProcess) {
-      startStream();
+// Camera Stream Manager
+class CameraStream extends EventEmitter {
+    constructor() {
+        super();
+        this.active = false;
+        this.format = DEFAULT_STREAM_FORMAT;
+        this.ffmpeg = null;
+        this.clients = [];
     }
 
-    // Remove client on close
-    req.on('close', () => {
-      clients = clients.filter(c => c !== res);
-      if (clients.length === 0) {
-        stopStream();
-      }
-    });
-    return;
-  }
+    start(format = DEFAULT_STREAM_FORMAT) {
+        if (this.active) return;
+        if (!SUPPORTED_FORMATS.includes(format)) format = DEFAULT_STREAM_FORMAT;
+        this.format = format;
+        this.active = true;
 
-  // ==== API: GET /stream ====
-  if (req.method === 'GET' && parsedUrl.pathname === '/stream') {
+        // Build ffmpeg args
+        let args = [
+            '-rtsp_transport', 'tcp',
+            '-i', getRtspUrl()
+        ];
+
+        if (format === 'mjpeg') {
+            args.push('-f', 'mjpeg', '-q:v', '5', '-');
+        } else if (format === 'h264') {
+            args.push('-an', '-c:v', 'copy', '-f', 'h264', '-');
+        } else if (format === 'mp4') {
+            args.push('-an', '-c:v', 'copy', '-f', 'mp4', '-movflags', 'frag_keyframe+empty_moov', '-');
+        }
+
+        this.ffmpeg = spawn('ffmpeg', args);
+
+        this.ffmpeg.stdout.on('data', (chunk) => {
+            this.clients.forEach(res => {
+                res.write(chunk);
+            });
+        });
+
+        this.ffmpeg.stderr.on('data', () => {});
+
+        this.ffmpeg.on('close', () => {
+            this.active = false;
+            this.ffmpeg = null;
+            this.clients.forEach(res => {
+                res.end();
+            });
+            this.clients = [];
+            this.emit('stopped');
+        });
+
+        this.emit('started');
+    }
+
+    stop() {
+        if (!this.active || !this.ffmpeg) return;
+        this.ffmpeg.kill('SIGTERM');
+        this.active = false;
+        this.emit('stopped');
+    }
+
+    addClient(res) {
+        this.clients.push(res);
+        res.on('close', () => {
+            this.clients = this.clients.filter(r => r !== res);
+            if (this.clients.length === 0 && this.active) {
+                this.stop();
+            }
+        });
+    }
+
+    getStatus() {
+        return {
+            active: this.active,
+            format: this.format,
+            stream_url: `/stream?format=${this.format}`,
+            supported_formats: SUPPORTED_FORMATS
+        };
+    }
+}
+
+const cameraStream = new CameraStream();
+
+function handleStart(req, res, body) {
+    let format = DEFAULT_STREAM_FORMAT;
+    try {
+        const data = body ? JSON.parse(body) : {};
+        if (typeof data.format === 'string' && SUPPORTED_FORMATS.includes(data.format)) {
+            format = data.format;
+        }
+    } catch (_) {}
+
+    cameraStream.start(format);
+
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
-      status: streamStatus,
-      rtsp_url: getRTSPUrl(),
-      mjpeg_stream_url: `http://${HTTP_SERVER_HOST}:${HTTP_SERVER_PORT}${HTTP_STREAM_PATH}`,
-      params: streamParams
+        status: 'started',
+        format: format,
+        stream_url: `/stream?format=${format}`,
+        supported_formats: SUPPORTED_FORMATS
     }));
-    return;
-  }
+}
 
-  // ==== API: POST /stream/start ====
-  if (req.method === 'POST' && parsedUrl.pathname === '/stream/start') {
-    req.on('data', d => buffer += decoder.write(d));
-    req.on('end', () => {
-      buffer += decoder.end();
-      let payload = {};
-      try { payload = JSON.parse(buffer); } catch {}
-      startStream(payload);
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: streamStatus, params: streamParams }));
-    });
-    return;
-  }
-
-  // ==== API: POST /stream/stop ====
-  if (req.method === 'POST' && parsedUrl.pathname === '/stream/stop') {
-    stopStream();
+function handleStop(req, res) {
+    cameraStream.stop();
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: streamStatus }));
-    return;
-  }
+    res.end(JSON.stringify({ status: 'stopped' }));
+}
 
-  // ==== API: PUT /stream/params ====
-  if (req.method === 'PUT' && parsedUrl.pathname === '/stream/params') {
-    req.on('data', d => buffer += decoder.write(d));
+function handleStream(req, res, query) {
+    let format = DEFAULT_STREAM_FORMAT;
+    if (typeof query.format === 'string' && SUPPORTED_FORMATS.includes(query.format.toLowerCase())) {
+        format = query.format.toLowerCase();
+    }
+    if (!cameraStream.active || cameraStream.format !== format) {
+        cameraStream.start(format);
+    }
+
+    res.writeHead(200, { 'Content-Type': MIME_TYPES[format] });
+    cameraStream.addClient(res);
+}
+
+function handleStatus(req, res, query) {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(cameraStream.getStatus()));
+}
+
+const server = http.createServer((req, res) => {
+    const parsedUrl = url.parse(req.url, true);
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
     req.on('end', () => {
-      buffer += decoder.end();
-      let payload = {};
-      try { payload = JSON.parse(buffer); } catch {}
-      // Merge new params
-      streamParams = { ...streamParams, ...payload };
-      // Restart stream if running
-      if (streamStatus === 'streaming') {
-        stopStream();
-        startStream(streamParams);
-      }
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ params: streamParams }));
+        if (req.method === 'POST' && parsedUrl.pathname === '/commands/start') {
+            handleStart(req, res, body);
+        } else if (req.method === 'POST' && parsedUrl.pathname === '/commands/stop') {
+            handleStop(req, res);
+        } else if (req.method === 'GET' && parsedUrl.pathname === '/stream') {
+            handleStream(req, res, parsedUrl.query);
+        } else if (req.method === 'GET' && parsedUrl.pathname === '/stream/status') {
+            handleStatus(req, res, parsedUrl.query);
+        } else {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Not found' }));
+        }
     });
-    return;
-  }
-
-  // ==== 404 ====
-  res.writeHead(404, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ error: 'Not found' }));
 });
 
-// ==== Start Server ====
-server.listen(HTTP_SERVER_PORT, HTTP_SERVER_HOST, () => {
-  // No log as per instructions
-});
+server.listen(SERVER_PORT, SERVER_HOST);
