@@ -175,25 +175,7 @@ def run_event_loop():
     asyncio.set_event_loop(loop)
     loop.run_forever()
 
-async def auto_connect():
-    """Auto connect to BACnet device"""
-    global hvac_controller, connection_status
 
-    try:
-        local_ip = os.getenv("BACNET_LOCAL_IP", "192.168.2.100/24")
-        device_address = os.getenv("BACNET_DEVICE_ADDRESS", "192.168.2.165:49665")
-        device_id = int(os.getenv("BACNET_DEVICE_ID", "2523161"))
-
-        hvac_controller = HVACController(local_ip, device_address, device_id)
-        result = await hvac_controller.connect()
-
-        if result:
-            connection_status = {"connected": True, "message": "Connected"}
-        else:
-            connection_status = {"connected": False, "message": "Connection failed"}
-
-    except Exception as e:
-        connection_status = {"connected": False, "message": f"Error: {str(e)}"}
 
 def run_async_task(coro):
     """Run async task in event loop"""
@@ -212,56 +194,7 @@ def check_connection():
         return False
     return True
 
-@app.route('/api/health', methods=['GET'])
-def health_check():
-    """Health check"""
-    return jsonify({
-        "status": "ok",
-        "timestamp": time.strftime('%Y-%m-%d %H:%M:%S'),
-        "connection": connection_status
-    })
 
-@app.route('/api/connect', methods=['POST'])
-def connect():
-    """Connect to BACnet device"""
-    global hvac_controller, connection_status
-
-    data = request.get_json() or {}
-    local_ip = data.get('local_ip', os.getenv("BACNET_LOCAL_IP", "192.168.2.100/24"))
-    device_address = data.get('device_address', os.getenv("BACNET_DEVICE_ADDRESS", "192.168.2.165:49665"))
-    device_id = data.get('device_id', int(os.getenv("BACNET_DEVICE_ID", "2523161")))
-
-    try:
-        hvac_controller = HVACController(local_ip, device_address, device_id)
-        result = run_async_task(hvac_controller.connect())
-
-        if result:
-            connection_status = {"connected": True, "message": "Connected"}
-            return jsonify({"success": True, "message": "Connected"})
-        else:
-            connection_status = {"connected": False, "message": "Connection failed"}
-            return jsonify({"success": False, "error": "Connection failed"}), 500
-
-    except Exception as e:
-        connection_status = {"connected": False, "message": str(e)}
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route('/api/disconnect', methods=['POST'])
-def disconnect():
-    """Disconnect from BACnet device"""
-    global hvac_controller, connection_status
-
-    if not check_connection():
-        return jsonify({"success": False, "error": "Not connected"}), 400
-
-    try:
-        run_async_task(hvac_controller.disconnect())
-        hvac_controller = None
-        connection_status = {"connected": False, "message": "Disconnected"}
-        return jsonify({"success": True, "message": "Disconnected"})
-
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route('/api/data', methods=['GET'])
 def read_data():
@@ -369,11 +302,6 @@ if __name__ == '__main__':
     loop_thread = threading.Thread(target=run_event_loop, daemon=True)
     loop_thread.start()
     time.sleep(0.5)
-
-    # Auto connect to BACnet device
-    if loop and loop.is_running():
-        future = asyncio.run_coroutine_threadsafe(auto_connect(), loop)
-        future.result(timeout=30)
 
     try:
         app.run(host='0.0.0.0', port=8081, debug=False, threaded=True)
