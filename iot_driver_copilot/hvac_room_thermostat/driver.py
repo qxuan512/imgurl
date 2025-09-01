@@ -1,23 +1,23 @@
 import os
 import json
-from flask import Flask, request, jsonify, abort
+from flask import Flask, request, jsonify, Response
 import requests
 
 app = Flask(__name__)
 
-# Load configuration from environment variables
-DEVICE_HOST = os.environ.get("DEVICE_HOST", "192.168.2.165")
-DEVICE_PORT = int(os.environ.get("DEVICE_PORT", "49665"))
+# Environment Variables for Configuration
+DEVICE_ID = os.environ.get("DEVICE_ID", "2523161")
+DEVICE_IP = os.environ.get("DEVICE_IP", "192.168.2.165")
+DEVICE_PORT = os.environ.get("DEVICE_PORT", "49665")
 SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
 SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
 
-# For demonstration, assume the device exposes an HTTP API compatible with the required operations.
-# All requests to the device are proxied and responses are returned in JSON.
+# Compose base url for device
+DEVICE_BASE_URL = f"http://{DEVICE_IP}:{DEVICE_PORT}"
 
-DEVICE_BASE_URL = f"http://{DEVICE_HOST}:{DEVICE_PORT}"
-
-def proxy_device_get(path):
-    url = f"{DEVICE_BASE_URL}{path}"
+# Helper to proxy GETs to device and return JSON
+def proxy_get(endpoint):
+    url = f"{DEVICE_BASE_URL}{endpoint}"
     try:
         resp = requests.get(url, timeout=5)
         resp.raise_for_status()
@@ -25,51 +25,56 @@ def proxy_device_get(path):
     except requests.exceptions.RequestException as e:
         return jsonify({"error": str(e)}), 502
 
-def proxy_device_put(path, payload):
-    url = f"{DEVICE_BASE_URL}{path}"
-    headers = {"Content-Type": "application/json"}
+# Helper to proxy PUTs to device with JSON payload
+def proxy_put(endpoint, json_payload):
+    url = f"{DEVICE_BASE_URL}{endpoint}"
     try:
-        resp = requests.put(url, data=json.dumps(payload), headers=headers, timeout=5)
+        resp = requests.put(url, json=json_payload, timeout=5)
         resp.raise_for_status()
         return jsonify(resp.json())
     except requests.exceptions.RequestException as e:
         return jsonify({"error": str(e)}), 502
 
-@app.route("/device/preset", methods=["PUT"])
+# API: Retrieve current outdoor temperature as JSON
+@app.route('/sensors/outdoor', methods=['GET'])
+def get_outdoor_temperature():
+    return proxy_get('/sensors/outdoor')
+
+# API: Retrieve current indoor temperature as JSON
+@app.route('/sensors/indoor', methods=['GET'])
+def get_indoor_temperature():
+    return proxy_get('/sensors/indoor')
+
+# API: Retrieve current water temperature as JSON
+@app.route('/sensors/water', methods=['GET'])
+def get_water_temperature():
+    return proxy_get('/sensors/water')
+
+# API: Fetch preset temperature values stored in the thermostat
+@app.route('/presets', methods=['GET'])
+def get_presets():
+    return proxy_get('/presets')
+
+# API: Retrieve the current operating mode and status of the thermostat
+@app.route('/device/status', methods=['GET'])
+def get_device_status():
+    return proxy_get('/device/status')
+
+# API: Set or update a preset temperature value on the thermostat
+@app.route('/device/preset', methods=['PUT'])
 def set_preset_temperature():
     if not request.is_json:
-        abort(400, description="Payload must be JSON")
-    payload = request.get_json()
-    # Proxy to device endpoint
-    return proxy_device_put("/api/preset", payload)
+        return jsonify({"error": "JSON payload required"}), 400
+    json_payload = request.get_json()
+    return proxy_put('/device/preset', json_payload)
 
-@app.route("/sensors/outdoor", methods=["GET"])
-def get_outdoor_temperature():
-    return proxy_device_get("/api/sensors/outdoor")
-
-@app.route("/sensors/indoor", methods=["GET"])
-def get_indoor_temperature():
-    return proxy_device_get("/api/sensors/indoor")
-
-@app.route("/sensors/water", methods=["GET"])
-def get_water_temperature():
-    return proxy_device_get("/api/sensors/water")
-
-@app.route("/presets", methods=["GET"])
-def get_presets():
-    return proxy_device_get("/api/presets")
-
-@app.route("/device/status", methods=["GET"])
-def get_device_status():
-    return proxy_device_get("/api/status")
-
-@app.route("/device/mode", methods=["PUT"])
-def set_device_mode():
+# API: Update the operating mode (e.g., heating, cooling, off) of the thermostat
+@app.route('/device/mode', methods=['PUT'])
+def set_operating_mode():
     if not request.is_json:
-        abort(400, description="Payload must be JSON")
-    payload = request.get_json()
-    # Proxy to device endpoint
-    return proxy_device_put("/api/mode", payload)
+        return jsonify({"error": "JSON payload required"}), 400
+    json_payload = request.get_json()
+    return proxy_put('/device/mode', json_payload)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     app.run(host=SERVER_HOST, port=SERVER_PORT)
