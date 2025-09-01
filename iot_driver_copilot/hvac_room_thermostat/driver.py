@@ -1,74 +1,383 @@
+#!/usr/bin/env python3
+"""
+HVAC DeviceShifu - Flask-based BACnet device control API
+"""
+
+from flask import Flask, request, jsonify
+import asyncio
+import threading
+import time
 import os
-import json
-from flask import Flask, request, jsonify, abort
+import BAC0
+
+# Configure BAC0
+BAC0.log_level('error')
+os.environ.update({
+    'BAC0_POLLING_ENABLED': '0',
+    'BAC0_COV_ENABLED': '0',
+    'BAC0_AUTO_START': '0'
+})
+
+class HVACController:
+    """HVAC Controller"""
+
+    def __init__(self, local_ip="192.168.2.109/24", device_address="192.168.2.165:49665", device_id=2523161):
+        self.local_ip = local_ip
+        self.device_address = device_address
+        self.device_id = device_id
+        self.bacnet = None
+        self.device = None
+
+    async def connect(self):
+        """Connect to BACnet network and device"""
+        try:
+            from BAC0.scripts.Lite import Lite
+            self.bacnet = await Lite(ip=self.local_ip, port=47808, deviceId=0)
+            self.device = await BAC0.device(self.device_address, self.device_id, self.bacnet, poll=False)
+            return True
+        except Exception:
+            return False
+
+    async def _read_value(self, obj_type, obj_id):
+        """Helper method to read BACnet value"""
+        coro = self.bacnet.read(f"{self.device_address} {obj_type} {obj_id} presentValue")
+        value = await coro if hasattr(coro, '__await__') else coro
+        return f"{value:.2f}" if isinstance(value, (int, float)) else str(value)
+
+    async def read_all_data(self):
+        """Read all device data"""
+        try:
+            data = {
+                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'device_info': {
+                    'address': self.device_address,
+                    'id': self.device_id,
+                    'name': 'RoomController.Simulator'
+                },
+                'temperatures': {
+                    'analogInput 0': await self._read_value('analogInput', 0),
+                    'analogInput 1': await self._read_value('analogInput', 1),
+                    'analogInput 2': await self._read_value('analogInput', 2)
+                },
+                'setpoints': {
+                    'analogValue 0': await self._read_value('analogValue', 0),
+                    'analogValue 1': await self._read_value('analogValue', 1),
+                    'analogValue 2': await self._read_value('analogValue', 2),
+                    'analogValue 3': await self._read_value('analogValue', 3)
+                },
+                'control_states': {
+                    'controller_state': await self._read_value('multiStateValue', 0),
+                    'ventilation_level': await self._read_value('multiStateValue', 1),
+                    'heater_state': await self._read_value('binaryValue', 0),
+                    'cooler_state': await self._read_value('binaryValue', 1)
+                }
+            }
+
+            coro = self.bacnet.read(f"{self.device_address} characterstringValue 1 presentValue")
+            data['setpoint_texts'] = await coro if hasattr(coro, '__await__') else coro
+            return data
+        except Exception as e:
+            return {'error': str(e)}
+
+    async def read_device_info(self):
+        """Read device information"""
+        return {
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'device_info': {
+                'address': self.device_address,
+                'id': self.device_id,
+                'name': 'RoomController.Simulator'
+            }
+        }
+
+    async def read_temperature_sensors(self):
+        """Read temperature sensor data"""
+        try:
+            return {
+                'analogInput 0': await self._read_value('analogInput', 0),
+                'analogInput 1': await self._read_value('analogInput', 1),
+                'analogInput 2': await self._read_value('analogInput', 2)
+            }
+        except Exception as e:
+            return {'error': str(e)}
+
+    async def read_temperature_setpoints(self):
+        """Read temperature setpoint data"""
+        try:
+            return {
+                'analogValue 0': await self._read_value('analogValue', 0),
+                'analogValue 1': await self._read_value('analogValue', 1),
+                'analogValue 2': await self._read_value('analogValue', 2),
+                'analogValue 3': await self._read_value('analogValue', 3)
+            }
+        except Exception as e:
+            return {'error': str(e)}
+
+    async def read_control_status(self):
+        """Read control status data"""
+        try:
+            return {
+                'controller_state': await self._read_value('multiStateValue', 0),
+                'ventilation_level': await self._read_value('multiStateValue', 1),
+                'heater_state': await self._read_value('binaryValue', 0),
+                'cooler_state': await self._read_value('binaryValue', 1)
+            }
+        except Exception as e:
+            return {'error': str(e)}
+
+    async def _write_value(self, obj_type, obj_id, value):
+        """Helper method to write BACnet value"""
+        coro = self.bacnet.write(f"{self.device_address} {obj_type} {obj_id} presentValue {value}")
+        if hasattr(coro, '__await__'):
+            await coro
+
+    async def control_device(self, command, value=None):
+        """Control device"""
+        try:
+            if command == 'set_setpoint':
+                await self._write_value('analogValue', 0, value)
+            elif command == 'set_mode' and value in [1, 2, 3]:
+                await self._write_value('multiStateValue', 0, value)
+            elif command == 'set_ventilation' and value in [1, 2, 3, 4]:
+                await self._write_value('multiStateValue', 1, value)
+            elif command == 'override_setpoint':
+                coro = self.bacnet.write(f"{self.device_address} analogValue 0 outOfService true")
+                if hasattr(coro, '__await__'):
+                    await coro
+                await self._write_value('analogValue', 0, value)
+            return True
+        except Exception:
+            return False
+
+    async def disconnect(self):
+        """Disconnect"""
+        if self.bacnet:
+            coro = self.bacnet.disconnect()
+            if hasattr(coro, '__await__'):
+                await coro
 
 app = Flask(__name__)
 
-# Load configuration from environment variables
-DEVICE_ID = os.environ.get('DEVICE_ID', '2523161')
-DEVICE_ADDRESS = os.environ.get('DEVICE_ADDRESS', '192.168.2.165:49665')
-LOCAL_INTERFACE = os.environ.get('LOCAL_INTERFACE', '192.168.2.100/24')
-SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
-SERVER_PORT = int(os.environ.get('SERVER_PORT', '8080'))
+# Configure Flask JSON encoding
+app.config['JSON_AS_ASCII'] = False
+app.json.ensure_ascii = False
 
-# Simulated in-memory device state
-device_state = {
-    'sensors': {
-        'indoor': 23.2,
-        'outdoor': 18.6,
-        'water': 45.1
-    },
-    'presets': {
-        'preset': 22.0
-    },
-    'status': {
-        'mode': 'auto',
-        'device_status': 'on'
-    }
-}
+# Global variables
+hvac_controller = None
+connection_status = {"connected": False, "message": "Not connected"}
+loop = None
+loop_thread = None
 
-@app.route('/sensors', methods=['GET'])
-def get_sensors():
-    sensor_type = request.args.get('type')
-    sensors = device_state['sensors']
-    if sensor_type:
-        value = sensors.get(sensor_type)
-        if value is None:
-            return jsonify({'error': f'Unknown sensor type: {sensor_type}'}), 400
-        return jsonify({sensor_type: value})
-    return jsonify(sensors)
+def run_event_loop():
+    """Run event loop in a separate thread"""
+    global loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
 
-@app.route('/status', methods=['GET'])
-def get_status():
-    return jsonify(device_state['status'])
+async def auto_connect():
+    """Auto connect to BACnet device"""
+    global hvac_controller, connection_status
 
-@app.route('/presets', methods=['GET'])
-def get_presets():
-    return jsonify(device_state['presets'])
-
-@app.route('/commands/mode', methods=['POST'])
-def set_mode():
-    if not request.is_json:
-        abort(400, 'Request body must be JSON')
-    data = request.get_json()
-    mode = data.get('mode')
-    if mode not in ['cooling', 'heating', 'auto', 'off']:
-        return jsonify({'error': 'Invalid mode'}), 400
-    device_state['status']['mode'] = mode
-    return jsonify({'result': 'Mode updated', 'mode': mode})
-
-@app.route('/commands/preset', methods=['POST'])
-def set_preset():
-    if not request.is_json:
-        abort(400, 'Request body must be JSON')
-    data = request.get_json()
-    preset = data.get('preset')
     try:
-        preset = float(preset)
-    except (TypeError, ValueError):
-        return jsonify({'error': 'Invalid preset value'}), 400
-    device_state['presets']['preset'] = preset
-    return jsonify({'result': 'Preset updated', 'preset': preset})
+        local_ip = os.getenv("BACNET_LOCAL_IP", "192.168.2.100/24")
+        device_address = os.getenv("BACNET_DEVICE_ADDRESS", "192.168.2.165:49665")
+        device_id = int(os.getenv("BACNET_DEVICE_ID", "2523161"))
+
+        hvac_controller = HVACController(local_ip, device_address, device_id)
+        result = await hvac_controller.connect()
+
+        if result:
+            connection_status = {"connected": True, "message": "Connected"}
+        else:
+            connection_status = {"connected": False, "message": "Connection failed"}
+
+    except Exception as e:
+        connection_status = {"connected": False, "message": f"Error: {str(e)}"}
+
+def run_async_task(coro):
+    """Run async task in event loop"""
+    if loop is None or not loop.is_running():
+        return {"error": "Event loop not running"}
+
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    try:
+        return future.result(timeout=30)
+    except Exception as e:
+        return {"error": str(e)}
+
+def check_connection():
+    """Check if device is connected"""
+    if not hvac_controller or not connection_status["connected"]:
+        return False
+    return True
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Health check"""
+    return jsonify({
+        "status": "ok",
+        "timestamp": time.strftime('%Y-%m-%d %H:%M:%S'),
+        "connection": connection_status
+    })
+
+@app.route('/api/connect', methods=['POST'])
+def connect():
+    """Connect to BACnet device"""
+    global hvac_controller, connection_status
+
+    data = request.get_json() or {}
+    local_ip = data.get('local_ip', os.getenv("BACNET_LOCAL_IP", "192.168.2.100/24"))
+    device_address = data.get('device_address', os.getenv("BACNET_DEVICE_ADDRESS", "192.168.2.165:49665"))
+    device_id = data.get('device_id', int(os.getenv("BACNET_DEVICE_ID", "2523161")))
+
+    try:
+        hvac_controller = HVACController(local_ip, device_address, device_id)
+        result = run_async_task(hvac_controller.connect())
+
+        if result:
+            connection_status = {"connected": True, "message": "Connected"}
+            return jsonify({"success": True, "message": "Connected"})
+        else:
+            connection_status = {"connected": False, "message": "Connection failed"}
+            return jsonify({"success": False, "error": "Connection failed"}), 500
+
+    except Exception as e:
+        connection_status = {"connected": False, "message": str(e)}
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/api/disconnect', methods=['POST'])
+def disconnect():
+    """Disconnect from BACnet device"""
+    global hvac_controller, connection_status
+
+    if not check_connection():
+        return jsonify({"success": False, "error": "Not connected"}), 400
+
+    try:
+        run_async_task(hvac_controller.disconnect())
+        hvac_controller = None
+        connection_status = {"connected": False, "message": "Disconnected"}
+        return jsonify({"success": True, "message": "Disconnected"})
+
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/api/data', methods=['GET'])
+def read_data():
+    """Read device data"""
+    if not check_connection():
+        return jsonify({"success": False, "error": "Not connected"}), 400
+
+    result = run_async_task(hvac_controller.read_all_data())
+    if isinstance(result, dict) and "error" in result:
+        return jsonify({"success": False, "error": result["error"]}), 500
+    return jsonify({"success": True, "data": result})
+
+@app.route('/api/info', methods=['GET'])
+def read_device_info():
+    """Read device information"""
+    if not check_connection():
+        return jsonify({"success": False, "error": "Not connected"}), 400
+
+    result = run_async_task(hvac_controller.read_device_info())
+    return jsonify({"success": True, "data": result})
+
+@app.route('/api/temperature', methods=['GET'])
+def read_temperature_sensors():
+    """Read temperature sensor data"""
+    if not check_connection():
+        return jsonify({"success": False, "error": "Not connected"}), 400
+
+    result = run_async_task(hvac_controller.read_temperature_sensors())
+    if isinstance(result, dict) and "error" in result:
+        return jsonify({"success": False, "error": result["error"]}), 500
+    return jsonify({"success": True, "data": result})
+
+@app.route('/api/temperature/setpoints', methods=['GET'])
+def read_temperature_setpoints():
+    """Read temperature setpoint data"""
+    if not check_connection():
+        return jsonify({"success": False, "error": "Not connected"}), 400
+
+    result = run_async_task(hvac_controller.read_temperature_setpoints())
+    if isinstance(result, dict) and "error" in result:
+        return jsonify({"success": False, "error": result["error"]}), 500
+    return jsonify({"success": True, "data": result})
+
+@app.route('/api/status', methods=['GET'])
+def read_control_status():
+    """Read control status data"""
+    if not check_connection():
+        return jsonify({"success": False, "error": "Not connected"}), 400
+
+    result = run_async_task(hvac_controller.read_control_status())
+    if isinstance(result, dict) and "error" in result:
+        return jsonify({"success": False, "error": result["error"]}), 500
+    return jsonify({"success": True, "data": result})
+
+@app.route('/api/control', methods=['POST'])
+def control_device():
+    """Control device"""
+    if not check_connection():
+        return jsonify({"success": False, "error": "Not connected"}), 400
+
+    data = request.get_json()
+    if not data or 'command' not in data:
+        return jsonify({"success": False, "error": "Missing command"}), 400
+
+    command = data['command']
+    value = data.get('value')
+
+    # Validate command
+    valid_commands = ['set_setpoint', 'set_mode', 'set_ventilation', 'override_setpoint']
+    if command not in valid_commands:
+        return jsonify({"success": False, "error": "Invalid command"}), 400
+
+    # Validate value
+    if command in ['set_setpoint', 'override_setpoint']:
+        try:
+            float(value)
+        except (ValueError, TypeError):
+            return jsonify({"success": False, "error": "Invalid temperature value"}), 400
+    elif command == 'set_mode' and value not in [1, 2, 3]:
+        return jsonify({"success": False, "error": "Invalid mode value"}), 400
+    elif command == 'set_ventilation' and value not in [1, 2, 3, 4]:
+        return jsonify({"success": False, "error": "Invalid ventilation value"}), 400
+
+    result = run_async_task(hvac_controller.control_device(command, value))
+    if result:
+        return jsonify({"success": True, "message": f"Command {command} executed"})
+    return jsonify({"success": False, "error": "Command failed"}), 500
+
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({"success": False, "error": "Endpoint not found"}), 404
+
+@app.errorhandler(405)
+def method_not_allowed(error):
+    return jsonify({"success": False, "error": "Method not allowed"}), 405
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({"success": False, "error": "Internal server error"}), 500
 
 if __name__ == '__main__':
-    app.run(host=SERVER_HOST, port=SERVER_PORT)
+    print("HVAC DeviceShifu API Server starting...")
+
+    # Start event loop thread
+    loop_thread = threading.Thread(target=run_event_loop, daemon=True)
+    loop_thread.start()
+    time.sleep(0.5)
+
+    # Auto connect to BACnet device
+    if loop and loop.is_running():
+        future = asyncio.run_coroutine_threadsafe(auto_connect(), loop)
+        future.result(timeout=30)
+
+    try:
+        app.run(host='0.0.0.0', port=8081, debug=False, threaded=True)
+    except KeyboardInterrupt:
+        if loop:
+            loop.call_soon_threadsafe(loop.stop)
+        print("Server stopped")
